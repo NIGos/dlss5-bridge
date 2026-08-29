@@ -338,6 +338,135 @@ static bool BridgeBlitDepth(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D1
     return true;
 }
 
+// Converts the game's motion vectors into the shared R16G16_FLOAT texture, used
+// when the driver refuses to share the game's own MV format. Same shape as the
+// depth conversion: save the compute bindings, dispatch, put everything back.
+static bool BridgeMakeMVShader(ID3D11Device *dev11)
+{
+    if (g_bridge.mv_cs != nullptr) return true;
+
+    static const char kSrc[] =
+        "Texture2D<float2>   src : register(t0);\n"
+        "RWTexture2D<float2> dst : register(u0);\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "    uint w, h; dst.GetDimensions(w, h);\n"
+        "    if (id.x < w && id.y < h) dst[id.xy] = src[id.xy];\n"
+        "}\n";
+
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr
+        ? reinterpret_cast<PFN_D3DCompile_>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[bridge] d3dcompiler_47.dll unavailable"); return false; }
+
+    ID3DBlob *code = nullptr, *err = nullptr;
+    HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "mvblit", nullptr, nullptr,
+                         "main", "cs_5_0", 0, 0, &code, &err);
+    if (FAILED(hr) || code == nullptr)
+    {
+        Log("[bridge] MV shader compile failed 0x%08X: %s", hr,
+            err != nullptr ? static_cast<const char *>(err->GetBufferPointer()) : "");
+        if (err != nullptr) err->Release();
+        return false;
+    }
+    if (err != nullptr) err->Release();
+
+    hr = dev11->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                                    &g_bridge.mv_cs);
+    code->Release();
+    if (FAILED(hr)) { Log("[bridge] MV CreateComputeShader failed 0x%08X", hr); return false; }
+
+    Log("[bridge] MV conversion shader ready (cs_5_0)");
+    return true;
+}
+
+static bool BridgeBlitMV(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D11Texture2D *src)
+{
+    if (g_bridge.mv_cs == nullptr || g_bridge.mv_uav == nullptr) return false;
+
+    if (g_bridge.mv_src != src)
+    {
+        if (g_bridge.mv_srv != nullptr) { g_bridge.mv_srv->Release(); g_bridge.mv_srv = nullptr; }
+        if (g_bridge.mv_src != nullptr) { g_bridge.mv_src->Release(); g_bridge.mv_src = nullptr; }
+
+        // A null descriptor takes the resource's own format, which is invalid
+        // for a typeless resource, and this branch is reachable with one: a game
+        // supplying R32G32_TYPELESS motion vectors resolves through TypedFormat
+        // to R32G32_FLOAT, fails to share, and enters the fallback. Name the
+        // view format the same way BridgeBlitDepth names its depth view.
+        D3D11_TEXTURE2D_DESC sdesc = {};
+        src->GetDesc(&sdesc);
+
+        DXGI_FORMAT view = DXGI_FORMAT_UNKNOWN;
+        switch (sdesc.Format)
+        {
+        case DXGI_FORMAT_R32G32_TYPELESS:
+        case DXGI_FORMAT_R32G32_FLOAT:           view = DXGI_FORMAT_R32G32_FLOAT; break;
+        case DXGI_FORMAT_R16G16_TYPELESS:
+        case DXGI_FORMAT_R16G16_FLOAT:           view = DXGI_FORMAT_R16G16_FLOAT; break;
+        case DXGI_FORMAT_R16G16_UNORM:           view = DXGI_FORMAT_R16G16_UNORM; break;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:      view = DXGI_FORMAT_R10G10B10A2_UNORM; break;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:     view = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
+        default:                                 view = sdesc.Format; break;  // already typed
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format              = view;
+        sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        HRESULT hr = dev11->CreateShaderResourceView(src, &sd, &g_bridge.mv_srv);
+        if (FAILED(hr))
+        {
+            // Like the depth case, say it once. Continuing would mean DLSS reads
+            // a motion-vector texture nobody ever writes, and the image smears.
+            //
+            // Unlike depth, this stops the bridge rather than degrading to a
+            // placeholder: depth's fallback quietly drops one input, but an MV
+            // texture nobody writes smears every frame, and zero is not a
+            // neutral motion value. Stopping returns rendering to the game's
+            // own working DLSS instead. Deliberate divergence from BridgeBlitDepth.
+            Log("[bridge] cannot read this game's motion vectors (format %u); the "
+                "bridge is stopping rather than feed it stale ones. Please report "
+                "this format.", sdesc.Format);
+            BridgeDisable("the game's MV format cannot be read");
+            return false;
+        }
+        Log("[bridge] MV view: resource format %u read as %u", sdesc.Format, view);
+
+        g_bridge.mv_src = src;
+        src->AddRef();
+    }
+
+    ID3D11ComputeShader       *old_cs  = nullptr;
+    ID3D11ShaderResourceView  *old_srv = nullptr;
+    ID3D11UnorderedAccessView *old_uav = nullptr;
+    ctx->CSGetShader(&old_cs, nullptr, nullptr);
+    ctx->CSGetShaderResources(0, 1, &old_srv);
+    ctx->CSGetUnorderedAccessViews(0, 1, &old_uav);
+
+    UINT keep = static_cast<UINT>(-1);
+    ctx->CSSetShader(g_bridge.mv_cs, nullptr, 0);
+    ctx->CSSetShaderResources(0, 1, &g_bridge.mv_srv);
+    ctx->CSSetUnorderedAccessViews(0, 1, &g_bridge.mv_uav, &keep);
+    ctx->Dispatch((g_bridge.width + 7) / 8, (g_bridge.height + 7) / 8, 1);
+
+    ID3D11ShaderResourceView  *no_srv = nullptr;
+    ID3D11UnorderedAccessView *no_uav = nullptr;
+    ctx->CSSetShaderResources(0, 1, &no_srv);
+    ctx->CSSetUnorderedAccessViews(0, 1, &no_uav, &keep);
+
+    ctx->CSSetShader(old_cs, nullptr, 0);
+    ctx->CSSetShaderResources(0, 1, &old_srv);
+    ctx->CSSetUnorderedAccessViews(0, 1, &old_uav, &keep);
+    if (old_cs  != nullptr) old_cs->Release();
+    if (old_srv != nullptr) old_srv->Release();
+    if (old_uav != nullptr) old_uav->Release();
+    return true;
+}
+
 // D3D12 leaves resource lifetime to the caller: releasing a texture or an NGX
 // feature while a submitted command list still references it corrupts driver
 // state and surfaces later as an access violation inside NGX. Every teardown
@@ -365,6 +494,9 @@ static void BridgeReleaseTextures()
     if (g_bridge.depth_uav != nullptr) { g_bridge.depth_uav->Release(); g_bridge.depth_uav = nullptr; }
     if (g_bridge.depth_srv != nullptr) { g_bridge.depth_srv->Release(); g_bridge.depth_srv = nullptr; }
     if (g_bridge.depth_src != nullptr) { g_bridge.depth_src->Release(); g_bridge.depth_src = nullptr; }
+    if (g_bridge.mv_uav    != nullptr) { g_bridge.mv_uav->Release();    g_bridge.mv_uav    = nullptr; }
+    if (g_bridge.mv_srv    != nullptr) { g_bridge.mv_srv->Release();    g_bridge.mv_srv    = nullptr; }
+    if (g_bridge.mv_src    != nullptr) { g_bridge.mv_src->Release();    g_bridge.mv_src    = nullptr; }
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
         if (g_bridge.tex11[i]  != nullptr) { g_bridge.tex11[i]->Release();  g_bridge.tex11[i]  = nullptr; }
@@ -749,12 +881,13 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     bool ok = true;
     g_bridge.depth_placeholder = false;
     g_bridge.depth_converted   = false;
+    g_bridge.mv_converted      = false;
     for (int i = 0; i < SLOT_COUNT && ok; ++i)
     {
         // Depth crosses as R32_FLOAT, written by a compute pass, because its
         // native R24G8_TYPELESS cannot be shared. It therefore needs a UAV too.
         const bool        is_depth   = (i == SLOT_DEPTH);
-        const DXGI_FORMAT share_fmt  = is_depth ? DXGI_FORMAT_R32_FLOAT
+        DXGI_FORMAT       share_fmt  = is_depth ? DXGI_FORMAT_R32_FLOAT
                                                 : TypedFormat(fmt[i]);
         if (!is_depth && share_fmt != fmt[i])
             Log("[bridge] %s is %s; the shared copy uses %s, because nothing can view "
@@ -764,15 +897,60 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         const UINT        tw = (i == SLOT_OUTPUT) ? g_bridge.out_width  : w;
         const UINT        th = (i == SLOT_OUTPUT) ? g_bridge.out_height : h;
 
-        if (MakeSharedPair(dev11, dev1, i, tw, th, share_fmt, needs_uav))
+        bool made = MakeSharedPair(dev11, dev1, i, tw, th, share_fmt, needs_uav);
+
+        // The game's own MV format can be one the driver will not share --
+        // R32G32_FLOAT is absent from the kernel's shared-format list, and
+        // CreateTexture2D then rejects it in every flag combination. R16G16_FLOAT,
+        // the DLSS-recommended motion-vector format, is in every list, so retry
+        // with that and convert per frame, the way depth is converted. TypedFormat
+        // has already had its pass by here, so a typeless game MV that shares fine
+        // never reaches this; a retried mirror is the only one that needs converting.
+        bool mv_fallback = false;
+        if (!made && i == SLOT_MV)
+        {
+            share_fmt = DXGI_FORMAT_R16G16_FLOAT;
+            Log("[bridge] MV: format %u cannot be shared on this driver; retrying as R16G16_FLOAT",
+                fmt[i]);
+            made = MakeSharedPair(dev11, dev1, i, tw, th, share_fmt, needs_uav);
+            mv_fallback = true;
+        }
+
+        if (made)
         {
             if (i == SLOT_MV)
             {
-                D3D11_UNORDERED_ACCESS_VIEW_DESC mu = {};
-                mu.Format        = share_fmt;
-                mu.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-                if (FAILED(dev11->CreateUnorderedAccessView(g_bridge.tex11[i], &mu, &g_bridge.mv_uav)))
-                    Log("[bridge] MV UAV unavailable; mv_zero will do nothing");
+                // A retried mirror is R16G16_FLOAT while the game's own texture is
+                // not, so CopyResource cannot fill it: the conversion pass does.
+                if (mv_fallback)
+                {
+                    // The conversion pass writes the shared MV through a UAV.
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC mu = {};
+                    mu.Format        = share_fmt;
+                    mu.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+                    if (SUCCEEDED(dev11->CreateUnorderedAccessView(g_bridge.tex11[i], &mu, &g_bridge.mv_uav)) &&
+                        g_bridge.mv_uav != nullptr &&
+                        BridgeMakeMVShader(dev11))
+                    {
+                        g_bridge.mv_converted = true;
+                        Log("[bridge] MV will be converted fmt=%u -> R16G16_FLOAT by a compute pass",
+                            fmt[i]);
+                        continue;
+                    }
+                    // Without the conversion pass there is no way to fill the
+                    // shared MV, and DLSS reading a texture nobody writes smears
+                    // the image. Stop cleanly rather than deliver that.
+                    Breadcrumb("setting up the MV conversion pass");
+                    Log("[bridge] MV conversion setup failed; this game's MV format %u cannot be bridged",
+                        fmt[i]);
+                    if (g_bridge.mv_uav    != nullptr) { g_bridge.mv_uav->Release();    g_bridge.mv_uav    = nullptr; }
+                    if (g_bridge.tex11[i]  != nullptr) { g_bridge.tex11[i]->Release();  g_bridge.tex11[i]  = nullptr; }
+                    if (g_bridge.tex12[i]  != nullptr) { g_bridge.tex12[i]->Release();  g_bridge.tex12[i]  = nullptr; }
+                    if (g_bridge.shared[i] != nullptr) { CloseHandle(g_bridge.shared[i]); g_bridge.shared[i] = nullptr; }
+                    ok = false;
+                }
+                else
+                    continue;
             }
             if (!is_depth) continue;
 
@@ -1133,9 +1311,11 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         }
     }
 
-    // 1. game -> shared, on the D3D11 immediate context
+    // 1. game -> shared, on the D3D11 immediate context. MV goes through a
+    //    conversion pass when the driver would not share the game's format.
     ctx->CopyResource(g_bridge.tex11[SLOT_COLOR], g[SLOT_COLOR]);
-    ctx->CopyResource(g_bridge.tex11[SLOT_MV],    g[SLOT_MV]);
+    if (g_bridge.mv_converted) BridgeBlitMV(ctx, dev11, g[SLOT_MV]);
+    else                       ctx->CopyResource(g_bridge.tex11[SLOT_MV], g[SLOT_MV]);
     if (g_cfg.stage >= 2 && g_bridge.depth_converted)
         BridgeBlitDepth(ctx, dev11, g[SLOT_DEPTH]);
 

@@ -100,9 +100,19 @@ struct Bridge
     bool                       depth_converted;
     ID3D11ComputeShader       *depth_cs;
     ID3D11UnorderedAccessView *depth_uav;   // on the shared R32_FLOAT texture
-    ID3D11UnorderedAccessView *mv_uav;      // only used to clear it for isolation tests
+    ID3D11UnorderedAccessView *mv_uav;      // the MV conversion pass writes the shared copy through it
     ID3D11ShaderResourceView  *depth_srv;   // on the game's depth
     ID3D11Resource            *depth_src;   // held so its pointer cannot be recycled
+
+    // Some games hand NGX motion vectors in a format the driver will not share
+    // -- R32G32_FLOAT, for one, is absent from the kernel's shared-format list,
+    // and CreateTexture2D then rejects it outright. The shared MV copy is
+    // R16G16_FLOAT, the DLSS-recommended motion-vector format, and a compute
+    // pass converts into it, the same way depth is converted.
+    bool                       mv_converted;
+    ID3D11ComputeShader       *mv_cs;
+    ID3D11ShaderResourceView  *mv_srv;      // on the game's MV
+    ID3D11Resource            *mv_src;      // held so its pointer cannot be recycled
 
     // Last resort if even that fails: a zero-filled D3D12 texture completes the
     // NGX contract but leaves DLSS blind to disocclusion, which shows up as the
