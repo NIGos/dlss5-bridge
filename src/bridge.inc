@@ -1979,14 +1979,18 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     if (gow == 0 || goh == 0) { gow = d[SLOT_OUTPUT].Width; goh = d[SLOT_OUTPUT].Height; }
 
     // DLSS never produces an image smaller than the one it is given, so an
-    // output size below the render size is not a contract -- it is a mistake in
-    // the block. Gallipoli reports 2560x1440 in and 1485x835 out, which is the
-    // Balanced render size written into the output fields; NGX answers
-    // 0xBAD00005 and the bridge used to rebuild every texture, fail, and repeat
-    // until three failures switched it off.
-    //
-    // The output texture is an allocation rather than a claim, so when the two
-    // disagree this way the texture wins.
+    // output size below the render size is not a contract -- it is an inverted
+    // block. Gallipoli reports 2560x1440 in and 1485x835 out, House Party
+    // 5120x1440 in and 2970x835 out: the Balanced render size written into the
+    // output fields, while Width/Height hold the display size the game created
+    // its own feature with (both games' creates say Width == OutWidth ==
+    // display). Mirror that create rather than the output allocation: under
+    // dynamic resolution the allocation is padded -- 5120x2048 for a 5120x1440
+    // display -- and a feature built to the padding asks NGX for a scale no
+    // preset covers, which is 0xBAD00005 on every evaluate and three strikes.
+    // The true render size still reaches the evaluate through the game's own
+    // subrect dimensions, which these engines do fill in correctly.
+    bool inverted = false;
     if (gow < gw || goh < gh)
     {
         static bool said = false;
@@ -1995,12 +1999,13 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             said = true;
             Log("[bridge] the game asks for an output of %ux%u from an input of %ux%u, "
                 "which is smaller rather than larger.", gow, goh, gw, gh);
-            Log("  Its output texture is %ux%u, and a texture is an allocation rather "
-                "than a claim, so that is used instead.",
-                d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
+            Log("  That is the render size written into the output fields; the input "
+                "fields carry the display size the game's own feature was created "
+                "with, so %ux%u is used for the output as well.", gw, gh);
         }
-        gow = d[SLOT_OUTPUT].Width;
-        goh = d[SLOT_OUTPUT].Height;
+        inverted = true;
+        gow = gw;
+        goh = gh;
     }
 
     // If even the texture cannot satisfy it, nothing here can: say so once and
@@ -2025,6 +2030,26 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // so there is nothing to place the region by. Stand aside and let the game
     // render that screen itself.
     const bool partial = (gow != d[SLOT_OUTPUT].Width) || (goh != d[SLOT_OUTPUT].Height);
+    if (partial && inverted)
+    {
+        // An inverted block names its region where Gallipoli's map screen could
+        // not: the game's own DLSS writes a gow x goh output at the 0,0 the
+        // subrect origins state, into the same padded allocation, and displays
+        // only that region -- the padding rows below it are never shown. Write
+        // the same region and deliver; the stale rest is the game's own
+        // steady state too.
+        g_bridge.partial_output = false;
+        if (!g_bridge.partial_reported)
+        {
+            g_bridge.partial_reported = true;
+            Log("[bridge] the %ux%u output sits at 0,0 inside a %ux%u allocation "
+                "padded for dynamic resolution; the region is written and the "
+                "padding left alone, the same as the game's own DLSS does.",
+                gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
+        }
+    }
+    else
+    {
     g_bridge.partial_output = partial;
     if (partial)
     {
@@ -2041,6 +2066,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
         dev11->Release();
         return;
+    }
     }
 
     bool shape_changed = (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
