@@ -33,6 +33,14 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+// Header-only, ships with the Windows SDK, adds no lib to the link line. It is
+// here for one call: the optical flow self-check reads back an R16G16_FLOAT
+// texture and has to decode halves, subnormals included -- a UV delta below one
+// pixel at 3840 wide is subnormal, which is exactly the regime this whole path
+// exists for, so a hand-rolled decoder would be wrong in the only case that
+// matters.
+#include <DirectXPackedVector.h>
+#include <cassert>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -110,7 +118,11 @@ typedef void (*PFN_ReShadeLogMessage)(HMODULE, int, const char *);
 static PFN_ReShadeLogMessage g_reshade_log;
 static HMODULE               g_reshade_module;
 
-static void Log(const char *fmt, ...)
+// Annotated so the compiler counts the conversions against the arguments. It is
+// unannotated varargs that let a config line ship with sixteen conversions and
+// fifteen values, printing a stack slot as ofa_perf in every log this project
+// has collected -- found by reading, because nothing warned.
+static void Log(_Printf_format_string_ const char *fmt, ...)
 {
     char line[2048];
     va_list ap;
@@ -290,7 +302,25 @@ struct Layer
     Hook    eval;
     Hook    eval_c;
     Hook    create;
+
+    // The Vulkan NGX API, hooked in the same layer slot and by the same
+    // mechanism. CreateFeature1 is a third class rather than a variant of
+    // CreateFeature: it is a distinct export at a distinct address and it
+    // prepends a VkDevice, so a game reaching DLSS through it while only
+    // CreateFeature is patched would be unobserved.
+    Hook    vk_eval;
+    Hook    vk_eval_c;
+    Hook    vk_create;
+    Hook    vk_create1;
 };
+
+// Whether the Vulkan mirror is switched on, read once at attach out of
+// dlss5-dx11-bridge.cfg. It decides whether four foreign entry points get
+// fourteen bytes written into them, so it is a launch-time decision and not a
+// per-frame one. Kept out of BridgeCfg deliberately: bridge.inc is the file the
+// nine shipped D3D11 titles run on, and its config report line stays byte for
+// byte what those titles' logs already carry.
+static int              g_vk_mirror;
 
 static Layer            g_layer[kMaxLayers];
 static volatile LONG    g_layer_count;
@@ -413,6 +443,10 @@ static const char *FormatName(DXGI_FORMAT f)
     case DXGI_FORMAT_R16G16_FLOAT:          return "R16G16_FLOAT";
     case DXGI_FORMAT_R16G16_TYPELESS:       return "R16G16_TYPELESS";
     case DXGI_FORMAT_R32_FLOAT:             return "R32_FLOAT";
+    // The Vulkan mirror's depth slot when the game's depth aspect arrives packed.
+    // Without this line the one message that reports failing to create it says
+    // "unnamed", which is a refusal that cannot name what it refused.
+    case DXGI_FORMAT_R32_UINT:              return "R32_UINT";
     case DXGI_FORMAT_R32_TYPELESS:          return "R32_TYPELESS";
     case DXGI_FORMAT_D32_FLOAT:             return "D32_FLOAT";
     case DXGI_FORMAT_R24G8_TYPELESS:        return "R24G8_TYPELESS";
@@ -744,6 +778,57 @@ static volatile LONG g_probe_done = 0;
 
 typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
 
+// A game that ships DLSS has already loaded the driver's NGX loader long before
+// this add-on looks for it -- the game's own NVSDK_NGX_D3D11_Init pulls it in.
+// A game that ships no DLSS never does, and the synthetic contract is for
+// exactly those games: Skyrim Special Edition on 2026-08-30 armed the synthetic
+// path, built the contract, opened the D3D12 session and then found nothing
+// exporting NVSDK_NGX_D3D12_Init_Ext, because nobody had loaded NGX.
+//
+// The driver publishes where it lives, for this purpose. NGXCore\FullPath is the
+// directory the loader and its snippets sit in, and it is what NGX's own
+// bootstrap reads. Loading it from anywhere else would be guessing at a path
+// under DriverStore that changes with every driver.
+//
+// Called only from the synthetic path. The mirror path must NOT do this: there,
+// nothing exporting NGX means the game never called DLSS, which is a fact worth
+// reporting rather than one to paper over by loading NGX on the game's behalf.
+static bool EnsureNgxLoaderLoaded()
+{
+    static bool tried;
+    static bool ok;
+    if (tried) return ok;
+    tried = true;
+
+    wchar_t dir[MAX_PATH] = {};
+    DWORD   cb = sizeof(dir);
+    const LSTATUS r = RegGetValueW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+        L"FullPath", RRF_RT_REG_SZ, nullptr, dir, &cb);
+    if (r != ERROR_SUCCESS || dir[0] == 0)
+    {
+        Log("[bridge] NGXCore\\FullPath is not in the registry (%ld), so the driver's NGX "
+            "loader cannot be found. On an NVIDIA driver that supports DLSS it is always "
+            "there; its absence means either no NVIDIA driver or one too old.", r);
+        return false;
+    }
+
+    wchar_t path[MAX_PATH] = {};
+    _snwprintf_s(path, _TRUNCATE, L"%ls\\_nvngx.dll", dir);
+    const HMODULE m = LoadLibraryW(path);
+    if (m == nullptr)
+    {
+        Log("[bridge] the driver's NGX loader is registered at %ls but did not load (%lu).",
+            path, GetLastError());
+        return false;
+    }
+    Log("[bridge] the game loaded no NGX of its own, so the driver's loader was loaded "
+        "directly from %ls. This happens only on the synthetic path: a game with its own "
+        "DLSS has already brought NGX in.", path);
+    ok = true;
+    return true;
+}
+
 static HMODULE FindNgxLoader()
 {
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
@@ -983,9 +1068,17 @@ static void DumpCapability(NVSDK_NGX_Parameter *caps)
             "add-on could not create a neural-rendering feature, and updating the "
             "driver fixed it. Update the driver before looking anywhere else.");
     else if (denoising_available == 0)
-        Log("[bridge]   this driver reports denoising as unavailable. A D3D12 add-on "
-            "asking for a neural-rendering feature will not get one, and that refusal "
-            "is the driver's rather than this bridge's.");
+        // This key is Ray Reconstruction's, and it does not speak for DLSS 5
+        // neural rendering -- feature 18 has no capability key of its own. The
+        // line here used to conclude that a neural-rendering feature "will not
+        // get one", which is false and was falsified in this project's own
+        // session on 2026-08-31: Skyrim Special Edition reported Available = 0
+        // on driver 616.56 and the DLSS 5 add-on then created feature 18 and
+        // evaluated it sixty times. State the reading; draw no conclusion from it.
+        Log("[bridge]   Ray Reconstruction is reported unavailable here. That says "
+            "nothing about DLSS 5 neural rendering, which has no capability key of "
+            "its own: this add-on has seen feature 18 created and evaluated on a "
+            "driver answering exactly this way.");
 }
 
 // bridge.inc prints this before D3D12CreateDevice, and the include comes long
@@ -1090,6 +1183,29 @@ static void LogFileVersion(const wchar_t *dir, const wchar_t *leaf, const char *
         Log("    %-26ls %s  (no version resource)", leaf, label);
 }
 
+// What the status panel says about this add-on's neighbours. Captured while the
+// log below is written rather than re-read when the panel draws: this runs once
+// at attach on the loader thread and cannot change afterwards, and the panel
+// runs on ReShade's UI thread on every frame the overlay is open. Doing file
+// I/O there to restate a fixed fact would be the wrong trade twice over. Written
+// before ReShade has presented once and read-only from then on, which is why no
+// lock guards them.
+static char g_panel_addons[768];
+static char g_panel_dlss5[1024];
+static bool g_panel_ini_read;
+
+// strcat_s calls the invalid-parameter handler on overflow, which terminates the
+// process. These buffers are filled from a directory listing and a file, neither
+// of which has a bound this code sets, so appending has to be the kind that
+// stops rather than the kind that aborts. What does not fit is dropped: the log
+// beside it already carries every line in full.
+static void PanelAppend(char *buf, size_t n, const char *s)
+{
+    const size_t have = strlen(buf);
+    if (have + 2 >= n) return;
+    _snprintf_s(buf + have, n - have, _TRUNCATE, "%s\n", s);
+}
+
 // The DLSS 5 add-on keeps its own settings in ReShade.ini, and those settings
 // decide whether it does anything at all. Reading them here answers from the
 // log what previously needed a screenshot of its overlay: whether neural
@@ -1109,6 +1225,8 @@ static void LogReShadeConfig(const wchar_t *dir)
             "settings could not be read.");
         return;
     }
+
+    g_panel_ini_read = true;
 
     char section[128] = "";
     char line[512];
@@ -1143,6 +1261,7 @@ static void LogReShadeConfig(const wchar_t *dir)
             header = true;
         }
         Log("    %s", b);
+        PanelAppend(g_panel_dlss5, sizeof(g_panel_dlss5), b);
     }
     fclose(f);
 
@@ -1275,6 +1394,21 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     const LONG n = InterlockedIncrement(&g_eval_count);
     if (n == 1) RetractIdleNote();
 
+    // One-way and unconditional: the game's own DLSS wins from any state, at any
+    // time, and nothing ever puts this back. The asymmetry is the whole reason.
+    // "This game has DLSS" is provable only positively and only at a moment
+    // nothing here can bound -- Escape from Tarkov called DLSS twenty-three
+    // seconds in, and a title whose first call comes from a menu can take far
+    // longer -- while "this game has no DLSS" is not provable at all. So a
+    // substitute may hold the field only until the real contract arrives, and
+    // then it must lose it, whatever it was in the middle of.
+    // The old value is kept because it says whether anything has to be undone.
+    // A substitute that was mid-frame when this arrived has already left a
+    // feature standing in g_bridge, and it cannot clear that itself until its
+    // own next frame -- which is one presented frame too late if the game's
+    // buffers happen to match the shape it built for.
+    const LONG prev_source = InterlockedExchange(&g_source, SRC_MIRROR);
+
     // The loader notification is allowed to give up rather than block, so a
     // module can be missed. This is the same scan from the render thread, where
     // no loader lock is held and giving up costs nothing.
@@ -1345,6 +1479,21 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // session creates a device and starts an NGX session, and on some drivers
     // that is itself the thing that crashes. An off switch that still does the
     // dangerous part is not an off switch.
+    // The session open and the frame are one unit under g_bridge_cs, not two:
+    // a second source that took the section between them would find
+    // session_ready true and every texture still null. Uncontended whenever
+    // this is the only source, which the arming latch makes the usual case.
+    EnterCriticalSection(&g_bridge_cs);
+    // Inside the section, so it cannot land while a substitute is between its
+    // own copies and its copy back. One-shot by construction: the exchange above
+    // has already made g_source SRC_MIRROR, so the next evaluate reads
+    // SRC_MIRROR here and this is skipped. In a session with one source
+    // prev_source is never SRC_SYNTH and this is a compare against a local.
+    if (prev_source == SRC_SYNTH)
+    {
+        g_bridge.frame_ready = false;
+        g_bridge.need_reset  = true;
+    }
     if (g_cfg.stage >= 1 && InterlockedCompareExchange(&g_probe_done, 1, 0) == 0)
     {
         ID3D11Device *dev = nullptr;
@@ -1352,6 +1501,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
         if (dev != nullptr) { BridgeInitSession(dev, ctx); dev->Release(); }
     }
     BridgeFrame(ctx, p);
+    LeaveCriticalSection(&g_bridge_cs);
 
     return r;
 }
@@ -1454,6 +1604,19 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
     return r;
 }
 
+// Defined in vkmirror.inc, which is included after synth.inc -- it needs the
+// private D3D12 session and the Vulkan transport, both of which live there --
+// while the detour table below has to exist before the module scan. void * for
+// VkCommandBuffer and VkDevice: both are dispatchable, both pointer-sized, and
+// nothing here dereferences either.
+static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
+                                          const NVSDK_NGX_Handle *handle,
+                                          const NVSDK_NGX_Parameter *p, void *cb);
+static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
+                                        NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out);
+static NVSDK_NGX_Result ForwardVkCreate1(Hook &h, void *dev, void *cmd, int feature_id,
+                                         NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out);
+
 // One detour per layer, because a detour has to know which layer's saved bytes
 // to restore before forwarding, and the entry point itself carries no way to
 // tell. Eight sets of three is duplication a macro can carry; the alternative is
@@ -1471,7 +1634,23 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
                              "NVSDK_NGX_D3D11_EvaluateFeature_C", c, h, p, cb); }    \
     static NVSDK_NGX_Result Detour_Create_##i(                                       \
         ID3D11DeviceContext *c, int f, NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **o) \
-    { return ForwardCreate(g_layer[i].create, c, f, p, o); }
+    { return ForwardCreate(g_layer[i].create, c, f, p, o); }                         \
+    static NVSDK_NGX_Result Detour_VkEvaluate_##i(                                   \
+        void *c, const NVSDK_NGX_Handle *h,                                          \
+        const NVSDK_NGX_Parameter *p, void *cb)                                      \
+    { return ForwardVkEvaluate(g_layer[i].vk_eval,                                   \
+                               "NVSDK_NGX_VULKAN_EvaluateFeature", c, h, p, cb); }   \
+    static NVSDK_NGX_Result Detour_VkEvaluate_C_##i(                                 \
+        void *c, const NVSDK_NGX_Handle *h,                                          \
+        const NVSDK_NGX_Parameter *p, void *cb)                                      \
+    { return ForwardVkEvaluate(g_layer[i].vk_eval_c,                                 \
+                               "NVSDK_NGX_VULKAN_EvaluateFeature_C", c, h, p, cb); } \
+    static NVSDK_NGX_Result Detour_VkCreate_##i(                                     \
+        void *c, int f, NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **o)                \
+    { return ForwardVkCreate(g_layer[i].vk_create, c, f, p, o); }                    \
+    static NVSDK_NGX_Result Detour_VkCreate1_##i(                                    \
+        void *d, void *c, int f, NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **o)       \
+    { return ForwardVkCreate1(g_layer[i].vk_create1, d, c, f, p, o); }
 
 LAYER_DETOURS(0) LAYER_DETOURS(1) LAYER_DETOURS(2)  LAYER_DETOURS(3)
 LAYER_DETOURS(4) LAYER_DETOURS(5) LAYER_DETOURS(6)  LAYER_DETOURS(7)
@@ -1482,9 +1661,19 @@ struct DetourSet
     PFN_Evaluate eval;
     PFN_Evaluate eval_c;
     PFN_Create   create;
+    // void *, because the Vulkan detours' own prototypes are not the D3D11 ones
+    // and HookInstall takes a void * anyway.
+    void        *vk_eval;
+    void        *vk_eval_c;
+    void        *vk_create;
+    void        *vk_create1;
 };
 
-#define LAYER_ENTRY(i) { &Detour_Evaluate_##i, &Detour_Evaluate_C_##i, &Detour_Create_##i }
+#define LAYER_ENTRY(i) { &Detour_Evaluate_##i, &Detour_Evaluate_C_##i, &Detour_Create_##i, \
+                         reinterpret_cast<void *>(&Detour_VkEvaluate_##i),                 \
+                         reinterpret_cast<void *>(&Detour_VkEvaluate_C_##i),               \
+                         reinterpret_cast<void *>(&Detour_VkCreate_##i),                   \
+                         reinterpret_cast<void *>(&Detour_VkCreate1_##i) }
 static const DetourSet kDetour[kMaxLayers] = {
     LAYER_ENTRY(0), LAYER_ENTRY(1), LAYER_ENTRY(2),  LAYER_ENTRY(3),
     LAYER_ENTRY(4), LAYER_ENTRY(5), LAYER_ENTRY(6),  LAYER_ENTRY(7),
@@ -1556,9 +1745,37 @@ static int HookNewNgxModules()
         void *eval   = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_EvaluateFeature"));
         void *eval_c = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_EvaluateFeature_C"));
         void *create = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_D3D11_CreateFeature"));
-        if (create == nullptr || (eval == nullptr && eval_c == nullptr)) continue;
 
-        const bool filler = IsFillerStub(create) || IsFillerStub(eval) || IsFillerStub(eval_c);
+        // The Vulkan API, only when the mirror is switched on. There is no
+        // NVSDK_NGX_VULKAN_EvaluateFeature_C in any driver -- there is no _C
+        // export for any API, because _C lives in the SDK's static client
+        // library -- but a game that links NGX statically can re-export one, so
+        // it is looked for per module and simply expected to be absent.
+        void *vk_eval    = nullptr;
+        void *vk_eval_c  = nullptr;
+        void *vk_create  = nullptr;
+        void *vk_create1 = nullptr;
+        if (g_vk_mirror != 0)
+        {
+            vk_eval    = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_VULKAN_EvaluateFeature"));
+            vk_eval_c  = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_VULKAN_EvaluateFeature_C"));
+            vk_create  = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_VULKAN_CreateFeature"));
+            vk_create1 = reinterpret_cast<void *>(GetProcAddress(mods[i], "NVSDK_NGX_VULKAN_CreateFeature1"));
+        }
+
+        const bool has_d11 = create != nullptr && (eval != nullptr || eval_c != nullptr);
+        const bool has_vk  = (vk_create != nullptr || vk_create1 != nullptr) &&
+                             (vk_eval != nullptr || vk_eval_c != nullptr);
+        if (!has_d11 && !has_vk) continue;
+
+        // Mandatory on Vulkan rather than optional: in this driver build EVERY
+        // NGX export of nvngx.dll -- the redirector, not the loader -- is a 0x90
+        // sled at an address that is not even function-aligned, the Vulkan names
+        // included. The peer project has no such guard and patches fourteen
+        // bytes of that padding.
+        const bool filler = IsFillerStub(create) || IsFillerStub(eval) || IsFillerStub(eval_c) ||
+                            IsFillerStub(vk_create) || IsFillerStub(vk_create1) ||
+                            IsFillerStub(vk_eval) || IsFillerStub(vk_eval_c);
 
         bool known = AlreadyRejected(mods[i]);
         for (LONG k = 0; k < g_layer_count && !known; ++k)
@@ -1666,10 +1883,46 @@ static int HookNewNgxModules()
             HookInstall(L.eval_c, eval_c, reinterpret_cast<void *>(kDetour[slot].eval_c));
         LeaveCriticalSection(&g_hook_cs);
 
+        // "absent" rather than "FAILED" for a null CreateFeature, which used to be
+        // impossible -- the accept test above required it -- and is not any more:
+        // a module can now be accepted for its Vulkan exports alone.
         Log("  hooked: CreateFeature=%s EvaluateFeature=%s EvaluateFeature_C=%s",
-            ok_create ? "yes" : "FAILED",
+            create != nullptr ? (ok_create ? "yes" : "FAILED") : "absent",
             eval   != nullptr ? (ok_eval   ? "yes" : "FAILED") : "absent",
             eval_c != nullptr ? (ok_eval_c ? "yes" : "FAILED") : "absent");
+
+        // Said and done only where there is something to say, so a session with
+        // vk_mirror off -- which is every D3D11 session -- logs exactly what it
+        // logged before this existed.
+        if (has_vk)
+        {
+            Log("  NVSDK_NGX_VULKAN_CreateFeature     = %p", vk_create);
+            Log("  NVSDK_NGX_VULKAN_CreateFeature1    = %p", vk_create1);
+            Log("  NVSDK_NGX_VULKAN_EvaluateFeature   = %p", vk_eval);
+            Log("  NVSDK_NGX_VULKAN_EvaluateFeature_C = %p", vk_eval_c);
+            if (vk_create  != nullptr) LogPrologue("VK CreateFeature", static_cast<const BYTE *>(vk_create));
+            if (vk_create1 != nullptr) LogPrologue("VK CreateFeature1", static_cast<const BYTE *>(vk_create1));
+            if (vk_eval    != nullptr) LogPrologue("VK EvaluateFeature", static_cast<const BYTE *>(vk_eval));
+            if (vk_eval_c  != nullptr) LogPrologue("VK EvaluateFeature_C", static_cast<const BYTE *>(vk_eval_c));
+
+            EnterCriticalSection(&g_hook_cs);
+            const bool okv_create = vk_create != nullptr &&
+                HookInstall(L.vk_create, vk_create, kDetour[slot].vk_create);
+            const bool okv_create1 = vk_create1 != nullptr &&
+                HookInstall(L.vk_create1, vk_create1, kDetour[slot].vk_create1);
+            const bool okv_eval = vk_eval != nullptr &&
+                HookInstall(L.vk_eval, vk_eval, kDetour[slot].vk_eval);
+            const bool okv_eval_c = vk_eval_c != nullptr &&
+                HookInstall(L.vk_eval_c, vk_eval_c, kDetour[slot].vk_eval_c);
+            LeaveCriticalSection(&g_hook_cs);
+
+            Log("  hooked: VULKAN CreateFeature=%s CreateFeature1=%s EvaluateFeature=%s "
+                "EvaluateFeature_C=%s",
+                vk_create  != nullptr ? (okv_create  ? "yes" : "FAILED") : "absent",
+                vk_create1 != nullptr ? (okv_create1 ? "yes" : "FAILED") : "absent",
+                vk_eval    != nullptr ? (okv_eval    ? "yes" : "FAILED") : "absent",
+                vk_eval_c  != nullptr ? (okv_eval_c  ? "yes" : "FAILED") : "absent");
+        }
 
         if (slot == g_layer_count) InterlockedIncrement(&g_layer_count);
         ++added;
@@ -1808,8 +2061,20 @@ static void LogNeighbours()
             // Luma-Prey.addon during NGX initialisation and the address alone
             // told its author nothing. Only loaded add-ons have a base; one that
             // ReShade has not loaded yet simply has no line.
-            if (HMODULE m = GetModuleHandleW(fd.cFileName))
+            HMODULE m = GetModuleHandleW(fd.cFileName);
+            if (m != nullptr)
                 Log("        loaded at %p", static_cast<void *>(m));
+
+            // The same two facts kept for the status panel. Which of these is
+            // the DLSS 5 add-on is deliberately not decided here: its filename
+            // belongs to its author, so the panel shows the list and lets the
+            // reader recognise it, exactly as the log above does.
+            {
+                char entry[160];
+                _snprintf_s(entry, sizeof(entry), _TRUNCATE, "%ls -- %s", fd.cFileName,
+                            m != nullptr ? "loaded" : "present, not loaded");
+                PanelAppend(g_panel_addons, sizeof(g_panel_addons), entry);
+            }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -2014,6 +2279,14 @@ static void ReportIdle()
     if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0 &&
         g_deferred_exe == nullptr) return;
     if (g_eval_count != 0) return;
+    // Idle means nothing at all is running, not merely that the game's own DLSS
+    // is not. A source that delivers frames without the game ever calling
+    // EvaluateFeature leaves g_eval_count at zero for the whole session, and the
+    // path below then hooks the host executable's own NGX exports -- which is
+    // what this file records as killing The Elder Scrolls Online. Asking a
+    // delivered-frame count rather than each source in turn keeps that correct
+    // for a source nobody has written yet.
+    if (g_frames_delivered != 0) return;
     if (GetTickCount64() - g_hook_time < 60000) return;
     if (InterlockedCompareExchange(&g_idle_reported, 1, 0) != 0) return;
 
@@ -2162,6 +2435,20 @@ static void ReportOutcome()
     }
 }
 
+// After bridge.inc, because it reads the config the mirror parses and reuses the
+// mirror's pixel readback and its whole frame path. Down here rather than beside
+// that include because arming has to ask three things the mirror keeps at file
+// scope further down -- g_create_count, g_eval_count and g_hook_time -- and
+// hoisting three existing declarations into bridge.h to feed one new reader is a
+// larger change to the file the nine titles depend on than moving one include.
+// Still above RegisterWithReShade, which is what fills in the module handle and
+// the API version synth.inc needs.
+#include "synth.inc"
+// After synth.inc, which owns the private D3D12 session and the Vulkan
+// transport the mirror reuses whole.
+#include "vkmirror.inc"
+
+
 // ---------------------------------------------------------------------------
 // ReShade add-on registration
 //
@@ -2204,6 +2491,13 @@ static bool RegisterWithReShade(HMODULE self)
                 g_reshade_log = reinterpret_cast<PFN_ReShadeLogMessage>(
                     GetProcAddress(mods[i], "ReShadeLogMessage"));
                 g_reshade_module = self;
+                // Which ReShade, and which version it settled on. The loop
+                // counts down past the point where effect_runtime's vtable is
+                // the one this add-on was compiled against, so the number it
+                // stopped at is a fact synth.inc has to check rather than a
+                // detail of the negotiation.
+                g_reshade_dll = mods[i];
+                g_reshade_api = version;
                 return true;
             }
         }
@@ -2285,9 +2579,10 @@ static DWORD WINAPI NgxProbeThread(LPVOID)
     return 0;
 }
 
-// Reads one key straight from the config file: the probe decides whether to run
-// before the bridge has parsed anything.
-static bool ProbeRequested()
+// Reads one key straight from the config file. Two callers now: the probe
+// decides whether to run before the bridge has parsed anything, and the Vulkan
+// mirror's gate is deliberately not a BridgeCfg field -- see g_vk_mirror.
+static bool CfgKeyOn(const char *key_eq)
 {
     char path[MAX_PATH] = {};
     GetModuleFileNameA(g_self, path, MAX_PATH);
@@ -2298,11 +2593,14 @@ static bool ProbeRequested()
     if (fopen_s(&f, path, "r") != 0 || f == nullptr) return false;
     char line[256];
     bool on = false;
+    const size_t n = strlen(key_eq);
     while (fgets(line, sizeof(line), f) != nullptr)
-        if (_strnicmp(line, "probe=1", 7) == 0) { on = true; break; }
+        if (_strnicmp(line, key_eq, n) == 0) { on = true; break; }
     fclose(f);
     return on;
 }
+
+static bool ProbeRequested() { return CfgKeyOn("probe=1"); }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
@@ -2312,6 +2610,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
         InitializeCriticalSection(&g_hook_cs);
+        // Before RegisterWithReShade, because that is what arms the ReShade
+        // event a second source enters the frame path through, and an
+        // uninitialised section is not a lock that is merely unheld.
+        InitializeCriticalSection(&g_bridge_cs);
 
         GetModuleFileNameA(module, g_log_path, MAX_PATH);
         char *slash = strrchr(g_log_path, '\\');
@@ -2380,8 +2682,23 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // prevent -- so the documented off switch still created a D3D12 device
         // and started an NGX session before anything looked at the file.
         CfgReload();
-            g_hook_time = GetTickCount64();
-    StartWatchingForNgx();
+        // After the config, never before it: stage=0 has to switch this off too,
+        // and the value is not known until the file has been read.
+        SynthRegisterEvents();
+        // Read before StartWatchingForNgx, because it decides whether the module
+        // scan hooks the Vulkan entry points at all.
+        g_vk_mirror = CfgKeyOn("vk_mirror=1") ? 1 : 0;
+        VkmRegisterEvents();
+        // Not behind SynthEnabled, unlike the events above. The panel's whole
+        // job is to say which situation this session is in, and "synthesis is
+        // switched off and the mirror is running" is one of the situations it
+        // has to be able to say. It registers a draw callback and nothing else:
+        // no device, no session, no per-frame work unless the user opens the
+        // overlay.
+        PanelRegister();
+
+        g_hook_time = GetTickCount64();
+        StartWatchingForNgx();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -2399,14 +2716,34 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         StopWatchingForNgx();
         ReportOutcome();
 
+        // Not dead code, however rarely detach runs. A module that unloads with
+        // its jumps still in place and is then loaded again reads its own patch
+        // as the "original bytes" it saves and calls through: the detour lands
+        // in itself and recurses until the stack is gone. The Vulkan port of
+        // this add-on is the counter-example -- its DllMain has only a
+        // DLL_PROCESS_ATTACH branch, so nothing ever wrote the bytes back, and a
+        // second load produced STATUS_STACK_OVERFLOW. Most games never reach
+        // here, which is exactly why it looks removable.
+        // Before the hooks come out, because a game whose GPU is parked at the
+        // mirror's vkCmdWaitEvents is waiting on an event only this add-on can
+        // set -- and an unloaded add-on that never sets it is a device loss for
+        // the whole game rather than a dropped frame.
+        VkmShutdown();
+
         EnterCriticalSection(&g_hook_cs);
         for (LONG i = 0; i < g_layer_count; ++i)
         {
             HookRemove(g_layer[i].eval);
             HookRemove(g_layer[i].eval_c);
             HookRemove(g_layer[i].create);
+            HookRemove(g_layer[i].vk_eval);
+            HookRemove(g_layer[i].vk_eval_c);
+            HookRemove(g_layer[i].vk_create);
+            HookRemove(g_layer[i].vk_create1);
             g_layer[i].eval.active = g_layer[i].eval_c.active =
                 g_layer[i].create.active = false;
+            g_layer[i].vk_eval.active = g_layer[i].vk_eval_c.active =
+                g_layer[i].vk_create.active = g_layer[i].vk_create1.active = false;
         }
         LeaveCriticalSection(&g_hook_cs);
         if (g_unregister != nullptr) g_unregister(g_self);

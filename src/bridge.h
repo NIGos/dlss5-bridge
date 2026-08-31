@@ -23,6 +23,55 @@ enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_COUNT };
 static const char *kSlotKey[SLOT_COUNT]  = { "Color", "Output", "Depth", "MotionVectors" };
 static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
 
+// The four facts a texture description has to yield for the dimension repairs
+// in BridgeFrameInner to run: width, height, format and sample count. Nothing
+// in that block reads anything else out of a description, and D3D11, D3D12 and
+// Vulkan spell those four in three unrelated structs -- so the repairs that
+// Gallipoli, The Elder Scrolls Online, Phantasy Star Online 2 and House Party
+// each forced stay one block of code rather than one copy per API.
+//
+// The field names deliberately match D3D11's. Every one of those repairs was
+// verified by inspection against a user log and none of those titles is
+// available to test, so each read site keeps the exact expression it was
+// verified with; only the sample count -- SampleDesc.Count there, Samples here
+// -- reads differently at all.
+struct TexFacts
+{
+    UINT        Width;
+    UINT        Height;
+    DXGI_FORMAT Format;
+    UINT        Samples;
+};
+
+// Which contract the D3D12 side is mirroring. Every decision that used to read
+// "the bridge is running" has to say whose frames it is running on the moment
+// there is more than one answer, so the answer is stored rather than inferred.
+// Declared here because bridge.inc is included well before the counters beside
+// g_eval_count and reads this in NoteAbsentParam and BridgeWillDeliver.
+enum Source { SRC_NONE, SRC_MIRROR, SRC_SYNTH };
+
+static volatile LONG g_source;
+
+// Frames this add-on has actually put into the game's Output, counted whichever
+// source produced them. g_bridge.frames_done cannot answer that question for
+// anyone outside the frame path: it is the mirror's own state, and a second
+// source would keep its own. ReportIdle needs one liveness signal that does not
+// have to be taught about each new source.
+static volatile LONG g_frames_delivered;
+
+// The mirror runs on the game's render thread; a synthetic source runs on the
+// thread ReShade renders its effects from. Both reach the one g_bridge -- its
+// textures, its fence values, its command list -- and the lock BridgeFrame
+// already takes is the game's own ID3D11Multithread, held only when the game
+// switched multithread protection on. That is a lock about the game's device,
+// not about this add-on's state, so it cannot be the one that separates two
+// sources.
+// ponytail: one global section around the whole frame, not per-object locks.
+// It is uncontended in every session that has one source, which the arming
+// latch makes the only kind there is; splitting it earns nothing until two
+// sources are ever live at once, which is the thing the latch forbids.
+static CRITICAL_SECTION g_bridge_cs;
+
 struct Bridge
 {
     bool disabled;          // set after a hard failure; never retried
@@ -108,6 +157,13 @@ struct Bridge
     UINT64                     fence_value;
 
     PFN_D3D12CreateFeature   create_feature;
+
+    // The first bytes of NVSDK_NGX_D3D12_CreateFeature as they were when this
+    // add-on took its own copy of the pointer. A DLSS 5 add-on detours that
+    // export, so a change here is that add-on arriving -- derived, not timed.
+    unsigned char            create_prologue[16];
+    bool                     create_prologue_taken;
+    bool                     recreated_for_addon;
     PFN_D3D12EvaluateFeature eval_feature;
     PFN_D3D12ReleaseFeature  release_feature;
     PFN_AllocateParameters   alloc_params;
@@ -153,6 +209,17 @@ struct Bridge
     LONGLONG cpu_ticks;
     LONGLONG span_start;
     UINT64   timed_frames;
+
+    // The synthetic path's optical flow, kept apart from cpu_ticks because it is
+    // not the bridge's own cost and because it is invisible to the line above:
+    // TimingTick is only reached through BridgeFrame, and the whole flow block
+    // runs before BridgeFrame is called. nvOFExecute blocks the calling thread,
+    // which here is ReShade's present thread, so this is CPU time inside the
+    // game's frame rather than merely GPU time -- and it is the budget item.
+    // Zero in every mirror session, which is what keeps the report line
+    // byte-identical there.
+    LONGLONG ofa_ticks;
+    UINT64   ofa_frames;
 
     // The game's depth is R24G8_TYPELESS and D3D11 will not create a shared
     // texture in that format, so the shared copy is R32_FLOAT and a compute pass

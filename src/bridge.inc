@@ -45,21 +45,36 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //                  overwritten by this bridge anyway, so running it is wasted
 //                  work -- this is where most of the frame cost comes back.
 //                  Only takes effect while the bridge is actually delivering.
+//   source=auto    which contract the D3D12 side runs on: auto, mirror, synth
+//                  or off. A word rather than a number, because auto is not a
+//                  quantity. Only mirror exists to be selected today; auto is
+//                  it, and the other two are read and reported and do nothing
+//   synth_after=0  seconds to wait for the game's own DLSS before a synthetic
+//                  contract may start. 0 is off. There is no such contract yet,
+//                  so this is read and reported and nothing waits on it
 // The create flags are the only place the game states what its own buffers
 // mean: whether the colour carries values above 1.0, whether the depth is
 // reversed, whether the motion vectors are at render resolution. Spelling them
 // out costs one line and removes the arithmetic from every report.
+// The spelling on its own, because the status panel has to print the same names
+// into an ImGui line rather than into the log. Two copies of this list is two
+// lists to forget to extend the day NGX defines another bit.
+static void CreateFlagNames(char *b, size_t n, unsigned int f)
+{
+    b[0] = 0;
+    if (f & 0x01) strcat_s(b, n, " IsHDR");
+    if (f & 0x02) strcat_s(b, n, " MVLowRes");
+    if (f & 0x04) strcat_s(b, n, " MVJittered");
+    if (f & 0x08) strcat_s(b, n, " DepthInverted");
+    if (f & 0x20) strcat_s(b, n, " DoSharpening");
+    if (f & 0x40) strcat_s(b, n, " AutoExposure");
+    if (b[0] == 0) strcat_s(b, n, " none");
+}
+
 static void LogCreateFlags(const char *what, unsigned int f)
 {
     char b[192];
-    b[0] = 0;
-    if (f & 0x01) strcat_s(b, " IsHDR");
-    if (f & 0x02) strcat_s(b, " MVLowRes");
-    if (f & 0x04) strcat_s(b, " MVJittered");
-    if (f & 0x08) strcat_s(b, " DepthInverted");
-    if (f & 0x20) strcat_s(b, " DoSharpening");
-    if (f & 0x40) strcat_s(b, " AutoExposure");
-    if (b[0] == 0) strcat_s(b, " none");
+    CreateFlagNames(b, sizeof(b), f);
     Log("[bridge] %s flags %u:%s", what, f, b);
 }
 
@@ -96,9 +111,56 @@ struct BridgeCfg
     int dred;
     int skip_exe;
     int unwrap;
+    int source;        // CfgSource
+    int synth_after;   // seconds, 0 off
+    // Which way a third-party motion-vector shader points its Y, and its X.
+    // Neither ReshadeMotionEstimation nor qUINT_of.fx states the direction in
+    // its declaration, and there is no parameter, semantic or annotation that
+    // does -- so this cannot be derived, only tried. MV.Scale carries the sign,
+    // and a sign that is wrong gathers the temporal history from the wrong side
+    // of the movement: exactly the smear Trails beyond the Horizon showed when
+    // -1.0 was invented for it. Guessing once and shipping it is how that
+    // happened; a knob is how a user fixes it in the version they already have.
+    int mv_sign_x;   // -1 / +1 force; 0 uses the provider's own convention
+    int mv_sign_y;
+    // NVOFA output grid size: 0 off, else 1, 2 or 4. Both the on/off switch and
+    // the calibration knob, so there is no second key. Default 2, measured on an
+    // RTX 5090 at 3840x1600: 1.6 ms/frame and 109 MB driver-side, and a median
+    // error of 0.09-0.11 px against grid 4's 0.12-0.19 px on rotation and zoom.
+    // Grid 4 is 0.6 ms and not broken; grid 1 buys nothing measurable over 2 and
+    // costs 8.8 ms. Perf level is fixed at FAST because at grid 2 it is inside
+    // MEDIUM's noise floor -- a second knob whose right answer is already known
+    // is a second thing that can be set wrong.
+    int ofa_grid;
+    // 5 SLOW, 10 MEDIUM, 20 FAST -- NVOFA's own NV_OF_PERF_LEVEL values, so a
+    // report quoting this number can be read against NVIDIA's table directly.
+    int ofa_perf;
 };
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1 };
+// auto is not a fourth point on a scale with the other three, so this is stored
+// as a word in the file: "source=1" would have to be looked up to be read, and
+// the value it names is the one thing in this file a user is most likely to be
+// told to change by someone else.
+enum CfgSource { CFG_SRC_AUTO, CFG_SRC_MIRROR, CFG_SRC_SYNTH, CFG_SRC_OFF };
+
+static const char *kCfgSourceName[] = { "auto", "mirror", "synth", "off" };
+
+static int ParseSourceWord(const char *w, int fallback)
+{
+    for (int i = 0; i < static_cast<int>(_countof(kCfgSourceName)); ++i)
+        if (_stricmp(w, kCfgSourceName[i]) == 0) return i;
+    return fallback;   // an unreadable value is not a request to change anything
+}
+
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 0, 0, 2, 20 };
+
+// CfgReload's one-second gate, promoted out of that function so the panel can
+// reach it. Two uses, both of them reads of a clock rather than of a setting:
+// zeroing it after a panel write makes the next delivered frame re-read the file
+// instead of waiting the second out, and a value still zero seconds after a
+// write is how the panel tells "the value was rejected" from "nothing has called
+// CfgReload at all". It is a gate, not a setting: g_cfg keeps exactly one writer.
+static volatile LONGLONG g_cfg_last_read;
 
 // Accumulates the two figures and reports them together, because either one
 // alone is misleading.
@@ -160,17 +222,33 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
             1000.0 * double(g_bridge.iv_max) / double(g_bridge.qpf));
         g_bridge.iv_min = 0; g_bridge.iv_max = 0;
         g_bridge.cpu_ticks = 0; g_bridge.timed_frames = 0; g_bridge.span_start = exit;
+        g_bridge.ofa_ticks = 0; g_bridge.ofa_frames = 0;
         return;
     }
 
     const double lo = 1000.0 * double(g_bridge.iv_min) / double(g_bridge.qpf);
     const double hi = 1000.0 * double(g_bridge.iv_max) / double(g_bridge.qpf);
 
+    // The synthetic path's optical flow, as a clause that is empty whenever no
+    // flow ran. In the nine shipped titles ofa_frames is always 0, so the line
+    // below is byte-identical to every one already in a mirror log. It carries
+    // its own denominator on purpose: if that count disagrees with the leading
+    // frame count, flow ran on frames that were not delivered, and the line says
+    // so rather than quietly averaging over the wrong number.
+    char ofa[80] = "";
+    if (g_bridge.ofa_frames != 0)
+        _snprintf_s(ofa, sizeof(ofa), _TRUNCATE,
+                    " | optical flow %.2f ms over %llu frames",
+                    1000.0 * double(g_bridge.ofa_ticks) / double(g_bridge.qpf)
+                           / double(g_bridge.ofa_frames),
+                    g_bridge.ofa_frames);
+
     Log("[bridge] %.0f frames: bridge CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) "
-        "| spread %.2f-%.2f ms | bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)%s",
+        "| spread %.2f-%.2f ms | bridge is %.0f%% of the frame | d3d12 %llu/%llu (%lld behind)%s%s",
         n, cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), lo, hi,
         100.0 * cpu_ms / span_ms, done, g_bridge.fence_value,
         static_cast<long long>(g_bridge.fence_value) - static_cast<long long>(done),
+        ofa,
         ForegroundIsThisProcess() ? "" : "  <== WINDOW NOT IN FOCUS, do not read as steady state");
 
     // This measures the gap between the game's own DLSS calls, so a loading
@@ -191,14 +269,22 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     g_bridge.iv_max       = 0;
     g_bridge.cpu_ticks    = 0;
     g_bridge.timed_frames = 0;
+    g_bridge.ofa_ticks    = 0;
+    g_bridge.ofa_frames   = 0;
     g_bridge.span_start   = exit;
 }
 
 // True only when skipping the game's own DLSS cannot leave a stale frame on
 // screen: the bridge must be healthy and already have produced a valid output.
+// This is only ever asked in order to suppress the game's own DLSS evaluate, so
+// the frames it counts have to be frames that replace it. During a handover the
+// flags below still read healthy while the frames behind them were produced by
+// somebody else, and skipping the game on that evidence leaves the last mirrored
+// image on screen under live audio and live input.
 static bool BridgeWillDeliver()
 {
-    return g_cfg.skip_game != 0 && g_cfg.mode == 2 && g_cfg.stage >= 3 &&
+    return g_source == SRC_MIRROR &&
+           g_cfg.skip_game != 0 && g_cfg.mode == 2 && g_cfg.stage >= 3 &&
            !g_bridge.disabled && g_bridge.session_ready && g_bridge.frame_ready &&
            !g_bridge.partial_output && g_bridge.frames_done > 0;
 }
@@ -218,10 +304,10 @@ static void CfgReload()
     // render thread every single frame, inside the lock the game's own threads
     // contend for. The clock does not stop when the counter does.
     // ponytail: one second, fixed; a per-caller rate only if one ever earns it.
-    static ULONGLONG last_read;
     const ULONGLONG now = GetTickCount64();
+    const ULONGLONG last_read = static_cast<ULONGLONG>(g_cfg_last_read);
     if (last_read != 0 && now - last_read < 1000) return;
-    last_read = now;
+    g_cfg_last_read = static_cast<LONGLONG>(now);
 
     char path[MAX_PATH];
     CfgPath(path);
@@ -235,7 +321,19 @@ static void CfgReload()
     {
         char key[64];
         int  val = 0;
-        if (sscanf_s(line, "%63[^=]=%d", key, static_cast<unsigned>(sizeof(key)), &val) != 2) continue;
+        if (sscanf_s(line, "%63[^=]=%d", key, static_cast<unsigned>(sizeof(key)), &val) != 2)
+        {
+            // Only source= takes a word, so the numeric scan stays exactly as it
+            // was and a line it rejects gets one more chance rather than a
+            // rewritten parser -- every other key in this file is a number, and
+            // the ones the nine shipped titles depend on are all in that set.
+            char word[16];
+            if (sscanf_s(line, "%63[^=]=%15s", key, static_cast<unsigned>(sizeof(key)),
+                         word, static_cast<unsigned>(sizeof(word))) == 2 &&
+                _stricmp(key, "source") == 0)
+                next.source = ParseSourceWord(word, next.source);
+            continue;
+        }
         if      (_stricmp(key, "mode")        == 0) next.mode        = val;
         else if (_stricmp(key, "flags")       == 0) next.flags       = val;
         else if (_stricmp(key, "dred")        == 0) next.dred        = val;
@@ -246,23 +344,58 @@ static void CfgReload()
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
         else if (_stricmp(key, "stage")       == 0) next.stage       = val;
         else if (_stricmp(key, "skip_game")   == 0) next.skip_game   = val;
+        else if (_stricmp(key, "synth_after") == 0) next.synth_after = val;
+        else if (_stricmp(key, "ofa_grid")    == 0) next.ofa_grid    = val;
+        else if (_stricmp(key, "ofa_perf")    == 0) next.ofa_perf    = val;
+        // Only the sign is taken, because only the sign is unknown: the
+        // magnitude is the back buffer size and this add-on measures that. A
+        // number here that is not a sign would be a second way to say something
+        // already derived, and the two would disagree.
+        // Three-valued, not two. 0 means "use whatever the motion-vector provider
+        // documents", which for vort_Shaders is a fact read out of MIT source rather
+        // than a guess; -1 and +1 force, and forcing still wins, because a real
+        // installation is where a documented convention gets contradicted.
+        else if (_stricmp(key, "mv_sign_x")   == 0) next.mv_sign_x   = (val < 0) ? -1 : (val > 0 ? 1 : 0);
+        else if (_stricmp(key, "mv_sign_y")   == 0) next.mv_sign_y   = (val < 0) ? -1 : (val > 0 ? 1 : 0);
     }
     fclose(f);
     if (next.stage < 0 || next.stage > 3) next.stage = g_cfg.stage;
 
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
 
+    // Same rule stage and mode already follow: a value that is not one of the
+    // four the driver was measured with is not a request to change anything.
+    if (next.ofa_grid != 0 && next.ofa_grid != 1 && next.ofa_grid != 2 && next.ofa_grid != 4)
+        next.ofa_grid = g_cfg.ofa_grid;
+    // Anything else is a typo rather than a request; keep what was working.
+    if (next.ofa_perf != 5 && next.ofa_perf != 10 && next.ofa_perf != 20)
+        next.ofa_perf = g_cfg.ofa_perf;
+
+    // Every field, not a chosen few. dred, skip_exe and unwrap were absent here,
+    // so editing one of them mid-session was applied and never reported -- the
+    // config line then described a file it no longer matched, which is worse
+    // than not printing one. A key worth reading is worth comparing.
     const bool rebuild = (next.flags != g_cfg.flags) || (next.subrects != g_cfg.subrects);
     const bool changed = rebuild || (next.mode != g_cfg.mode) ||
                          (next.reset_every != g_cfg.reset_every) || (next.pixels != g_cfg.pixels) ||
-                         (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game);
+                         (next.stage != g_cfg.stage) || (next.skip_game != g_cfg.skip_game) ||
+                         (next.dred != g_cfg.dred) || (next.skip_exe != g_cfg.skip_exe) ||
+                         (next.unwrap != g_cfg.unwrap) || (next.source != g_cfg.source) ||
+                         (next.synth_after != g_cfg.synth_after) ||
+                         (next.mv_sign_x != g_cfg.mv_sign_x) ||
+                         (next.mv_sign_y != g_cfg.mv_sign_y) ||
+                         (next.ofa_grid != g_cfg.ofa_grid) ||
+                         (next.ofa_perf != g_cfg.ofa_perf);
     if (!changed) return;
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d unwrap=%d",
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d source=%s synth_after=%d "
+        "mv_sign_x=%d mv_sign_y=%d ofa_grid=%d ofa_perf=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
-        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
+        g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
+        kCfgSourceName[g_cfg.source], g_cfg.synth_after, g_cfg.mv_sign_x, g_cfg.mv_sign_y,
+        g_cfg.ofa_grid, g_cfg.ofa_perf);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -277,20 +410,194 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\n",
+    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nsource=%s\nsynth_after=%d\nmv_sign_x=%d\nmv_sign_y=%d\nofa_grid=%d\nofa_perf=%d\n",
             g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
-            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
+            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
+            kCfgSourceName[g_cfg.source], g_cfg.synth_after, g_cfg.mv_sign_x, g_cfg.mv_sign_y,
+            g_cfg.ofa_grid, g_cfg.ofa_perf);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
+}
+
+// The status panel's only writer, and the only place in this add-on that writes
+// a file a user owns. It rewrites ONE key and leaves every other byte --
+// comments, keys this build has never heard of, ordering, CRLF -- exactly as it
+// found them: the file is the single source of truth and this add-on is not its
+// author. That is also why CfgWriteDefault is not reused as the writer; its one
+// fprintf prints the struct and would delete everything else in the file.
+//
+// The read happens one instruction before the write, so an edit a user saved
+// from a text editor two frames ago is in the buffer being rewritten rather than
+// being overwritten by a snapshot taken at start-up. Nothing here touches g_cfg:
+// CfgReload picks this up from the file on the next delivered frame, through the
+// same parser, the same validators and the same change detector a hand edit goes
+// through, which is what keeps one source of truth and one writer of g_cfg.
+// ponytail: last writer wins inside this one call; no lock file, no watcher.
+// The one fiddly part of the writer, kept pure so it can be run on its own: no
+// file, no globals, in and out are buffers. Copies every line of in verbatim,
+// replaces the value on the first line whose key matches, appends the key if no
+// line matched, and returns the length written -- or 0 if the result would not
+// fit, which the caller reports rather than truncating a user's file.
+//
+// The key comparison is the text before the first '=', trimmed of spaces, tabs
+// and a CR, so a CRLF file and an indented line both match. Line endings are
+// carried through byte for byte because a line is copied with its own newline;
+// only the line this writes uses \n.
+static size_t CfgRewriteLine(const char *in, size_t n, const char *key, const char *value,
+                             char *out, size_t out_n)
+{
+    size_t o = 0;
+    bool   done = false;
+    const size_t klen = strlen(key);
+    for (size_t i = 0; i < n; )
+    {
+        size_t e = i;
+        while (e < n && in[e] != '\n') ++e;
+        const size_t len = (e < n) ? (e - i + 1) : (e - i);   // the newline stays with the line
+
+        size_t k0 = i;
+        while (k0 < e && (in[k0] == ' ' || in[k0] == '\t')) ++k0;
+        size_t k1 = k0;
+        while (k1 < e && in[k1] != '=') ++k1;
+        size_t k2 = k1;
+        while (k2 > k0 && (in[k2 - 1] == ' ' || in[k2 - 1] == '\t' || in[k2 - 1] == '\r')) --k2;
+
+        if (!done && k1 < e && (k2 - k0) == klen && _strnicmp(in + k0, key, klen) == 0)
+        {
+            const int w = _snprintf_s(out + o, out_n - o, _TRUNCATE, "%s=%s\n", key, value);
+            if (w < 0) return 0;
+            o += static_cast<size_t>(w);
+            done = true;
+        }
+        else
+        {
+            if (o + len >= out_n) return 0;
+            memcpy(out + o, in + i, len);
+            o += len;
+        }
+        i = (e < n) ? e + 1 : e;
+    }
+    if (!done)
+    {
+        // A file whose last line has no newline of its own -- which a text
+        // editor is perfectly happy to save -- would otherwise have the appended
+        // key run onto the end of it, producing one line that parses as neither.
+        if (o > 0 && out[o - 1] != '\n')
+        {
+            if (o + 1 >= out_n) return 0;
+            out[o++] = '\n';
+        }
+        const int w = _snprintf_s(out + o, out_n - o, _TRUNCATE, "%s=%s\n", key, value);
+        if (w < 0) return 0;
+        o += static_cast<size_t>(w);
+    }
+    return o;
+}
+
+static bool CfgSetKey(const char *key, const char *value, char *why, size_t why_n)
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+
+    // Normally a no-op, because it returns early when the file exists. If the
+    // file was deleted mid-session it comes back with ALL sixteen keys at this
+    // session's current values -- it prints g_cfg, not build defaults -- and
+    // writing only our one line into a vanished file would instead leave fifteen
+    // keys absent, which is invisible now and reverts a user's whole tuning on
+    // the next launch.
+    CfgWriteDefault();
+
+    char   buf[4096];
+    size_t n = 0;
+    FILE  *f = nullptr;
+    if (fopen_s(&f, path, "rb") == 0 && f != nullptr)
+    {
+        n = fread(buf, 1, sizeof(buf), f);
+        fclose(f);
+    }
+    // Most editors save by truncate-then-write, so a zero-byte read of a file
+    // that exists means mid-save rather than empty. Refusing costs one click.
+    if (n == 0)
+    {
+        strcpy_s(why, why_n, "the config file could not be read just now; try again");
+        return false;
+    }
+    // A writer that silently truncates at its buffer would destroy an annotated
+    // config. Refuse and say so.
+    if (n == sizeof(buf))
+    {
+        strcpy_s(why, why_n,
+                 "this file is larger than the panel will rewrite; change it in a text editor");
+        return false;
+    }
+    buf[n] = 0;
+
+    char   out[4352];
+    const size_t o = CfgRewriteLine(buf, n, key, value, out, sizeof(out));
+    if (o == 0)
+    {
+        strcpy_s(why, why_n,
+                 "this file is larger than the panel will rewrite; change it in a text editor");
+        return false;
+    }
+
+    // Temp plus rename, so a failure leaves the original byte-for-byte intact
+    // and CfgReload on the other thread never sees a half-written file.
+    char tmp[MAX_PATH + 8];
+    _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s.tmp", path);
+
+    FILE *w = nullptr;
+    if (fopen_s(&w, tmp, "wb") != 0 || w == nullptr)
+    {
+        _snprintf_s(why, why_n, _TRUNCATE,
+                    "dlss5-dx11-bridge.cfg could not be written (error %lu)", GetLastError());
+        return false;
+    }
+    const bool wrote = fwrite(out, 1, o, w) == o;
+    fflush(w);
+    fclose(w);
+    if (!wrote)
+    {
+        DeleteFileA(tmp);
+        strcpy_s(why, why_n, "dlss5-dx11-bridge.cfg could not be written in full");
+        return false;
+    }
+
+    // CfgReload's own fopen can hold the target at this instant -- MSVC's fopen
+    // does not ask for FILE_SHARE_DELETE -- so a sharing violation here is a
+    // race with a reader rather than a broken folder. Three tries, no sleep.
+    DWORD err = 0;
+    for (int t = 0; t < 3; ++t)
+    {
+        if (MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        {
+            // Not a setting: the reload gate, so the next delivered frame reads
+            // the file instead of waiting the one-second rate limit out.
+            InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(&g_cfg_last_read), 0);
+            // Once per click, never per frame: Log takes g_log_cs and the render
+            // thread takes it too.
+            Log("[panel] wrote %s=%s to %s", key, value, path);
+            return true;
+        }
+        err = GetLastError();
+    }
+    DeleteFileA(tmp);
+    _snprintf_s(why, why_n, _TRUNCATE, "the config file was busy; try again (error %lu)", err);
+    return false;
 }
 
 // Reads one pixel back to the CPU. Blocking and slow, so only used on the first
 // few frames, but it settles what the buffers actually contain instead of
 // guessing from what the screen looks like.
-static void LogCenterPixel(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
-                           const char *label, ID3D11Texture2D *tex, DXGI_FORMAT fmt)
+//
+// The coordinate is a parameter and the value is returned rather than logged,
+// because synth.inc asks the same question of a texture that is not the mirror's
+// and at points that are not its centre. Two readbacks would be two sets of
+// staging-texture and Map mistakes to make; this stays the only one.
+static bool ReadPixelRaw(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
+                         ID3D11Texture2D *tex, DXGI_FORMAT fmt, UINT x, UINT y, UINT *out)
 {
-    if (tex == nullptr) return;
+    if (tex == nullptr || ctx == nullptr || dev11 == nullptr || out == nullptr) return false;
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width            = 1;
@@ -303,20 +610,29 @@ static void LogCenterPixel(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
     td.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
 
     ID3D11Texture2D *staging = nullptr;
-    if (FAILED(dev11->CreateTexture2D(&td, nullptr, &staging)) || staging == nullptr) return;
+    if (FAILED(dev11->CreateTexture2D(&td, nullptr, &staging)) || staging == nullptr) return false;
 
-    const UINT cx = g_bridge.width / 2, cy = g_bridge.height / 2;
-    D3D11_BOX box = { cx, cy, 0, cx + 1, cy + 1, 1 };
+    D3D11_BOX box = { x, y, 0, x + 1, y + 1, 1 };
     ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box);
 
+    bool got = false;
     D3D11_MAPPED_SUBRESOURCE ms = {};
     if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &ms)) && ms.pData != nullptr)
     {
-        Log("[bridge]   %-8s centre pixel raw = 0x%08X", label,
-            *static_cast<const UINT *>(ms.pData));
+        *out = *static_cast<const UINT *>(ms.pData);
+        got  = true;
         ctx->Unmap(staging, 0);
     }
     staging->Release();
+    return got;
+}
+
+static void LogCenterPixel(ID3D11DeviceContext *ctx, ID3D11Device *dev11,
+                           const char *label, ID3D11Texture2D *tex, DXGI_FORMAT fmt)
+{
+    UINT raw = 0;
+    if (ReadPixelRaw(ctx, dev11, tex, fmt, g_bridge.width / 2, g_bridge.height / 2, &raw))
+        Log("[bridge]   %-8s centre pixel raw = 0x%08X", label, raw);
 }
 
 // Every path that gives up goes through here, so the user is told once, in the
@@ -889,10 +1205,21 @@ static void BridgeReleaseTextures()
     g_bridge.frame_ready = false;
 }
 
+// The one place a D3D11 description is reduced to the four facts the frame path
+// reads. A second backend fills the same TexFacts from its own desc type here,
+// rather than teaching the dimension repairs a second struct to read.
+static void TexFactsFromD3D11(const D3D11_TEXTURE2D_DESC &d, TexFacts *out)
+{
+    out->Width   = d.Width;
+    out->Height  = d.Height;
+    out->Format  = d.Format;
+    out->Samples = d.SampleDesc.Count;
+}
+
 // Reads one texture slot out of the game's parameter block and returns its
 // description, so the bridge can tell when BG3 has recreated its render targets.
 static ID3D11Texture2D *GameTexture(const NVSDK_NGX_Parameter *p, const char *key,
-                                    D3D11_TEXTURE2D_DESC *desc)
+                                    TexFacts *facts)
 {
     ID3D11Resource *res = nullptr;
     if (p->Get(key, &res) != NGX_SUCCESS || res == nullptr) return nullptr;
@@ -900,7 +1227,12 @@ static ID3D11Texture2D *GameTexture(const NVSDK_NGX_Parameter *p, const char *ke
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) ||
         tex == nullptr)
         return nullptr;
-    if (desc != nullptr) tex->GetDesc(desc);
+    if (facts != nullptr)
+    {
+        D3D11_TEXTURE2D_DESC desc = {};
+        tex->GetDesc(&desc);
+        TexFactsFromD3D11(desc, facts);
+    }
     return tex;  // caller releases
 }
 
@@ -1007,7 +1339,16 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (FAILED(hr) || g_bridge.dev12 == nullptr)
         { Log("[bridge] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
 
+        // The D3D11 synthetic transport comes through here rather than through
+        // Synth12Open, so the bootstrap has to be at both call sites. A game with
+        // no DLSS of its own has never loaded NGX -- nothing had a reason to --
+        // and this is where Skyrim Special Edition stopped on 2026-08-30 with the
+        // contract already built. Guarded on the source: on the mirror path,
+        // nothing exporting NGX means the game never called DLSS, and that is a
+        // fact to report rather than one to paper over by loading NGX for it.
         HMODULE ngx = FindNgxLoader();
+        if (ngx == nullptr && g_source == SRC_SYNTH && EnsureNgxLoaderLoaded())
+            ngx = FindNgxLoader();
         if (ngx == nullptr) { Log("[bridge] NGX D3D12 exports not present"); goto fail; }
 
         auto init_ext = reinterpret_cast<PFN_Init_Ext>(GetProcAddress(ngx, "NVSDK_NGX_D3D12_Init_Ext"));
@@ -1411,6 +1752,76 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
 // area is smaller than the texture that holds it.
 static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsigned int fallback);
 
+// One field, three meanings: g_cfg.flags carries the user's forced value, -1 for
+// "copy whoever is driving", and 107 for the default this add-on shipped before
+// 1.0.16 and now treats as unset. A second contract source would be a fourth
+// meaning in the same int, and the log line that reports the value would have no
+// way left to say where it came from -- which is the failure the note above
+// NoteAbsentParam names. So the origin is returned alongside the value and the
+// label is read off it, rather than reconstructed from the config at the point
+// of printing.
+enum FlagsFrom { FLAGS_NONE, FLAGS_GAME, FLAGS_SYNTH, FLAGS_CONFIG };
+
+static const char *kFlagsFromLabel[] = {
+    // FLAGS_NONE is 107 with nobody behind it -- no source and no config -- and
+    // says "forced by config" because that is what it said before this function
+    // existed, and a log line that changes meaning breaks every comparison
+    // against an older session.
+    "sent to D3D12, forced by config",
+    "sent to D3D12, copied from the game",
+    "sent to D3D12, built by the synthetic contract",
+    "sent to D3D12, forced by config",
+};
+
+// What actually went into the parameter block NGX was handed, and which of the
+// four origins above put it there. Both are locals at the two places that Set
+// the key -- BridgeBuildResources here and Synth12Build in synth.inc -- and the
+// status panel has to name them from ReShade's UI thread, where dereferencing
+// either parameter block to ask again is not allowed. So they are published
+// here instead of read back there. -1 means no create has happened yet, which
+// is a different answer from flags 0 and the panel says so.
+//
+// Written by whichever thread built the feature and read by the UI thread with
+// no lock: a LONG and a pointer to a string literal, both aligned, so a reader
+// sees one value or the other and never half of one. The literal is static
+// storage that outlives the process, so the pointer cannot go stale.
+static volatile LONG  g_panel_flags = -1;
+static const char    *g_panel_flags_from;
+
+// Precedence: an explicit config value, else the active source's own, else 107.
+// FLAGS_SYNTH has no producer in this build; it is declared so the value and its
+// label arrive together the first time one exists, instead of being retrofitted
+// into a field that already carries too much.
+static unsigned int ResolveCreateFlags(const NVSDK_NGX_Parameter *gp, FlagsFrom *from)
+{
+    if (g_cfg.flags >= 0 && g_cfg.flags != 107)
+    {
+        *from = FLAGS_CONFIG;
+        return static_cast<unsigned int>(g_cfg.flags);
+    }
+
+    // A source that is present is the source, whether or not it declared this
+    // particular key: 107 stands in for the key, not for the source. Whether the
+    // game declared it is a separate question, and the line above this one --
+    // "the game's create flags" -- is what answers it.
+    if (gp != nullptr)
+    {
+        unsigned int v = 0;
+        // Which source, asked of g_source rather than reconstructed from the
+        // value. A synthetic block answers this Get and would otherwise be
+        // labelled "copied from the game" in a session where there is no game
+        // to copy from -- a log line stating something it did not derive, and
+        // the one thing the flags storage was split per source to prevent.
+        // Absence still means 107 here, so the synthetic block being complete
+        // is the self-check's business, not this line's.
+        *from = (g_source == SRC_SYNTH) ? FLAGS_SYNTH : FLAGS_GAME;
+        return gp->Get("DLSS.Feature.Create.Flags", &v) == NGX_SUCCESS ? v : 107u;
+    }
+
+    *from = FLAGS_NONE;
+    return 107u;
+}
+
 static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
                                  const NVSDK_NGX_Parameter *gp)
 {
@@ -1601,13 +2012,12 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // game had set Sharpness to 1.0 without ever enabling it. The old default
     // is treated as unset, and the substitution is announced.
     const bool old_default = (g_cfg.flags == 107);
-    const bool copying     = (g_cfg.flags < 0 || old_default) && gp != nullptr;
 
-    if (copying)
-        CopyUIntParam(gp, "DLSS.Feature.Create.Flags", 107u);
-    else
-        g_bridge.params->Set("DLSS.Feature.Create.Flags",
-                             g_cfg.flags < 0 ? 107 : g_cfg.flags);
+    FlagsFrom          flags_from = FLAGS_NONE;
+    const unsigned int resolved   = ResolveCreateFlags(gp, &flags_from);
+    const bool         copying    = (flags_from == FLAGS_GAME);
+
+    g_bridge.params->Set("DLSS.Feature.Create.Flags", resolved);
     {
         unsigned int used = 0;
         g_bridge.params->Get("DLSS.Feature.Create.Flags", &used);
@@ -1616,8 +2026,14 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
             gp != nullptr && gp->Get("DLSS.Feature.Create.Flags", &asked) == NGX_SUCCESS;
 
         if (have_asked) LogCreateFlags("the game's create", asked);
-        LogCreateFlags(copying ? "sent to D3D12, copied from the game"
-                               : "sent to D3D12, forced by config", used);
+        LogCreateFlags(kFlagsFromLabel[flags_from], used);
+        // Published for the panel from the same value the line above prints, so
+        // the two can never disagree about what was sent.
+        // Origin first, then the value: the interlocked write is the barrier, so
+        // a reader that sees a value has already been able to see the label that
+        // goes with it.
+        g_panel_flags_from = kFlagsFromLabel[flags_from];
+        InterlockedExchange(&g_panel_flags, static_cast<LONG>(used));
 
         if (old_default && copying)
             Log("[bridge]   dlss5-dx11-bridge.cfg says flags=107, which was this "
@@ -1721,15 +2137,29 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
 
     if (code != 0)
     {
-        // NGX loads its feature implementations from the game folder before the
-        // driver's copy. A stale or mismatched nvngx_*.dll there is the usual
-        // reason creating a feature faults rather than returning an error.
-        Warn("creating the DLSS feature crashed. If you copied any nvngx_*.dll into "
-             "the game folder by hand, a version mismatch there is the likeliest "
-             "cause -- try removing them.");
-        Log("  NGX prefers nvngx_*.dll files sitting next to the game over the");
-        Log("  driver's own. If any were dropped in by hand, a version mismatch");
-        Log("  there is the likeliest cause -- try removing them.");
+        // What was observed, first, and on its own line: SafeCreateFeature runs
+        // under CaptureFault, so the faulting address is known and the module
+        // that owns it can be named. Which module it is decides the diagnosis --
+        // the driver's own loader, a snippet sitting in the game folder, or
+        // another add-on's detour in front of the call are three different
+        // problems -- and none of them can be told apart from a sentence that
+        // names a cause instead of an address.
+        wchar_t who[MAX_PATH + 64] = {};
+        Warn("creating the DLSS feature raised exception 0x%08X.", code);
+        if (NameFaultOwner(who, _countof(who)))
+            Log("[bridge]   it faulted in %ls", who);
+        else
+            Log("[bridge]   no faulting address was recorded, so the module cannot "
+                "be named.");
+
+        // Offered as something to try, not as the cause. A reporter on 2026-08-31
+        // made every nvngx_*.dll on the machine the same 310.8.0.0 and the create
+        // still faulted, so a version mismatch is one explanation among several
+        // rather than the answer.
+        Log("[bridge]   NGX loads its feature snippets from the game folder before the");
+        Log("[bridge]   driver's own copy, so an nvngx_*.dll dropped in there is worth");
+        Log("[bridge]   removing as a test. It is not established as the cause: the same");
+        Log("[bridge]   fault has been reported with every copy on the machine matching.");
         BridgeDisable("the DLSS feature could not be created");
         return false;
     }
@@ -1746,6 +2176,25 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     Log("[bridge] feature ready: render %ux%u -> output %ux%u  (textures in %ux%u out %ux%u) handle=%p",
         g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h,
         w, h, g_bridge.out_width, g_bridge.out_height, static_cast<void *>(g_bridge.feature));
+
+    // A DLSS 5 add-on captures its contract by detouring
+    // NVSDK_NGX_D3D12_CreateFeature and reading the create it sees. It arms when
+    // NGX appears -- and on the synthetic path NGX appears because THIS add-on
+    // loaded it, so the two race and the create can win. Skyrim Special Edition
+    // on 2026-08-30: create at 22:37:44.856, the other add-on's hook at .883.
+    // Twenty-seven milliseconds, and the neural pass never saw a contract.
+    //
+    // The prologue is taken here so a later change can be seen. A detour is
+    // written over the first bytes of the export, so those bytes changing is
+    // that add-on arriving -- which is a fact about memory rather than a guess
+    // about how long it takes.
+    if (!g_bridge.create_prologue_taken && g_bridge.create_feature != nullptr)
+    {
+        memcpy(g_bridge.create_prologue,
+               reinterpret_cast<const void *>(g_bridge.create_feature),
+               sizeof(g_bridge.create_prologue));
+        g_bridge.create_prologue_taken = true;
+    }
 
     // What a DLSS 5 add-on will ask of the textures the bridge hands it, asked
     // here first. Escape from Tarkov failed on exactly this and said so only
@@ -2038,13 +2487,38 @@ static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsig
 // smeared ground and foliage reported there. Whatever NGX does with an unset
 // parameter is exactly what the game's own DLSS call gets, so leaving it unset
 // is the only way to match. These mirror; they do not fill in.
+//
+// For the mirror an absent key is news about the game. For a synthetic contract
+// it is news about this add-on: the note above requires such a contract to
+// arrive already complete, so arriving here at all means the synthesiser left a
+// key unset and the value that follows was chosen by nobody. Same call site,
+// opposite meaning, so it cannot be the same sentence.
 static void NoteAbsentParam(const char *key)
 {
     static const char *seen[32];
     static int         count;
+    static LONG        seen_source = SRC_NONE;
+
+    // Thirty-two slots between every source there will ever be. One source that
+    // runs first fills them and the next one's report comes out empty, which
+    // reads exactly like a complete contract. Start the table again instead:
+    // both accounts are wanted in full, and a repeat after a handover is the
+    // point rather than noise.
+    const LONG src = g_source;
+    if (src != seen_source) { count = 0; seen_source = src; }
+
     for (int i = 0; i < count; ++i)
         if (strcmp(seen[i], key) == 0) return;
     if (count < static_cast<int>(_countof(seen))) seen[count++] = key;
+
+    if (src == SRC_SYNTH)
+    {
+        Log("[synth] DEFECT: the synthetic contract sets no %s, and this path exists "
+            "to describe a game that under-declares. A contract built here is built "
+            "complete or not at all, so the neutral now being sent is standing in for "
+            "a decision nothing made.", key);
+        return;
+    }
     Log("[bridge] the game sets no %s; the neutral from nvsdk_ngx_helpers.h is sent "
         "instead, which is what a game using the official helper would send.", key);
 }
@@ -2225,7 +2699,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // Stage 0 touches nothing at all, not even a read of the game's parameters.
     if (g_cfg.stage <= 0) { ++g_bridge.frames_done; return; }
 
-    D3D11_TEXTURE2D_DESC d[SLOT_COUNT] = {};
+    TexFacts             d[SLOT_COUNT] = {};
     ID3D11Texture2D     *g[SLOT_COUNT] = {};
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
@@ -2249,7 +2723,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // any size or format, so nothing else would have noticed it.
     UINT samples = 1;
     for (int i = 0; i < SLOT_COUNT; ++i)
-        if (d[i].SampleDesc.Count > samples) samples = d[i].SampleDesc.Count;
+        if (d[i].Samples > samples) samples = d[i].Samples;
     if (samples > 1)
     {
         if (!g_bridge.msaa_reported)
@@ -2686,6 +3160,33 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         g_bridge.pending_out = v_out;
 
         const UINT64 n = ++g_bridge.frames_done;
+        // The one place a completed evaluate exists to be copied back, so the
+        // only honest place to count a delivered frame. The stage<3 returns
+        // above move frames_done as well, and they deliver nothing.
+        InterlockedIncrement(&g_frames_delivered);
+
+        // Did a DLSS 5 add-on detour CreateFeature after this add-on had already
+        // called it? Only asked on the synthetic path, and only for the first
+        // few frames: in a mirror session the game creates features of its own
+        // and that add-on catches one of those, but here nothing else will ever
+        // call CreateFeature again, so the one create it missed was the only one
+        // there was going to be. Comparing the bytes is the whole test -- a
+        // detour is written over them -- so this states what it observed rather
+        // than waiting a length of time somebody guessed.
+        if (g_source == SRC_SYNTH && g_bridge.create_prologue_taken &&
+            !g_bridge.recreated_for_addon && n >= 2 && n <= 240 &&
+            g_bridge.create_feature != nullptr &&
+            memcmp(g_bridge.create_prologue,
+                   reinterpret_cast<const void *>(g_bridge.create_feature),
+                   sizeof(g_bridge.create_prologue)) != 0)
+        {
+            g_bridge.recreated_for_addon = true;
+            Log("[bridge] NVSDK_NGX_D3D12_CreateFeature has been detoured since this add-on "
+                "created its feature, which is a DLSS 5 add-on arming after the fact. It "
+                "captures its contract from a create it sees, and it did not see this one. "
+                "Rebuilding once so that it does.");
+            g_bridge.frame_ready = false;
+        }
 
         if (mode == 2)      ctx->CopyResource(g[SLOT_OUTPUT], g_bridge.tex11[SLOT_OUTPUT]);
         else if (mode == 1) ctx->CopyResource(g[SLOT_OUTPUT], g_bridge.tex11[SLOT_COLOR]);

@@ -1,0 +1,14 @@
+#version 450
+// Reads the depth view the game itself hands NGX (any depth format) and writes
+// normalized depth into the bridge's shared R32_SFLOAT image.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src_depth;
+layout(binding = 1, r32f) uniform writeonly image2D dst_r32f;
+layout(push_constant) uniform PC { uvec2 extent; } pc;
+void main()
+{
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= pc.extent.x || p.y >= pc.extent.y) return;
+    float d = texelFetch(src_depth, ivec2(p), 0).r;
+    imageStore(dst_r32f, ivec2(p), vec4(d, 0.0, 0.0, 0.0));
+}
