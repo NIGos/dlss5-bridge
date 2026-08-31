@@ -1,6 +1,6 @@
 # DLSS 5 Bridge
 
-> ## v1.1.0 — the biggest release, and the last
+> ## v1.2.0 — the biggest release, and the last
 >
 > **Vulkan games are supported.** A Vulkan game's own DLSS contract is mirrored
 > onto a private D3D12 session, so neural rendering runs over the game's own
