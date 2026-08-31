@@ -1,5 +1,24 @@
 # DLSS 5 DX11 Bridge
 
+> ## Project status: finished
+>
+> **The DLSS 5 add-on now supports D3D11 and D3D9 directly, so the reason this
+> bridge existed is gone.** For a D3D11 or D3D9 game, use that add-on on its own
+> — it is the one that gets updated.
+>
+> **v1.1.0 is the last feature release. There is no active development after it.**
+>
+> Two things here are not covered by the add-on on its own, and are why the last
+> release is still worth taking: the **Vulkan bridge** (`vk_mirror=1`), which
+> mirrors a Vulkan game's own DLSS contract onto a private D3D12 session, and
+> **motion vectors read straight from the NVIDIA driver's optical flow engine**,
+> which removes the dependency on a third-party ReShade shader. Both are off by
+> default and both are NVIDIA-only.
+>
+> The repository stays up and stays MIT. The source is complete and builds from a
+> clean copy with the command below. Issues can be opened and will be read, but
+> assume nothing is fixed unless someone picks it up. Fork it freely.
+
 A ReShade add-on that lets a DLSS 5 Neural Rendering add-on — which only hooks
 DirectX 12 — run inside a game that renders with DirectX 11.
 
