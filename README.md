@@ -28,8 +28,10 @@
 A ReShade add-on that lets a DLSS 5 Neural Rendering add-on — which only hooks
 DirectX 12 — run inside a game that renders with DirectX 11.
 
-Tested on Baldur's Gate 3 (DX11 build), with DLAA and with every DLSS quality
-preset. Nothing here is specific to that game.
+Tested on two titles, unevenly: Skyrim Special Edition on D3D11, for the synthetic
+contract and the driver's optical flow, over extended play; and Baldur's Gate 3 on
+Vulkan for the mirror, briefly. Nothing here is specific to either game, but
+nothing else has been tried.
 
 ## What it does
 
