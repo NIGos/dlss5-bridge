@@ -29,7 +29,7 @@
 // the wait, so it executes once the D3D12 evaluate has finished. The worker sees
 // the first event, runs the D3D12 evaluate, sets the second. No queue is ever
 // touched, no vkQueueSubmit is intercepted, and therefore no Vulkan layer and no
-// manifest are needed. Seven Vulkan 1.0 core entry points and one Win32 event.
+// manifest are needed. Seven Vulkan 1.0 core entry points and two Win32 events.
 //
 // The park is what makes the time budget load-bearing rather than tidy: the
 // game's GPU is stopped for its duration, and Windows resets a device that stops
@@ -39,7 +39,7 @@
 // for the whole game, so that is written as an unconditional statement at the
 // end of the worker's body and not as a line inside an if.
 //
-// Off unless vk_mirror=1 is in dlss5-dx11-bridge.cfg. Nothing here is reached,
+// Off unless vk_mirror=1 is in dlss5-bridge.cfg. Nothing here is reached,
 // and none of the four Vulkan entry points is even hooked, without it.
 //
 // The transport shape -- create the shared textures on D3D12 and import THOSE
@@ -107,7 +107,7 @@ static const uint32_t kVkFmtD32SfloatS8Uint = 130;
 
 // The inverse of SynthVkFormat, and it has to exist separately: that one maps
 // the formats this add-on chose for its own textures, and the mirror has to
-// accept whatever the game presents. Six entries, covering what DLSS titles
+// accept whatever the game presents. Seven entries, covering what DLSS titles
 // actually hand NGX as Color. Anything else refuses by number, so the table is
 // extended from a report rather than guessed at -- there is deliberately no blit
 // fallback, because a blit converts, and a conversion nobody measured is exactly
@@ -193,12 +193,20 @@ struct VkmRes
 // removal for the whole game rather than a dropped frame.
 static const DWORD kVkmSeeCopiesMs = 300;
 
-// Consecutive stalls before the mirror gives up. 300 frames at the rate this
-// runs is a few seconds of a queue that never answers, which no ordinary pause
-// is. The threshold is deliberately far above anything measured, because the
-// cost of retiring early is silent: the game keeps rendering with its own DLSS
-// and the picture stays right, so a mirror that gave up looks like one that
-// works. Nothing has been observed to reach even a count of one -- see below.
+// Stalls before the mirror gives up, counted over the SESSION rather than
+// consecutively -- and the difference is not cosmetic. The drain gate in
+// VkMirrorFrame returns before the worker is woken, so a queue that stops
+// answering altogether freezes this counter instead of advancing it: reaching 300
+// means the queue came back 299 times. Each stall also costs the worker its full
+// 300 ms poll plus the drain frames after it, so 300 of them is a minute and a
+// half at best, not the few seconds this comment used to claim.
+//
+// A queue that never comes back is therefore not covered by this at all. The
+// mirror contributes nothing and says nothing further, and the game keeps
+// rendering with its own DLSS. That is the accepted cost of not retiring on a
+// hiccup, in code that measured zero stalls across roughly 18000 frames: the
+// threshold sits far above anything observed because retiring early is silent --
+// the picture stays right, so a mirror that gave up looks like one that works.
 static const LONG  kVkmStallGiveUp = 300;
 static const DWORD kVkmEvaluateMs  = 900;
 
@@ -217,9 +225,7 @@ static const DWORD kVkmIdleMs      = kVkmSeeCopiesMs + kVkmEvaluateMs + 200;
 
 struct VkMirror
 {
-    bool    opened;      // the session bring-up ran
     bool    refused;     // and refused, or something later stood the mirror down
-    bool    worker_ok;
 
     // TWO pairs, alternating, and the second pair is not pipelining -- there is
     // still exactly one frame in flight. It exists because a VkEvent must not be
@@ -398,8 +404,9 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
                 // permanent thing they would become if they kept coming.
                 if (g_vkm.stalls != 0)
                 {
-                    Log("[vkmirror] the game's queue is answering again after %ld skipped "
-                        "frame%s; the mirror never stopped.", g_vkm.stalls,
+                    Log("[vkmirror] the game's queue is answering again after %ld stalled "
+                        "frame%s, plus the drain frames each one costs, which are not "
+                        "counted here; the mirror was not retired.", g_vkm.stalls,
                         g_vkm.stalls == 1 ? "" : "s");
                     g_vkm.stalls = 0;
                 }
@@ -430,9 +437,10 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             const LONG n = InterlockedIncrement(&g_vkm.stalls);
             if (n == 1 || (n % 60) == 0)
                 Log("[vkmirror] the game's queue did not reach the bridge's copies within "
-                    "%d ms, so this frame is skipped (%ld in a row). The count clears on "
-                    "the first frame that arrives; if it keeps climbing, this log is the "
-                    "first record of what reaches this path.", kVkmSeeCopiesMs, n);
+                    "%d ms, so this frame is skipped (%ld stalls so far). The count clears "
+                    "on the first frame that arrives and evaluates; if it keeps climbing, "
+                    "this log is the first record of what reaches this path.",
+                    kVkmSeeCopiesMs, n);
             // Hand the render thread a stand-down before releasing it. This
             // frame's commands are still queued and unexecuted, so its pair must
             // not be reset by the next frame that comes round to it -- set this
@@ -445,8 +453,14 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             // vkCmdWaitEvents on ev_out, and a path that skips setting it hangs
             // the game instead of dropping a frame.
             if (n >= kVkmStallGiveUp)
-                VkmRefuse("the game's queue has not reached the bridge's copies for "
-                          "300 consecutive frames, which is no longer a pause");
+            {
+                char msg[224];
+                _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                            "the game's queue has failed to reach the bridge's copies on "
+                            "%ld frames this session, which is no longer a pause",
+                            kVkmStallGiveUp);
+                VkmRefuse(msg);
+            }
         }
 
         // UNCONDITIONAL, and it is written here rather than inside either branch
@@ -464,6 +478,13 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
 static void VkmShutdown()
 {
     if (g_vkm.worker == nullptr) return;
+
+    // FIRST, before anything is released. VkMirrorFrame's entry guard reads this,
+    // so a render thread that has not started a frame yet cannot arm one behind
+    // this function -- which would reset ev_out after the release below and then
+    // park the game's GPU on an event no code left in the process would ever set.
+    g_vkm.refused = true;
+
     if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
         for (int i = 0; i < 2; ++i)
             if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
@@ -471,11 +492,12 @@ static void VkmShutdown()
     SetEvent(g_vkm.wake);
     WaitForSingleObject(g_vkm.worker, 2000);
 
-    // Again, and this pass is the one that counts. The set above races the
-    // render thread's reset; this one runs after the worker is gone, so nothing
-    // is left to reset them behind it. It also covers the 2000 ms wait expiring
-    // on a worker still inside its evaluate, which leaves the loop's own release
-    // unreached.
+    // Again, and this pass is the one that counts. The set above races a render
+    // thread that was already inside VkMirrorFrame when refused went true and has
+    // not yet reached the re-check before the arm -- the reset is that thread's,
+    // not the worker's. This pass runs after both windows have closed. It also
+    // covers the 2000 ms wait expiring on a worker still inside its evaluate,
+    // which leaves the loop's own release unreached.
     if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
         for (int i = 0; i < 2; ++i)
             if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
@@ -697,7 +719,6 @@ static bool VkmEnsureEvents()
     if (g_vkm.worker == nullptr)
     { VkmRefuse("the mirror's worker thread would not start"); return false; }
 
-    g_vkm.worker_ok = true;
     // ponytail: the four VkEvents and the worker thread live for the life of the
     // process. Two events per pair is 64 bytes of driver object; destroying them
     // would need a point at which no submitted command buffer can still name
@@ -761,8 +782,15 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     // retire fence if a title ever measures badly enough to be worth it.
     if (g_vkm.idle != nullptr && WaitForSingleObject(g_vkm.idle, kVkmIdleMs) != WAIT_OBJECT_0)
     {
-        VkmRefuse("the previous frame's park had not cleared a second later, so nothing was "
-                  "recorded for this one");
+        // The number is the whole diagnostic here: this refusal retires the mirror
+        // for the session, so the one thing a report needs is how long the worker
+        // was actually given. Printed from the constant rather than spelled out in
+        // prose, which is what drifted when kVkmIdleMs stopped being 1000.
+        char msg[192];
+        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                    "the previous frame's park had not cleared %lu ms later, so nothing was "
+                    "recorded for this one", kVkmIdleMs);
+        VkmRefuse(msg);
         return;
     }
 
@@ -966,6 +994,11 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         return;
     }
 
+    // Re-read after the idle wait above, which blocks for kVkmIdleMs: a detach
+    // that ran VkmShutdown inside that window has already released the game, and
+    // arming a pair now would reset ev_out and park on a worker that has exited.
+    if (g_vkm.refused) return;
+
     const int pair = g_vkm.next;
     g_vkm.next ^= 1;
     g_svk.EvReset(g_svk.dev, g_vkm.ev_in[pair]);
@@ -1063,8 +1096,13 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
 
     // stage 2 parks and evaluates and writes nothing, which proves the park is
     // safe and inside its budget without ever putting a wrong pixel on screen.
-    // stage 3 is the copy back.
-    if (g_cfg.stage >= 3)
+    // stage 3 is the copy back. mode is tested with it because mode=1 skips the
+    // NGX evaluate entirely -- Synth12EvaluateShared returns success without
+    // running it -- so this copy would put a never-written texture over the
+    // game's own image, and mode=0 is documented everywhere else as never
+    // writing to the game. Both sibling paths already gate on mode; only this
+    // one did not.
+    if (g_cfg.stage >= 3 && g_cfg.mode == 2)
     {
         SynthVkBarrier(cb, g_svk.img[SLOT_OUTPUT], kSVkLayoutGeneral, kSVkLayoutTransferSrc);
         SynthVkBarrier(cb, res[SLOT_OUTPUT].image, kSVkLayoutGeneral, kSVkLayoutTransferDst,

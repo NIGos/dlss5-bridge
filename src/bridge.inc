@@ -12,7 +12,7 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 }
 
 // Everything worth trying here is a value, not code, and the add-on binary is
-// locked while the game runs. So the tunables live in dlss5-dx11-bridge.cfg,
+// locked while the game runs. So the tunables live in dlss5-bridge.cfg,
 // re-read while playing: edit it, and within a second the bridge picks the
 // change up and rebuilds whatever it invalidates. One session, many
 // experiments.
@@ -128,9 +128,7 @@ struct BridgeCfg
     // RTX 5090 at 3840x1600: 1.6 ms/frame and 109 MB driver-side, and a median
     // error of 0.09-0.11 px against grid 4's 0.12-0.19 px on rotation and zoom.
     // Grid 4 is 0.6 ms and not broken; grid 1 buys nothing measurable over 2 and
-    // costs 8.8 ms. Perf level is fixed at FAST because at grid 2 it is inside
-    // MEDIUM's noise floor -- a second knob whose right answer is already known
-    // is a second thing that can be set wrong.
+    // costs 8.8 ms.
     int ofa_grid;
     // 5 SLOW, 10 MEDIUM, 20 FAST -- NVOFA's own NV_OF_PERF_LEVEL values, so a
     // report quoting this number can be read against NVIDIA's table directly.
@@ -289,11 +287,25 @@ static bool BridgeWillDeliver()
            !g_bridge.partial_output && g_bridge.frames_done > 0;
 }
 
+// The add-on was called dlss5-dx11-bridge until 1.1.0, so a user upgrading has a
+// cfg under the old name with their settings in it. Take the new name when it
+// exists, the old one when only that does, and the new name when neither does,
+// so a fresh install writes the current one. Silently reverting somebody to
+// defaults because a file was renamed is not an upgrade anyone forgives.
 static void CfgPath(char *out)
 {
     GetModuleFileNameA(g_self, out, MAX_PATH);
-    if (char *s = strrchr(out, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "dlss5-dx11-bridge.cfg");
+    char *s = strrchr(out, '\\');
+    if (s == nullptr) return;
+    const size_t room = MAX_PATH - (s + 1 - out);
+
+    strcpy_s(s + 1, room, "dlss5-bridge.cfg");
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return;
+
+    strcpy_s(s + 1, room, "dlss5-dx11-bridge.cfg");
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return;
+
+    strcpy_s(s + 1, room, "dlss5-bridge.cfg");
 }
 
 static void CfgReload()
@@ -550,7 +562,7 @@ static bool CfgSetKey(const char *key, const char *value, char *why, size_t why_
     if (fopen_s(&w, tmp, "wb") != 0 || w == nullptr)
     {
         _snprintf_s(why, why_n, _TRUNCATE,
-                    "dlss5-dx11-bridge.cfg could not be written (error %lu)", GetLastError());
+                    "dlss5-bridge.cfg could not be written (error %lu)", GetLastError());
         return false;
     }
     const bool wrote = fwrite(out, 1, o, w) == o;
@@ -559,7 +571,7 @@ static bool CfgSetKey(const char *key, const char *value, char *why, size_t why_
     if (!wrote)
     {
         DeleteFileA(tmp);
-        strcpy_s(why, why_n, "dlss5-dx11-bridge.cfg could not be written in full");
+        strcpy_s(why, why_n, "dlss5-bridge.cfg could not be written in full");
         return false;
     }
 
@@ -793,7 +805,7 @@ static void BridgeDisable(const char *why)
 {
     if (g_bridge.disabled) return;
     g_bridge.disabled = true;
-    Warn("stopped: %s. The game renders normally. See dlss5-dx11-bridge.log "
+    Warn("stopped: %s. The game renders normally. See dlss5-bridge.log "
          "in the game folder for the detail.", why);
 
     // Before anything else. The game's queue may be waiting on a fence value
@@ -1332,7 +1344,7 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
                 "game keeps its own rendering.%s", dcode,
                 g_cfg.dred != 0
                     ? " DRED was requested for this session; set dred=0 in "
-                      "dlss5-dx11-bridge.cfg to make an attempt without it."
+                      "dlss5-bridge.cfg to make an attempt without it."
                     : " DRED was off for this attempt.");
             goto fail;
         }
@@ -1563,8 +1575,8 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // DRED reports a hung GPU by naming the command list and queue that
         // stopped. Unnamed objects come back as blanks, which is useless in a
         // process holding several of each.
-        if (g_bridge.queue != nullptr) g_bridge.queue->SetName(L"dlss5-dx11-bridge queue");
-        if (g_bridge.list  != nullptr) g_bridge.list->SetName(L"dlss5-dx11-bridge list");
+        if (g_bridge.queue != nullptr) g_bridge.queue->SetName(L"dlss5-bridge queue");
+        if (g_bridge.list  != nullptr) g_bridge.list->SetName(L"dlss5-bridge list");
 
         Log("[bridge] session ready: queue=%p list=%p fence12=%p fence11=%p (%d frames in flight)",
             static_cast<void *>(g_bridge.queue), static_cast<void *>(g_bridge.list),
@@ -1679,7 +1691,7 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
     {
     {
         wchar_t n[64];
-        _snwprintf_s(n, _TRUNCATE, L"dlss5-dx11-bridge %hs", kSlotName[i]);
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-bridge %hs", kSlotName[i]);
         g_bridge.tex12[i]->SetName(n);
     }
         Log("[bridge] %-6s %ux%u fmt=%u  via D3D12->D3D11  d3d12=%p d3d11=%p",
@@ -1736,7 +1748,7 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
 
     {
         wchar_t n[64];
-        _snwprintf_s(n, _TRUNCATE, L"dlss5-dx11-bridge %hs", kSlotName[i]);
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-bridge %hs", kSlotName[i]);
         g_bridge.tex12[i]->SetName(n);
     }
     Log("[bridge] %-6s %ux%u fmt=%u  via D3D11->D3D12  d3d12=%p d3d11=%p",
@@ -2036,14 +2048,14 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         InterlockedExchange(&g_panel_flags, static_cast<LONG>(used));
 
         if (old_default && copying)
-            Log("[bridge]   dlss5-dx11-bridge.cfg says flags=107, which was this "
+            Log("[bridge]   dlss5-bridge.cfg says flags=107, which was this "
                 "add-on's default before 1.0.16 rather than a description of this "
                 "game. It is being ignored in favour of the game's own value. To "
                 "force it, use flags=108 -- any value that is not 107 or -1 is "
                 "taken as deliberate.");
 
         if (!copying && have_asked && asked != used)
-            Log("[bridge]   these differ. Set flags=-1 in dlss5-dx11-bridge.cfg to "
+            Log("[bridge]   these differ. Set flags=-1 in dlss5-bridge.cfg to "
                 "copy the game's own value; the file is re-read while playing.");
 
         // DLSS applies its sharpening pass only when DoSharpening is set, and
@@ -2444,13 +2456,6 @@ static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
 // A failed Get is not required to leave the destination alone, so the result is
 // checked rather than assumed. Silently forwarding a zeroed value is how a
 // parameter the game never set becomes a wrong one the bridge invented.
-static void CopyFloatParam(const NVSDK_NGX_Parameter *src, const char *key, float fallback)
-{
-    float v = 0.0f;
-    if (src->Get(key, &v) != NGX_SUCCESS) v = fallback;
-    g_bridge.params->Set(key, v);
-}
-
 static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsigned int fallback)
 {
     unsigned int v = 0;
@@ -2649,7 +2654,7 @@ static bool BridgeEnsureExposure(ID3D11Device *dev11, ID3D11Texture2D *src)
     g_bridge.exp_w   = sd.Width;
     g_bridge.exp_h   = sd.Height;
     g_bridge.exp_fmt = sd.Format;
-    g_bridge.exp12->SetName(L"dlss5-dx11-bridge Exposure");
+    g_bridge.exp12->SetName(L"dlss5-bridge Exposure");
     if (!g_bridge.exp_reported)
     {
         g_bridge.exp_reported = true;

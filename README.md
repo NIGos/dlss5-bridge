@@ -1,4 +1,4 @@
-# DLSS 5 DX11 Bridge
+# DLSS 5 Bridge
 
 > ## v1.1.0 — the biggest release, and the last
 >
@@ -9,7 +9,8 @@
 >
 > **Motion vectors come straight from the NVIDIA driver.** The optical flow engine
 > in `nvofapi64.dll` is driven directly, so no ReShade motion-vector shader has to
-> be installed. 0.18 ms per frame at 3840x1600.
+> be installed. Works on D3D11 and on Vulkan; see Known limits for the different
+> route each one takes.
 >
 > **A game with no DLSS at all can be given one.** The two above add up to a DLSS
 > contract built from ReShade's depth and the driver's motion vectors, handed to
@@ -30,8 +31,9 @@ DirectX 12 — run inside a game that renders with DirectX 11.
 
 Tested on two titles, unevenly: Skyrim Special Edition on D3D11, for the synthetic
 contract and the driver's optical flow, over extended play; and Baldur's Gate 3 on
-Vulkan for the mirror, briefly. Nothing here is specific to either game, but
-nothing else has been tried.
+Vulkan, for the mirror and for the synthetic contract with the optical flow engine,
+in shorter sessions. Nothing here is specific to either game, but nothing else has
+been tried.
 
 ## What it does
 
@@ -69,10 +71,10 @@ In the game folder, alongside the game executable:
 
 | File | Where from |
 | --- | --- |
-| `dxgi.dll` — ReShade 6.8+ **with add-on support** | reshade.me, full version |
+| `dxgi.dll` — ReShade 6.0+ **with add-on support** | reshade.me, full version |
 | a DLSS 5 Neural Rendering ReShade add-on | its own author |
 | `nvngx_dlssnr.dll` | shipped with that add-on |
-| `dlss5-dx11-bridge.addon64` | this package |
+| `dlss5-bridge.addon64` | this package |
 
 The DLSS 5 add-on's own neural-rendering toggle has to be enabled, either in
 its ReShade overlay panel or in `ReShade.ini`.
@@ -82,17 +84,26 @@ support D3D12, and `ID3D11Device5` for cross-API shared fences.
 
 ## Install
 
-Drop `dlss5-dx11-bridge.addon64` next to ReShade. On first run it writes
-`dlss5-dx11-bridge.cfg` with working defaults; nothing needs configuring.
+Drop `dlss5-bridge.addon64` next to ReShade. On first run it writes
+`dlss5-bridge.cfg` with working defaults; nothing needs configuring.
+
+**Upgrading from 1.0.x:** the add-on was called `dlss5-dx11-bridge.addon64` and
+its settings file `dlss5-dx11-bridge.cfg`. **Delete the old `.addon64`.** ReShade
+loads every add-on it finds, so leaving it there puts two copies of this in the
+process, both writing over the same NGX entry points; the log says so if it
+happens, but it cannot prevent it. The old `.cfg` is read as-is — settings carry
+over with nothing to do — and can be deleted once the new one has been written.
 
 To remove it, delete the file.
 
-Nothing on disk is patched. The only writes to foreign code are 14 bytes at
-three function entry points, in memory, restored around every call.
+Nothing on disk is patched. The only writes to foreign code are 14 bytes at each
+of three function entry points in every module that exports the NGX D3D11 API —
+six such modules in Baldur's Gate 3, twelve at most — in memory, restored around
+every call. `vk_mirror=1` adds four more per module.
 
 ## Configuration
 
-`dlss5-dx11-bridge.cfg` is re-read while the game runs, so values can be
+`dlss5-bridge.cfg` is re-read while the game runs, so values can be
 changed without restarting. Changes that only take effect on a new NGX feature
 trigger a rebuild automatically.
 
@@ -101,17 +112,22 @@ trigger a rebuild automatically.
 | `stage` | 3 | How much of the bridge runs. `0` fully inert, `1` the input copies only, `2` also the depth conversion, `3` everything. Useful for isolating a problem: if `stage=0` still misbehaves, the bridge is not the cause. |
 | `mode` | 2 | `0` never writes to the game, `1` transport only with no DLSS, `2` the full path. |
 | `skip_game` | 1 | Do not forward the game's own DLSS evaluate. Its result is overwritten anyway, so running it is wasted work. Suppressed only while the bridge is healthy and already delivering. |
-| `flags` | 107 | `DLSS.Feature.Create.Flags` for the bridge's feature. |
+| `flags` | -1 | `DLSS.Feature.Create.Flags` for the bridge's feature. `-1` copies the game's own value. Any other value forces one, except `107`, which was this add-on's default before 1.0.16 and is treated as unset — use `108` to force that bit pattern deliberately. |
 | `subrects` | 1 | Fallback for `DLSS.Enable.Output.Subrects`, used only when the game does not set one of its own. |
 | `reset_every` | 0 | `1` forces the NGX Reset flag every frame, discarding temporal history. Diagnostic only. |
 | `pixels` | 0 | `1` reads pixels back to the CPU for debugging. Stalls the GPU hard. |
 | `vk_mirror` | 0 | `1` hooks the `NVSDK_NGX_VULKAN` entry points as well, and mirrors a **Vulkan** game's own DLSS contract onto the private D3D12 session. Off by default and read once at launch, not re-read while the game runs: it decides whether four more foreign entry points get a fourteen-byte jump written into them, which is a launch-time decision. Needs a Vulkan game with DLSS of its own, ReShade attached to the Vulkan runtime, and a game whose NGX depth aspect is four bytes per texel — `D32_SFLOAT`, `D32_SFLOAT_S8_UINT` or `D24_UNORM_S8_UINT`. A 16-bit depth aspect, and every other case, refuses by name in the log and leaves the game's own DLSS on screen. `stage` still applies: `2` runs everything but the copy back into the game's Output, `3` is the whole path. |
-| `ofa_grid` | 2 | Output grid size for the driver's own optical flow engine, which supplies motion vectors on the synthetic path. `0` switches it off and falls back to a ReShade motion-estimation shader; `1`, `2` and `4` select the grid. Only read when the synthetic path is armed (`synth_after` above 0) — the mirror path never touches it. On a **Vulkan** runtime the engine runs on a private D3D11 device that opens `ID3D11Texture2D` aliases of the two shared D3D12 textures the transport already creates, so nothing extra is allocated for it; on D3D12 the engine is not wired and the motion vectors come from a ReShade shader. Measured on an RTX 5090 at 3840x1600: grid 2 costs 1.6 ms per frame and 109 MB, grid 4 costs 0.6 ms and 63 MB at roughly twice the error, grid 1 costs 8.8 ms and buys nothing measurable over grid 2. Any other value is ignored. |
-| `ofa_perf` | 20 | `NV_OF_PERF_LEVEL` for that engine: `5` SLOW, `10` MEDIUM, `20` FAST — NVIDIA's own numbers, so a report quoting this can be read against their table directly. The slower levels estimate sub-pixel motion more accurately and are the knob to reach for when fine detail drifts or shimmers under very slow camera motion; at FAST the residual error is 0.03-0.09 px and systematic. Cost multiplies with `ofa_grid`: at 3840x1600 on an idle GPU, grid 2 costs 11.5 / 6.2 / 1.6 ms at SLOW / MEDIUM / FAST, and grid 4 costs 3.0 / 1.2 / 0.6. Changing it closes and reopens the flow session. Any other value is ignored. |
+| `source` | `auto` | Which contract source may hold the session. `auto` lets the game's own DLSS win and falls back to the synthetic contract; `mirror` and `synth` pin one; `off` disables both. Read at launch and re-read every second. |
+| `synth_after` | 0 | Seconds to wait, with no NGX call from the game, before the synthetic contract may arm. `0` — the shipped default — leaves the synthetic path off entirely. |
+| `mv_sign_x` | 1 | Forces the X sign of the motion vectors instead of using the provider's documented convention. `1` keeps it, `-1` flips it. For diagnosing a provider whose sign this add-on has wrong. |
+| `mv_sign_y` | 1 | The same for Y. |
+| `probe` | 0 | `1` runs a standalone NGX D3D12 probe at attach and logs what the driver reports, then continues normally. A diagnostic; it changes nothing about how frames are handled. |
+| `ofa_grid` | 2 | Output grid size for the driver's own optical flow engine, which supplies motion vectors on the synthetic path. `0` switches it off and falls back to a ReShade motion-estimation shader; `1`, `2` and `4` select the grid. Only read when the synthetic path is armed (`synth_after` above 0) — the mirror path never touches it. On a **Vulkan** runtime the engine runs on a private D3D11 device, over two textures of its own that the transport copies into and reads out of — see Known limits for why it cannot alias the transport's; on D3D12 the engine is not wired and the motion vectors come from a ReShade shader. Measured on an RTX 5090 at 3840x1600: grid 2 uses 109 MB, grid 4 uses 63 MB at roughly twice the error, and grid 1 buys nothing measurable over grid 2. Frame cost is not quoted here: the figures taken in a standalone harness and the one the add-on's own log reports measure different things and have never been reconciled, and the status panel reports the live one for the session in front of you. Any other value is ignored. |
+| `ofa_perf` | 20 | `NV_OF_PERF_LEVEL` for that engine: `5` SLOW, `10` MEDIUM, `20` FAST — NVIDIA's own numbers, so a report quoting this can be read against their table directly. The slower levels estimate sub-pixel motion more accurately and are the knob to reach for when fine detail drifts or shimmers under very slow camera motion; at FAST the residual error is 0.03-0.09 px and systematic. Cost multiplies with `ofa_grid`, and SLOW is several times FAST at either grid. Numbers are not quoted here for the reason given in the `ofa_grid` row; the status panel reports the live cost for the session in front of you. Changing it closes and reopens the flow session. Any other value is ignored. |
 
 ## Status panel
 
-Open ReShade's overlay and there is a **DLSS 5 DX11 Bridge** window. It answers,
+Open ReShade's overlay and there is a **DLSS 5 Bridge** window. It answers,
 without anyone having to find a log file, the question every support report
 starts with: which of these paths is this session actually on.
 
@@ -120,8 +136,8 @@ starts with: which of these paths is this session actually on.
   sentence the delivery path itself refuses on, not a second copy of it
 - the backend: which API ReShade's effect runtime is on, and the transport that
   follows from it
-- the contract: input and output dimensions, the create flags with their bits
-  spelled out, and which source those flags came from
+- the contract: input and output dimensions, and the create flags with their
+  bits spelled out
 - motion vectors, on the synthetic path: which provider is producing them by
   name, whether the optical flow session is open and at what grid and effort,
   and what it measured as costing per frame
@@ -139,7 +155,7 @@ Six keys have controls: `source` (`auto` / `mirror only` / `synthetic only`),
 `synth_after` (as a checkbox writing `10` or `0`), `ofa_grid`, `ofa_perf`,
 `mv_sign_x` and `mv_sign_y`.
 
-`dlss5-dx11-bridge.cfg` is still the only place a value is set. The panel does
+`dlss5-bridge.cfg` is still the only place a value is set. The panel does
 not hold a copy of any setting: a click writes that one line of the file, and
 the file is re-read from the frame path exactly as it is after a text-editor
 edit — same parser, same validators, same change log, same rebuild. So there is
@@ -148,17 +164,20 @@ adopted, and a hand edit made while the panel is open wins with no merge rule to
 document. Every other byte of the file is left alone, comments included.
 
 The dividing line for what gets a control is not simple against advanced, it is
-whether the key takes effect on a running session. `dred`, `unwrap`, `skip_exe`
-and `pixels` are read once at attach or at device creation, so a click on them
-would do nothing. `stage`, `mode`, `skip_game`, `flags`, `subrects`,
+whether the key takes effect on a running session. `dred` and `unwrap` are read
+at device creation, so a click on them would do nothing. `pixels` is re-read
+every frame but only acts on frames 2 through 4, so it is a launch-time setting
+in effect; `skip_exe` is re-read on every module scan, but a module it rejected
+stays rejected. `stage`, `mode`, `skip_game`, `flags`, `subrects`,
 `reset_every` and `source=off` stay file-only for a different reason: they are
 diagnostic escape hatches that exist because a specific title broke, and a
 wrongly-set one produces a bug report that describes the setting rather than the
 bug. The panel names any of them that is off its default instead, in one line.
 
-`source` and `synth_after` are offered only before a source has claimed the
-session, because that latch is one-way; afterwards the panel prints their values
-and says they apply to the next launch. The motion-vector sign controls are
+`source` and `synth_after` are offered whenever no source holds the session:
+before the first DLSS call, and again after a Vulkan game's own DLSS has been
+quiet long enough for the latch to be released. While a source holds it the panel
+prints their values and says they apply to the next launch. The motion-vector sign controls are
 offered only while the optical flow engine is *not* running, because its
 direction is measured on the machine rather than assumed, and forcing a sign
 there would invert vectors that are already correct.
@@ -175,7 +194,7 @@ refuse cleanly and nothing else in the add-on is affected.
 
 ## Log
 
-`dlss5-dx11-bridge.log` records the contract read from the game, which
+`dlss5-bridge.log` records the contract read from the game, which
 resource-sharing direction the driver accepted, the result of every NGX call,
 and a timing line every 600 frames:
 
@@ -228,8 +247,8 @@ build does not require and this machine does not have.
 
 ```
 rc /nologo version.rc
-cl /nologo /LD /EHsc /O2 /MT /std:c++17 dlss5-dx11-bridge.cpp ^
-   /link /OUT:dlss5-dx11-bridge.addon64 version.res kernel32.lib user32.lib advapi32.lib
+cl /nologo /LD /EHsc /O2 /MT /std:c++17 dlss5-bridge.cpp ^
+   /link /OUT:dlss5-bridge.addon64 version.res kernel32.lib user32.lib advapi32.lib
 ```
 
 The version lives in two places that have to stay in step: `BRIDGE_VERSION` in
@@ -239,7 +258,7 @@ the second is what ReShade's overlay shows.
 ## Reporting a problem
 
 A screenshot of the status panel above answers the first question on its own.
-For anything past that, post `dlss5-dx11-bridge.log`. It is written to answer the
+For anything past that, post `dlss5-bridge.log`. It is written to answer the
 usual questions without a conversation:
 
 - the exact build, with its compile date
@@ -272,7 +291,7 @@ Reported by users, across seven unrelated engines:
 
 | Title | Engine | DLSS from |
 | --- | --- | --- |
-| **Baldur's Gate 3** | Divinity 4.0 | the game — tested in depth here, DLAA and every quality preset |
+| **Baldur's Gate 3** | Divinity 4.0 | the game |
 | **Final Fantasy XIV Online** | in-house | the game |
 | **The Legend of Heroes: Trails beyond the Horizon** | Falcom | the game — needed both fixes in 1.0.4 and 1.0.5, and is the reason they exist |
 | **Tainted Grail: Fall of Avalon** | Unity | the game |
@@ -282,7 +301,7 @@ Reported by users, across seven unrelated engines:
 | **S.T.A.L.K.E.R. Anomaly** | X-Ray | an upscaler injector mod (SSS24) |
 | **Assetto Corsa** | kunOS | Custom Shaders Patch (Preview 338 or later) |
 
-The last three matter for a second reason: they show the bridge picks up DLSS
+The last four matter for a second reason: they show the bridge picks up DLSS
 that another mod provides, not only DLSS built into the game. Those setups reach
 NGX by a different route — the mod links NGX statically and calls the feature
 snippet directly, rather than through the driver's loader — which is why every
@@ -333,7 +352,7 @@ Nothing else in this repository is third-party.
 
 - The game's DLSS runs once and the bridge's runs once; with `skip_game=1` only
   the bridge's does. There is no path that avoids a second NGX session.
-- Every fix is verified on Baldur's Gate 3 and on one GPU. The other titles in
+- Every fix is verified on one title and one GPU — the mirror on Baldur's Gate 3, the synthetic contract and the optical flow on Skyrim Special Edition (D3D11) and on Baldur's Gate 3 (Vulkan). The other titles in
   the table above are user reports, so a change that works here can still be
   wrong somewhere else.
 - Resolution changes and DLSS preset changes are handled by rebuilding, but
@@ -350,7 +369,31 @@ Nothing else in this repository is third-party.
   bytes per texel, which the staging buffer and its texture are both sized wrong
   for.
 - The Vulkan mirror runs one frame in flight, so it costs one pipeline bubble
-  per frame. It has not yet been run against a Vulkan title.
+  per frame. It has been run against one Vulkan title on one GPU — several
+  sessions and roughly 25000 mirrored frames of Baldur's Gate 3 — and no second
+  Vulkan title has been tried.
+- On the synthetic **Vulkan** path the driver's optical flow engine works, and the
+  route it takes is worth recording because the obvious one does not. The engine
+  needs a colour it can read and a motion-vector texture it can write, on a D3D11
+  device. It used to try opening `ID3D11Texture2D` aliases of the two shared D3D12
+  textures the transport already creates, through
+  `ID3D11Device1::OpenSharedResource1`, and that call is refused with `E_INVALIDARG`
+  (`0x80070057`) on the GPU and driver this was developed on. The same refusal is in
+  every D3D11 session log: the mirror's `MakeSharedPair` tries that direction first,
+  is refused for every texture and every format, and succeeds only by creating on
+  D3D11 and opening on D3D12 — the line reading `via D3D11->D3D12`. So the engine now
+  creates its own two textures the way the mirror does, in the direction this driver
+  accepts, and the transport copies each frame's colour into the engine's texture on
+  the D3D12 side under a CPU fence wait. NGX is handed the engine's motion-vector
+  texture directly; there is no copy back.
+- Arming on Vulkan no longer needs a ReShade motion-vector shader. The gate wanted
+  motion vectors before it would build the transport, and the engine that supplies
+  them opens inside the transport — so a machine with no such shader installed
+  never armed and the engine never got a first chance. The gate now accepts a
+  session on the expectation of the engine; the first frames build the transport
+  and open it, deliver nothing, and the vectors are real from the next one. If the
+  engine then refuses to open, the transport stands down rather than evaluating
+  over an unwritten texture.
 - The synthetic **Vulkan** path reads depth with a compute pass that samples it,
   so the depth binding no longer has to be 32-bit float and no longer has to be
   a copy source. What it still has to be is *the size of the back buffer*, and

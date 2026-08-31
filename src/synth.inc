@@ -427,8 +427,6 @@ static bool SynthApiHasBackend(uint32_t api)
            api == static_cast<uint32_t>(reshade::api::device_api::vulkan);
 }
 
-// Prints every precondition with the measurement behind it. A verdict on its own
-// sends people to a forum; the number that produced it is what lets them fix it.
 // ---------------------------------------------------------------------------
 // The verdict, computed once
 //
@@ -499,14 +497,6 @@ static SynthVerdictFacts SynthVerdictOf(const SynthFacts *f)
     return v;
 }
 
-// A small integer standing for exactly what the verdict line prints -- the depth
-// reason, whether the motion vectors are ok, and whether a depth encoding stands
-// the session aside. Nothing else: the point is that two probes with the same
-// story compare equal even when unrelated bytes of SynthFacts moved.
-//
-// depth_read and depth_varies reach this through depth_ok, so it is only
-// meaningful AFTER SynthProbeDepth has run. Computing it before the readback
-// makes the flat-depth verdict structurally invisible to the comparison.
 // The depth half of the verdict, as one index into the table below. Most
 // specific true reason first: size and sample count are read off a descriptor,
 // and an unbound depth has no descriptor -- its width is zero, so an earlier
@@ -540,12 +530,22 @@ static const char *const kSynthDepthReason[] = {
 static_assert(_countof(kSynthDepthReason) == 7,
               "kSynthDepthReason must have one entry per SynthDepthReason result");
 
+// A small integer standing for exactly what the verdict line prints -- the depth
+// reason, whether the motion vectors are ok, and whether a depth encoding stands
+// the session aside. Nothing else: the point is that two probes with the same
+// story compare equal even when unrelated bytes of SynthFacts moved.
+//
+// depth_read and depth_varies reach this through depth_ok, so it is only
+// meaningful AFTER SynthProbeDepth has run. Computing it before the readback
+// makes the flat-depth verdict structurally invisible to the comparison.
 static uint32_t SynthVerdictKey(const SynthFacts *f)
 {
     const SynthVerdictFacts v = SynthVerdictOf(f);
     return SynthDepthReason(f, v) | (v.mv_ok ? 0x10u : 0u) | (v.aside ? 0x20u : 0u);
 }
 
+// Prints every precondition with the measurement behind it. A verdict on its own
+// sends people to a forum; the number that produced it is what lets them fix it.
 static void SynthReport(const SynthFacts *f)
 {
     Log("[synth] ----- could a synthetic DLSS contract be built here? -----");
@@ -684,7 +684,7 @@ static void SynthReport(const SynthFacts *f)
             else
                 Log("[synth]     direction: this provider does not state one and its source is "
                     "not readable, so +1,+1 is assumed. If the image smears in the direction of "
-                    "movement, set mv_sign_y=-1 in dlss5-dx11-bridge.cfg.");
+                    "movement, set mv_sign_y=-1 in dlss5-bridge.cfg.");
         }
 
         // Both shipped providers declare RG16F at BUFFER_WIDTH x BUFFER_HEIGHT.
@@ -756,16 +756,18 @@ static void SynthReport(const SynthFacts *f)
     Log("[synth]   RESHADE_DEPTH_LINEARIZATION_FAR_PLANE has nothing to express: NGX is given "
         "raw depth, and the far plane is a shader-side convenience.");
 
+    // Only the three the verdict line reads. depth_size_ok and vk_depth_ok were
+    // named here too when this was extracted, and their sole remaining use is
+    // inside SynthDepthReason, which takes v and asks for itself.
     const SynthVerdictFacts v = SynthVerdictOf(f);
-    const bool depth_ok       = v.depth_ok;
-    const bool mv_ok          = v.mv_ok;
-    const bool aside          = v.aside;
-    const bool depth_size_ok  = v.depth_size_ok;
-    const bool vk_depth_ok    = v.vk_depth_ok;
+    const bool depth_ok = v.depth_ok;
+    const bool mv_ok    = v.mv_ok;
+    const bool aside    = v.aside;
 
     if (depth_ok && mv_ok && !aside)
-        Log("[synth]   verdict: every precondition holds. Nothing is built from them in this "
-            "build; this stage only measures.");
+        Log("[synth]   verdict: every precondition holds. Whether the synthetic contract "
+            "is also armed is a separate question -- synth_after, source and the game's "
+            "own DLSS decide it, and the arming line says so when it happens.");
     else
         // A depth buffer that is bound but could not be sampled is not the same
         // answer as one that is missing or flat: nothing was disproved, only
@@ -965,7 +967,7 @@ private:
 // and fails on exactly the defect constraint (a) exists to prevent: a synthetic
 // contract that arrives incomplete and lets NoteAbsentParam choose a value
 // nothing measured.
-static void SynthSelfCheck(const SynthParams *sp)
+static void SynthSelfCheck(const SynthParams *sp, bool mv_from_engine = false)
 {
     // Per key rather than per session: a key set only inside a branch would
     // otherwise be reported on the first frame and never again, or not at all
@@ -982,6 +984,13 @@ static void SynthSelfCheck(const SynthParams *sp)
         case SK_FLOAT: { float           v = 0.0f;    ok = sp->Get(kSynthSlots[i].key, &v) == NGX_SUCCESS; break; }
         case SK_RES:   { ID3D11Resource *v = nullptr; ok = sp->Get(kSynthSlots[i].key, &v) == NGX_SUCCESS; break; }
         }
+        // MotionVectors legitimately has no ReShade resource when the driver's own
+        // optical flow engine is the source: the vectors are written into the
+        // shared D3D12 texture from the other side, and the D3D12 evaluate sets
+        // that key itself. Reporting a DEFECT for it would be this file accusing
+        // itself of the arrangement it was built to have.
+        if (mv_from_engine && strcmp(kSynthSlots[i].key, "MotionVectors") == 0)
+            continue;
         if (ok || said[i]) continue;
         said[i] = true;
         Log("[synth] DEFECT: synthetic contract left %s unset", kSynthSlots[i].key);
@@ -2164,6 +2173,11 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
     if (n <= 1 || (n % 1800) == 0)
         Log("[synth] D3D12 frame %llu delivered (%ux%u)", n, w, h);
 }
+// The engine's own motion-vector texture, or null when the engine is not the
+// source. An accessor rather than a direct read because g_ovk is declared far
+// below the evaluate that has to ask.
+static ID3D12Resource *SynthOfaVkMvTexture();
+
 
 // The evaluate, for a session whose textures are all its own. The D3D12 half of
 // the Vulkan transport is exactly this: no back buffer arrives on this device
@@ -2207,7 +2221,16 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
     g_s12.params->Set("Output",        g_s12.tex[SLOT_OUTPUT]);
     g_s12.params->Set("Depth",         g_s12.depth_cvt != nullptr ? g_s12.depth_cvt
                                                                   : g_s12.tex[SLOT_DEPTH]);
-    g_s12.params->Set("MotionVectors", g_s12.tex[SLOT_MV]);
+    // The engine's own texture when it is the source, and the transport's
+    // otherwise. g_ovk.mv12 is non-null only after SynthOfaVkOpen succeeded, which
+    // happens on no other path -- the mirror never opens it, so the D3D11 mirror
+    // and the nine titles behind it read the same expression they always did.
+    //
+    // No copy back into SLOT_MV: NGX reads mv12 directly. It is a D3D12 resource
+    // on this device like any other, opened from the engine's D3D11 texture.
+    ID3D12Resource *const mv_engine = SynthOfaVkMvTexture();
+    g_s12.params->Set("MotionVectors", mv_engine != nullptr ? mv_engine
+                                                            : g_s12.tex[SLOT_MV]);
     Synth12FrameParams(sp);
 
     DWORD code = 0;
@@ -3393,9 +3416,9 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
         // resource that an imported VkDeviceMemory still names is a use after
         // free neither API has any way to report.
         SynthVkReleaseImages();
-        // The optical flow engine's D3D11 aliases of two of the textures
-        // Synth12Build is about to replace, and the private device they were
-        // opened on. It opens again on the next frame, against the new ones.
+        // The optical flow engine's own two textures, which are sized to the
+        // shape Synth12Build is about to change, and the private device they
+        // were created on. It opens again on the next frame, at the new size.
         SynthOfaVkRebuild();
         // The depth conversion's own texture and its two views. Safe here and
         // nowhere else in this function: the queue was just idled, so nothing
@@ -3418,14 +3441,38 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     }
 
     // The motion vector source, decided once. The driver's own optical flow
-    // engine if it will open -- it needs the shared textures the build above has
-    // just made -- and one of the three ReShade providers otherwise. Once it has
+    // engine if it will open -- it creates its own two textures and needs only
+    // the private D3D12 device to open them on -- and one of the three ReShade
+    // providers otherwise. Once it has
     // opened, or once it has stopped, no ReShade motion-vector texture is read
     // again on this transport: changing estimator under a feature whose temporal
     // history was built from the other one is the defect this source was added
     // to remove, reintroduced.
     SynthOfaVkOpen(w, h, back_fmt);
     const bool ofa_mv = SynthOfaVkIsSource();
+
+    // The arming gate now lets a session through on the PROMISE of the engine --
+    // see the Vulkan branch in OnSynthBeginEffects -- so this frame can arrive
+    // with the engine not open and no ReShade texture behind mv either. There is
+    // then nothing to copy and nothing to evaluate over: mv.handle is zero, and
+    // recording vkCmdCopyImage from VK_NULL_HANDLE into ReShade's own command
+    // buffer is undefined behaviour in the game's queue, not a dropped frame.
+    //
+    // Stand down instead. The engine gets its next chance on the next frame if it
+    // has not given up; if it has, g_ovk.stopped closes the gate above and this
+    // session is over.
+    if (!ofa_mv && mv.handle == 0)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[synth] the driver's optical flow engine has not opened and there is no "
+                "ReShade motion-vector texture either, so nothing is delivered until one "
+                "of the two arrives. The log above says why the engine did not open.");
+        }
+        return;
+    }
 
     cmd->barrier(back, resource_usage::render_target, resource_usage::copy_source);
     if (!ofa_mv)
@@ -3465,11 +3512,11 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
 
     SynthVkCopyImage(cb, static_cast<SVkHandle>(back.handle), kSVkLayoutTransferSrc,
                      g_svk.img[SLOT_COLOR], kSVkLayoutGeneral, w, h);
-    // Skipped entirely when the driver's engine is the source: it writes the
-    // same texture from the other side, after the wait below, so copying a
-    // ReShade effect's vectors in first would be work whose result is then
-    // overwritten -- and on a frame the engine refuses, would be the estimator
-    // swap this transport refuses to make.
+    // Skipped entirely when the driver's engine is the source: the evaluate then
+    // reads the engine's own texture instead of this one, so copying a ReShade
+    // effect's vectors in would be work nothing reads -- and on a frame the
+    // engine refuses, would be the estimator swap this transport refuses to
+    // make.
     if (!ofa_mv)
         SynthVkCopyImage(cb, static_cast<SVkHandle>(mv.handle), kSVkLayoutTransferSrc,
                          g_svk.img[SLOT_MV], kSVkLayoutGeneral, w, h);
@@ -3487,11 +3534,11 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     // GPU before the D3D12 evaluate below reads any of it.
     rq->wait_idle();
 
-    // The optical flow engine reads the colour that has just crossed and writes
-    // the motion vector texture the evaluate below reads, both through the
-    // private D3D11 device's aliases of them. It has to sit here and nowhere
-    // else: above the wait the colour is not there yet, and below the evaluate
-    // it would be a frame late.
+    // The optical flow engine copies the colour that has just crossed into its
+    // own texture on the D3D12 side, reads it through the private D3D11 device,
+    // and writes the vectors the evaluate below hands to NGX. It has to sit here
+    // and nowhere else: above the wait the colour is not there yet, and below the
+    // evaluate it would be a frame late.
     //
     // A frame the engine does not deliver -- the first one, which has no
     // previous frame to compare against, or one whose execute was refused -- is
@@ -3500,6 +3547,10 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     // for one frame.
     const bool mv_ready = !ofa_mv || SynthOfaVkFrame();
 
+    // The mirror sets this to its own 900 ms and nothing resets it, so state the
+    // budget here rather than inheriting whichever path ran last: nothing is
+    // parked behind this one, and an overrun sets g_s12.ready false for good.
+    g_s12.wait_ms = 0;
     const bool ok = mv_ready && Synth12EvaluateShared(sp);
 
     // Read again, and this is not defensive. The flush inside wait_idle advances
@@ -3547,14 +3598,6 @@ static LONG  g_synth_frames;
 static bool  g_synth_armed_said;
 static bool  g_synth_shape_said;
 
-// The two config values the latch was actually taken on. The status panel says
-// that sentence again long afterwards, and CfgReload re-reads the file every
-// second -- so a user who edits source= after arming would otherwise be told
-// "source=mirror allowed it" under a Synthetic heading. The latch is one-way and
-// permanent; these are frozen with it. -1 means it never armed, and the panel
-// only reads them when the latch says it did.
-static int         g_synth_armed_after = -1;
-static const char *g_synth_armed_source;
 
 // The counters as they stood when the source latch was last released, and the
 // release bookkeeping beside them.
@@ -3573,7 +3616,6 @@ static const char *g_synth_armed_source;
 static volatile LONG g_eval_base;
 static volatile LONG g_create_base;
 static volatile LONG g_release_n;      // episodes released this session
-static ULONGLONG     g_release_tick;   // when the last one was released
 
 // Stage 1's latch, seen from this side. The game's own DLSS wins from any state
 // at any time, so this asks only whether it has arrived and never argues about
@@ -3623,24 +3665,6 @@ static void SynthStandDown()
         g_synth_frames, g_synth_frames == 1 ? "" : "s");
 }
 
-// Every condition, each read off something rather than assumed, and the caller
-// says which one refused.
-//
-// The depth readback is not among them, and that is deliberate. SynthProbeDepth
-// stands aside whenever ReShade hands over the game's own depth-stencil texture,
-// because D3D11 copies such a resource only whole -- which is the common case,
-// not an edge one, so requiring a successful readback would mean never arming in
-// the configuration that works. What it can do is disprove: a buffer that was
-// read and came back flat is refused. The stage-2 report already draws that
-// distinction in words, printing "unverified" rather than "no".
-// ignore_mv skips the four motion-vector shape tests at the end and nothing
-// else. It exists for one caller: the pre-gate that decides whether to run the
-// driver's optical flow engine at all, which is asked BEFORE there is a motion
-// vector texture because it is what produces one. Without it every mirror
-// session in the nine shipped titles would pay 1.6 ms a frame building a flow
-// field nobody reads -- and Skyrim SE spent five seconds with depth "present but
-// NOT BOUND" before arming, which is 300 frames of it. Every other caller passes
-// false and gets exactly the function that was here.
 // Has the game used DLSS since the latch was last handed back? Against the
 // BASELINE, not against zero -- see g_eval_base. Both latches increment their
 // counter before they write SRC_MIRROR, so SRC_MIRROR strictly implies a
@@ -3681,10 +3705,37 @@ static void SynthLatchSelfCheck()
     assert( SynthCountsMovedSince(8, 400, 7, 400));
 }
 
+// Every condition, each read off something rather than assumed, and the caller
+// says which one refused.
+//
+// The depth readback is not among them, and that is deliberate twice over.
+// SynthProbeDepth stands aside whenever ReShade hands over the game's own
+// depth-stencil texture, because D3D11 copies such a resource only whole -- which
+// is the common case, not an edge one, so requiring a successful readback would
+// mean never arming in the configuration that works. Nor can it disprove, which
+// this comment used to claim: the readback runs in OnSynthBeginEffects AFTER the
+// delivery decision, so depth_read is zero every time this function is asked, and
+// the clause that refused a flat buffer could never fire. It has been removed
+// rather than left to read as a test that runs. A bound, right-sized, provably
+// flat buffer arms; the report, which does run after the readback, is the only
+// place "flat" is said.
+//
+// Not fixed by reordering: moving the probe above the gate would stall the GPU
+// every frame, and carrying the verdict forward in a static risks refusing a good
+// buffer on a stale reading -- a regression on an untested path, on the last
+// release.
+// ignore_mv skips the four motion-vector shape tests at the end and nothing
+// else. It exists for one caller: the pre-gate that decides whether to run the
+// driver's optical flow engine at all, which is asked BEFORE there is a motion
+// vector texture because it is what produces one. Without it every mirror
+// session in the nine shipped titles would pay 1.6 ms a frame building a flow
+// field nobody reads -- and Skyrim SE spent five seconds with depth "present but
+// NOT BOUND" before arming, which is 300 frames of it. Every other caller passes
+// false and gets exactly the function that was here.
 static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
 {
     if (g_cfg.synth_after <= 0)
-        return "synth_after=0 in dlss5-dx11-bridge.cfg";
+        return "synth_after=0 in dlss5-bridge.cfg";
     if (g_cfg.source != CFG_SRC_SYNTH && g_cfg.source != CFG_SRC_AUTO)
         return "source is not synth or auto";
     if (g_cfg.stage < 3)
@@ -3722,8 +3773,7 @@ static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
     // contract that only NGX can refuse, one evaluate at a time.
     if (f->depth_w != f->back_w || f->depth_h != f->back_h)
         return "the depth buffer is not the size of the back buffer";
-    if (f->depth_read && !f->depth_varies)
-        return "the depth buffer was read and is flat";
+
 
     // Two transport questions rather than contract ones, and the only ones there
     // are, so they are asked here where every other refusal is said.
@@ -3752,20 +3802,34 @@ static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
                    "compute pass that reads it cannot sample it -- on Vulkan that binding "
                    "is ReShade's own depth backup texture, which generic_depth creates "
                    "shader_resource and copy_dest, so this is not the expected case";
-        // mv_which 0 is the driver's own optical flow engine, which has no
-        // ReShade texture at all -- kSynthMv[0] is the row with no name -- and
-        // whose vectors never travel through a Vulkan transfer: they are written
-        // into the shared D3D12 texture from the other side. So there is nothing
-        // here to ask the question of, and asking it of a zeroed usage would
-        // refuse the better source in favour of the one it replaced.
-        if (f->mv_which != 0 && (f->mv_usage & copy_src) == 0)
-            return "the Vulkan motion vector texture was not created as a copy source, so "
-                   "no transfer may read it";
     }
 
     if (!ignore_mv)
     {
         if (!f->mv_bound)        return "no motion vector texture is bound";
+        // BELOW the bound test, and that is the whole point of where it sits.
+        // Above it, this fired on a texture that was declared and never bound --
+        // mv_usage is zero because there was no view to read it from, not because
+        // the texture was created without copy_source -- and it beat the true
+        // sentence one line up. A user with no motion-vector shader enabled was
+        // told the creation flags of a texture that had never been created.
+        //
+        // mv_which 0 is the driver's own optical flow engine -- kSynthMv[0], the
+        // row with no ReShade texture behind it -- whose vectors never travel
+        // through a Vulkan transfer: they are written into the shared D3D12
+        // texture from the other side.
+        //
+        // Both the device_api test and the constant are restated here rather than
+        // reused: copy_src above is scoped to the block this moved out of, and
+        // dropping the Vulkan guard would refuse every D3D11 session, where
+        // SynthBound::usage is deliberately left zero. That is the nine shipped
+        // titles.
+        if (f->device_api == static_cast<uint32_t>(reshade::api::device_api::vulkan) &&
+            f->mv_which != 0 &&
+            (f->mv_usage &
+             static_cast<uint32_t>(reshade::api::resource_usage::copy_source)) == 0)
+            return "the Vulkan motion vector texture was not created as a copy source, so "
+                   "no transfer may read it";
         if (f->mv_samples != 1)  return "the motion vectors are multisampled";
         if (f->mv_fmt != DXGI_FORMAT_R16G16_FLOAT) return "the motion vectors are not R16G16_FLOAT";
         if (f->mv_w != f->back_w || f->mv_h != f->back_h)
@@ -3934,7 +3998,7 @@ struct SynthOfa
 static SynthOfa g_ofa;
 
 // Each driver entry point gets its own guarded wrapper, for the reason the NGX
-// wrappers in dlss5-dx11-bridge.cpp were given theirs: these are undocumented
+// wrappers in dlss5-bridge.cpp were given theirs: these are undocumented
 // exports reached through signatures recovered from disassembly, and a wrong
 // guess has to land in the log rather than take the game down. Each is its own
 // function with no C++ objects, so __try is legal and no unwinding is needed.
@@ -4056,7 +4120,8 @@ static bool OfaMakeShader(ID3D11Device *dev11, const char *src, const char *name
     if (*out != nullptr) return true;
 
     PFN_D3DCompile_ compile = LoadSystemD3DCompiler();
-    if (compile == nullptr) { Log("[bridge] d3dcompiler_47.dll unavailable"); return false; }
+    if (compile == nullptr) { Log("[synth] optical flow: d3dcompiler_47.dll is unavailable, so the flow "
+                                     "conversion shader cannot be built"); return false; }
 
     ID3DBlob *code = nullptr, *err = nullptr;
     HRESULT hr = compile(src, strlen(src), name, nullptr, nullptr, "main", "cs_5_0", 0, 0,
@@ -4150,6 +4215,11 @@ static ID3D11Texture2D *OfaMakeTexture(ID3D11Device *dev11, UINT w, UINT h, DXGI
     }
     return t;
 }
+// The private D3D11 device the Vulkan transport runs the engine on, or null when
+// there is none. Declared here because OfaOpen has to name which device it opened
+// on and g_ovk is defined far below it.
+static ID3D11Device *SynthOfaVkDevice();
+
 
 static bool OfaOpen(ID3D11Device *dev11, ID3D11DeviceContext *ctx, UINT w, UINT h,
                     DXGI_FORMAT back_fmt)
@@ -4296,7 +4366,7 @@ static bool OfaOpen(ID3D11Device *dev11, ID3D11DeviceContext *ctx, UINT w, UINT 
             w, h, g_ofa.grid, static_cast<unsigned long>(r), OfaStatusName(r), msg);
         if (r == 5)   // NV_OF_ERR_OUT_OF_MEMORY
             Log("[synth]   Grid 2 needs about 109 MB driver-side at 3840x1600; grid 4 needs "
-                "about 63 MB. Try ofa_grid=4 in dlss5-dx11-bridge.cfg.");
+                "about 63 MB. Try ofa_grid=4 in dlss5-bridge.cfg.");
         OfaClose();
         return false;
     }
@@ -4319,11 +4389,19 @@ static bool OfaOpen(ID3D11Device *dev11, ID3D11DeviceContext *ctx, UINT w, UINT 
     g_ofa.ready   = true;
     g_ofa.stopped = false;
 
+    // Which device, said rather than assumed. This named "the game's own D3D11
+    // device" unconditionally, and on the Vulkan transport that is false: the
+    // game has no D3D11 device there and the session opens on a private one this
+    // add-on created. The two are told apart by the pointer, because g_ovk.dev is
+    // non-null only when this file made it.
     Log("[synth] optical flow: nvofapi64.dll loaded, instance at API 0x20, session open on "
-        "the game's own D3D11 device. Grid %u, perf %s, flow %ux%u R16G16_SINT -> %ux%u "
+        "%s. Grid %u, perf %s, flow %ux%u R16G16_SINT -> %ux%u "
         "R16G16_FLOAT. This is kSynthMv[0] and the three ReShade motion-vector names are "
-        "not consulted while it is running.", g_ofa.grid, SynthPerfName(g_ofa.perf),
-        fw, fh, w, h);
+        "not consulted while it is running.",
+        (SynthOfaVkDevice() != nullptr && SynthOfaVkDevice() == dev11)
+            ? "a private D3D11 device this add-on created, because the game is on Vulkan"
+            : "the game's own D3D11 device",
+        g_ofa.grid, SynthPerfName(g_ofa.perf), fw, fh, w, h);
     Log("[synth] optical flow conversion shaders ready (cs_5_0)");
     LogVideoMemory("after opening the optical flow session");
     return true;
@@ -4777,10 +4855,22 @@ static bool OfaFrame(reshade::api::effect_runtime *rt, reshade::api::command_lis
 // one GPU, none of which can be exercised on the only Vulkan title available to
 // test with. It would be the largest untested block in this file.
 //
-// The seam that already exists is the one the D3D11 mirror has used in nine
-// shipped titles: a D3D12 texture created on a SHARED heap with
-// ALLOW_SIMULTANEOUS_ACCESS, and an ID3D11Texture2D alias of it opened through
-// the NT handle -- MakeSharedPair in bridge.inc, in every session. The four
+// The seam this was built on turned out not to be the seam the mirror uses, and
+// that is why none of it works on Vulkan. The reasoning was: a D3D12 texture on
+// a SHARED heap with ALLOW_SIMULTANEOUS_ACCESS, and an ID3D11Texture2D alias of
+// it opened through the NT handle -- MakeSharedPair in bridge.inc, in every
+// session. MakeSharedPair does try that direction first. It has never once
+// succeeded: on 2026-08-31 every D3D11 log on this machine shows all four
+// textures refused with the same 0x80070057, every format, followed by
+// "trying the other direction", and the mirror running on attempt B -- created
+// on D3D11, opened on D3D12. The claim above was read off the function name
+// rather than off its log.
+//
+// Attempt B is not available here: these textures are imported into the game's
+// Vulkan device through the D3D12 NT handle and NGX evaluates on the D3D12
+// device, so they must be D3D12-created. That is the whole story of why the
+// engine runs on D3D11 and not on Vulkan, and it is stated in the README's
+// known limits rather than fixed, on a final release. The four
 // textures this transport already creates are exactly that: shared heap,
 // simultaneous access, NT handle, because the Vulkan side imports them. So the
 // colour that has just crossed from Vulkan into g_s12.tex[SLOT_COLOR] can be
@@ -4832,10 +4922,26 @@ struct SynthOfaVk
 
     ID3D11Device        *dev;
     ID3D11DeviceContext *ctx;
-    // Aliases of g_s12.tex[SLOT_COLOR] and g_s12.tex[SLOT_MV]. Not copies:
-    // the same memory, seen through the other API.
+    // The engine's OWN colour and motion-vector textures, created on this private
+    // D3D11 device and opened on the private D3D12 one -- not aliases of the four
+    // g_s12 textures, which is what this used to be and why it never worked.
+    //
+    // That crossing runs D3D11 -> D3D12, which is the direction this driver
+    // accepts. The other one, D3D12 -> D3D11, is refused for every texture and
+    // every format: the mirror's MakeSharedPair tries it first in every session
+    // and falls back 16 times out of 16. Aliasing the g_s12 textures needed the
+    // refused direction, and nothing made that necessary -- those four have to be
+    // D3D12-created because the game's Vulkan device imports them, but the
+    // engine's two are imported into nothing.
+    //
+    // Colour is copied in from g_s12.tex[SLOT_COLOR] on the D3D12 side each
+    // frame. The vectors need no copy out: the evaluate hands NGX mv12 directly.
     ID3D11Texture2D     *color;
     ID3D11Texture2D     *mvout;
+    ID3D12Resource      *color12;
+    ID3D12Resource      *mv12;
+    HANDLE               hcolor;
+    HANDLE               hmv;
     // The only synchronisation between this private D3D11 device and the private
     // D3D12 one, and it is a CPU barrier rather than a shared fence. That is
     // enough here and nowhere else: this runs between the caller's
@@ -4853,10 +4959,20 @@ struct SynthOfaVk
 
 static SynthOfaVk g_ovk;
 
+static ID3D12Resource *SynthOfaVkMvTexture() { return g_ovk.mv12; }
+static ID3D11Device   *SynthOfaVkDevice()    { return g_ovk.dev; }
+
 static bool SynthOfaVkIsSource() { return g_ovk.ready || g_ovk.stopped; }
 
 static void SynthOfaVkClose()
 {
+    // D3D12 aliases first, then the NT handles, then the D3D11 textures that own
+    // the memory. Releasing the owner while the other device still holds a view
+    // of it is the one ordering that is wrong here.
+    if (g_ovk.color12 != nullptr) { g_ovk.color12->Release(); g_ovk.color12 = nullptr; }
+    if (g_ovk.mv12    != nullptr) { g_ovk.mv12->Release();    g_ovk.mv12    = nullptr; }
+    if (g_ovk.hcolor  != nullptr) { CloseHandle(g_ovk.hcolor); g_ovk.hcolor = nullptr; }
+    if (g_ovk.hmv     != nullptr) { CloseHandle(g_ovk.hmv);    g_ovk.hmv    = nullptr; }
     if (g_ovk.color != nullptr) { g_ovk.color->Release(); g_ovk.color = nullptr; }
     if (g_ovk.mvout != nullptr) { g_ovk.mvout->Release(); g_ovk.mvout = nullptr; }
     if (g_ovk.done  != nullptr) { g_ovk.done->Release();  g_ovk.done  = nullptr; }
@@ -4883,6 +4999,69 @@ static void SynthOfaVkRebuild()
 // One shot. A failure is latched and never retried, and every branch names its
 // own reason -- a session that falls back to a ReShade provider has to be able
 // to say why, because that estimator is the one that smears.
+// The engine's own shared texture, created on the private D3D11 device and opened
+// on the private D3D12 one. D3D11 -> D3D12: the direction this driver accepts.
+//
+// Transcribed from MakeSharedPair's attempt B in bridge.inc rather than called,
+// deliberately. That function writes g_bridge.tex11[i], tex12[i] and shared[i] by
+// slot index and is load-bearing for nine shipped titles; borrowing it for a
+// fifth and sixth texture would put this file's failures into the mirror's state.
+// Thirty lines is cheaper than that coupling.
+//
+// Measured on this machine 2026-08-31: R11G11B10_FLOAT, R16G16_FLOAT,
+// B8G8R8A8_UNORM and R16G16_SINT all cross with and without the UAV bind and
+// arrive carrying ALLOW_SIMULTANEOUS_ACCESS (flags 0x24), which is what makes the
+// COMMON -> X -> COMMON barrier pairs around the copy correct. R32G32_FLOAT is
+// refused at CreateTexture2D -- the kernel's shared-format list is narrower than
+// DXGI's, the same note bridge.inc already carries.
+static bool SynthOfaShare(UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
+                          ID3D11Texture2D **out11, ID3D12Resource **out12,
+                          HANDLE *out_handle, const char *what)
+{
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width            = w;
+    td.Height           = h;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
+                          (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+    td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+
+    HRESULT hr = g_ovk.dev->CreateTexture2D(&td, nullptr, out11);
+    if (FAILED(hr))
+    {
+        Log("[synth] optical flow: the engine's %s texture could not be created on the "
+            "private D3D11 device, 0x%08X %s %ux%u.", what, hr, FormatName(fmt), w, h);
+        return false;
+    }
+
+    IDXGIResource1 *dxgi_res = nullptr;
+    hr = (*out11)->QueryInterface(__uuidof(IDXGIResource1),
+                                  reinterpret_cast<void **>(&dxgi_res));
+    if (SUCCEEDED(hr))
+    {
+        hr = dxgi_res->CreateSharedHandle(nullptr,
+                                          DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                                          nullptr, out_handle);
+        dxgi_res->Release();
+    }
+    if (SUCCEEDED(hr))
+        hr = g_s12.dev->OpenSharedHandle(*out_handle, __uuidof(ID3D12Resource),
+                                         reinterpret_cast<void **>(out12));
+    if (FAILED(hr))
+    {
+        Log("[synth] optical flow: the engine's %s texture was created but could not be "
+            "opened on the private D3D12 device, 0x%08X %s.", what, hr, FormatName(fmt));
+        if (*out11 != nullptr) { (*out11)->Release(); *out11 = nullptr; }
+        if (*out_handle != nullptr) { CloseHandle(*out_handle); *out_handle = nullptr; }
+        return false;
+    }
+    return true;
+}
+
 static bool SynthOfaVkOpen(UINT w, UINT h, DXGI_FORMAT back_fmt)
 {
     if (g_ovk.tried) return g_ovk.ready;
@@ -4895,15 +5074,15 @@ static bool SynthOfaVkOpen(UINT w, UINT h, DXGI_FORMAT back_fmt)
 
     if (g_cfg.ofa_grid == 0)
     {
-        Log("[synth] optical flow: ofa_grid=0 in dlss5-dx11-bridge.cfg, so the driver's "
+        Log("[synth] optical flow: ofa_grid=0 in dlss5-bridge.cfg, so the driver's "
             "optical flow engine is not used on this transport either and the motion "
             "vectors come from a ReShade effect.");
         return false;
     }
-    if (!g_s12.shared || g_s12.share[SLOT_COLOR] == nullptr || g_s12.share[SLOT_MV] == nullptr)
+    if (g_s12.dev == nullptr)
     {
-        Log("[synth] optical flow: the shared textures this transport reads and writes "
-            "through have no NT handle, so no second device can be given a view of them.");
+        Log("[synth] optical flow: the private D3D12 device is not open, so there is "
+            "nothing to open the engine's own textures on.");
         return false;
     }
 
@@ -4938,26 +5117,19 @@ static bool SynthOfaVkOpen(UINT w, UINT h, DXGI_FORMAT back_fmt)
         return false;
     }
 
-    ID3D11Device1 *dev1 = nullptr;
-    if (FAILED(g_ovk.dev->QueryInterface(__uuidof(ID3D11Device1),
-                                         reinterpret_cast<void **>(&dev1))) || dev1 == nullptr)
+    // The engine's own two textures, created here and opened on the private D3D12
+    // device -- see SynthOfaShare for why this direction and not the other.
+    //
+    // The colour takes the same typed format the transport's own colour texture
+    // has, so the per-frame CopyResource is a straight copy with no conversion.
+    // The vectors are R16G16_FLOAT, which is what the conversion writes and what
+    // NGX reads, and they need the UAV bind because the conversion shader writes
+    // them through an unordered access view.
+    if (!SynthOfaShare(w, h, g_ovk.fmt, /*uav=*/false,
+                       &g_ovk.color, &g_ovk.color12, &g_ovk.hcolor, "colour") ||
+        !SynthOfaShare(w, h, DXGI_FORMAT_R16G16_FLOAT, /*uav=*/true,
+                       &g_ovk.mvout, &g_ovk.mv12, &g_ovk.hmv, "motion vector"))
     {
-        Log("[synth] optical flow: the private D3D11 device does not answer for "
-            "ID3D11Device1, so an NT-handle shared resource cannot be opened on it.");
-        SynthOfaVkClose();
-        return false;
-    }
-    hr = dev1->OpenSharedResource1(g_s12.share[SLOT_COLOR], __uuidof(ID3D11Texture2D),
-                                   reinterpret_cast<void **>(&g_ovk.color));
-    if (SUCCEEDED(hr))
-        hr = dev1->OpenSharedResource1(g_s12.share[SLOT_MV], __uuidof(ID3D11Texture2D),
-                                       reinterpret_cast<void **>(&g_ovk.mvout));
-    dev1->Release();
-    if (FAILED(hr) || g_ovk.color == nullptr || g_ovk.mvout == nullptr)
-    {
-        Log("[synth] optical flow: the shared colour and motion vector textures could not "
-            "be opened on the private D3D11 device, 0x%08X. The likeliest cause is that the "
-            "two private devices are on different adapters.", hr);
         SynthOfaVkClose();
         return false;
     }
@@ -5001,6 +5173,69 @@ static bool SynthOfaVkOpen(UINT w, UINT h, DXGI_FORMAT back_fmt)
 static bool SynthOfaVkFrame()
 {
     if (!g_ovk.ready) return false;
+
+    // Fill the engine's own colour texture from the transport's, on the D3D12
+    // side, and WAIT for it on the CPU before the D3D11 read below.
+    //
+    // This did not exist while g_ovk.color was an alias of the same memory. Now
+    // that the engine owns its texture, the copy is the only thing that makes it
+    // this frame's colour -- and the wait is the only thing that orders it before
+    // the engine reads it. Skipping the wait is the one failure this transport
+    // cannot report: the flow would be computed against a stale or torn frame,
+    // giving subtly wrong vectors and ghosting, with nothing in the log and
+    // OfaSelfCheck still passing, because that checks the conversion against the
+    // flow texture the driver filled and not whether the colour was current.
+    //
+    // The barriers are COMMON -> COPY -> COMMON on both sides. Correct by the
+    // resources' own declared flags: both carry ALLOW_SIMULTANEOUS_ACCESS, the
+    // transport's because Synth12MakeTexture sets it and the engine's because it
+    // survives the D3D11 -> D3D12 crossing, measured as flags 0x24.
+    if (g_ovk.color12 != nullptr && g_s12.tex[SLOT_COLOR] != nullptr)
+    {
+        if (!Synth12Begin())
+        {
+            Log("[synth] optical flow: no command list to copy this frame's colour into "
+                "the engine's texture, so nothing is delivered this frame.");
+            return false;
+        }
+        D3D12_RESOURCE_BARRIER rb[2] = {};
+        for (int i = 0; i < 2; ++i)
+        {
+            rb[i].Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            rb[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        }
+        rb[0].Transition.pResource   = g_s12.tex[SLOT_COLOR];
+        rb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        rb[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        rb[1].Transition.pResource   = g_ovk.color12;
+        rb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        rb[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_s12.list->ResourceBarrier(2, rb);
+
+        g_s12.list->CopyResource(g_ovk.color12, g_s12.tex[SLOT_COLOR]);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            const D3D12_RESOURCE_STATES was = rb[i].Transition.StateAfter;
+            rb[i].Transition.StateBefore = was;
+            rb[i].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+        }
+        g_s12.list->ResourceBarrier(2, rb);
+
+        const UINT64 v = Synth12End();
+        if (g_s12.fence->GetCompletedValue() < v)
+        {
+            g_s12.fence->SetEventOnCompletion(v, g_s12.event);
+            if (WaitForSingleObject(g_s12.event, 4000) != WAIT_OBJECT_0)
+            {
+                Log("[synth] optical flow: the colour copy into the engine's texture did "
+                    "not complete within 4 s, so the engine is not run on it. Nothing is "
+                    "delivered this frame rather than flow computed on a stale frame.");
+                return false;
+            }
+        }
+    }
 
     SynthBound mv = {};
     if (!OfaFrameOn(g_ovk.dev, g_ovk.ctx, g_ovk.color, g_ovk.fmt, g_ovk.w, g_ovk.h, &mv))
@@ -5088,8 +5323,20 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     LeaveCriticalSection(&g_bridge_cs);
 
     const char *why = SynthArmRefusal(f, false);
-    if (why == nullptr && (depth->res.handle == 0 || mv->res.handle == 0))
-        why = "the depth or motion vector binding did not resolve to a texture";
+    // Split, and the motion-vector half asks about the ReShade providers only.
+    //
+    // Row 0 of kSynthMv is the driver's own optical flow engine, which has no
+    // ReShade texture behind it: the Vulkan branch that selects it leaves
+    // mv->res null ON PURPOSE, because on that transport the vectors are already
+    // in the shared D3D12 texture and a ReShade resource handle there would be a
+    // trap rather than a value. Compounded with the depth test, this refused
+    // every frame after the one that opened the engine -- so that branch has
+    // shipped without ever executing. mv_which != 0 is the sound discriminator:
+    // kSynthMvReShadeFirst is 1, so no ReShade provider can occupy row 0.
+    if (why == nullptr && depth->res.handle == 0)
+        why = "the depth binding did not resolve to a texture";
+    if (why == nullptr && mv->res.handle == 0 && f->mv_which != 0)
+        why = "the motion vector binding did not resolve to a texture";
     if (why != nullptr)
     {
         // SynthArmRefusal derives this sentence and nothing was saying it, so a
@@ -5183,14 +5430,17 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     if (!g_synth_armed_said)
     {
         g_synth_armed_said = true;
-        // Frozen from the same two values the line below prints, so the panel
-        // cannot state a setting that was never the one that decided.
-        g_synth_armed_after  = g_cfg.synth_after;
-        g_synth_armed_source = kCfgSourceName[g_cfg.source];
-        Log("[synth] arming. %d s have passed since this add-on started with no NGX "
-            "D3D11 create and no evaluate from the game, source=%s allows it, and every "
+        // "since this add-on started" is not always the window, and the counter is
+        // not D3D11's alone -- the Vulkan create increments it too. After a source
+        // latch release the question is what the game has done SINCE the release,
+        // which is the case that path exists for.
+        Log("[synth] arming. The configured %d s delay has passed, no NGX create and no "
+            "evaluate has come from the game since %s, source=%s allows it, and every "
             "precondition in the report above holds.",
-            g_cfg.synth_after, kCfgSourceName[g_cfg.source]);
+            g_cfg.synth_after,
+            InterlockedCompareExchange(&g_release_n, 0, 0) != 0
+                ? "the source latch was released" : "this add-on started",
+            kCfgSourceName[g_cfg.source]);
         // Which transport, read off the device rather than off the build. Both
         // deliver the same contract; they differ in how many devices the frame
         // touches, which is the first thing a report needs to say.
@@ -5217,7 +5467,14 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
         // happened rather than being assumed. That is the ambiguity -- "the
         // transport is right and the flow is bad" against "the transport is
         // wrong" -- which cost this project the vort_Shaders diagnosis.
-        if (f->mv_which == 0)
+        // g_ofa.grid != 0 as well as mv_which == 0, and the second test is not
+        // redundant any more. It used to be: mv_which 0 meant the engine had
+        // already opened, because that was the only way to select row 0. The
+        // Vulkan arming gate now selects it on the PROMISE of the engine -- so
+        // this can run before OfaOpen has set grid, and the two divisions below
+        // crashed the game with an integer divide by zero on the first session
+        // that armed without a ReShade shader, 2026-08-31.
+        if (f->mv_which == 0 && g_ofa.grid != 0)
         {
             Log("[synth]   motion vectors: NVIDIA optical flow, grid %u, perf %s. Flow "
                 "%ux%u R16G16_SINT -> NGX %ux%u R16G16_FLOAT, scaled by 1/32 into UV.",
@@ -5228,6 +5485,12 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
                 "provider's claim.",
                 g_cfg.mv_sign_x != 0 ? g_cfg.mv_sign_x : kSynthMv[0].sign_x,
                 g_cfg.mv_sign_y != 0 ? g_cfg.mv_sign_y : kSynthMv[0].sign_y);
+        }
+        else if (f->mv_which == 0)
+        {
+            Log("[synth]   motion vectors: the driver's optical flow engine, which has not "
+                "opened yet -- this session armed on the expectation of it. The flow field "
+                "sizes are reported by the line that opens it, on one of the next frames.");
         }
         Log("[synth]   IsHDR is %s because the back buffer is %s; DepthInverted is %s "
             "because RESHADE_DEPTH_INPUT_IS_REVERSED is %d.",
@@ -5269,7 +5532,9 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     SynthParams sp;
     SynthBuild(&sp, back.w, back.h, back.fmt, back.res, depth->res, mv->res,
                f->def_value[SYNTH_DEF_REVERSED], f->mv_which);
-    SynthSelfCheck(&sp);
+    // mv_which 0 is the driver's optical flow engine, whose vectors reach NGX
+    // through the shared D3D12 texture rather than through this contract.
+    SynthSelfCheck(&sp, f->mv_which == 0);
 
     // The same two steps the game's evaluate detour takes, in the same order and
     // under the same section: opening the session and running the frame are one
@@ -5360,7 +5625,6 @@ static uint32_t g_synth_last_verdict;
 // the worst a reader can see is a mix of two frames' numbers -- which for a
 // panel is one frame of a stale digit, and never a pointer to anything.
 static SynthFacts g_synth_panel_facts;
-static bool       g_synth_panel_measured;
 
 // stage=0 has to remain an off switch that stops everything, and this file is
 // new enough to be the thing that quietly broke it. Nothing here creates a
@@ -5465,7 +5729,8 @@ static void SynthReleaseLatch(ULONGLONG quiet_ms)
     // panel would flip to "Synthetic" and still show nothing, which is the same
     // bug one layer down. tried && !ready is the test, not !ready: a transport
     // that was never opened may still open.
-    const char *dead = (g_s12.tried && !g_s12.ready) ? "private D3D12"
+    const char *dead = g_bridge.disabled               ? "D3D11 bridge"
+                     : (g_s12.tried && !g_s12.ready) ? "private D3D12"
                      : (g_svk.tried && !g_svk.ready) ? "Vulkan import" : nullptr;
     if (dead != nullptr)
     {
@@ -5497,6 +5762,15 @@ static void SynthReleaseLatch(ULONGLONG quiet_ms)
     g_s12.w = 0;
     g_s12.need_reset = true;
 
+    // And the D3D11 side, which is the same two fields the mirror's own handover
+    // uses in the other direction. Without them a D3D11 game whose DLSS is
+    // switched off keeps the feature the mirror built for the game's contract and
+    // the synthetic path arms onto it: a feature made for one contract, fed the
+    // other. Clearing frame_ready forces the rebuild; need_reset throws away a
+    // temporal history accumulated from vectors the new source did not produce.
+    g_bridge.frame_ready = false;
+    g_bridge.need_reset  = true;
+
     // CAS and not an exchange, so this can only ever release the mirror.
     if (InterlockedCompareExchange(&g_source, SRC_NONE, SRC_MIRROR) == SRC_MIRROR)
     {
@@ -5511,7 +5785,6 @@ static void SynthReleaseLatch(ULONGLONG quiet_ms)
         {
             released = true;
             n = ++g_release_n;
-            g_release_tick = GetTickCount64();
         }
     }
     LeaveCriticalSection(&g_bridge_cs);
@@ -5520,7 +5793,7 @@ static void SynthReleaseLatch(ULONGLONG quiet_ms)
     // across GPU work.
     if (!released) return;
     if (n <= 3)
-        Log("[synth] the game's own Vulkan DLSS has not evaluated for %llu ms, so it is "
+        Log("[synth] the game's own DLSS has not evaluated for %llu ms, so it is "
             "switched off rather than between frames. The source latch is released: the "
             "synthetic contract may arm again, and the game's next evaluate takes the "
             "mirror straight back.", quiet_ms);
@@ -5534,6 +5807,11 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
                                 reshade::api::resource_view   rtv,
                                 reshade::api::resource_view)
 {
+    // Said at most once, and from here because this is the first place in the
+    // process where every add-on has certainly finished loading. See the note on
+    // the function: it warns, it does not prevent.
+    WarnIfOldCopyLoaded();
+
     if (!SynthEnabled() || rt == nullptr || cmd == nullptr) return;
 
     // The only per-frame present-thread code this add-on has, so it is the only
@@ -5569,17 +5847,29 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
             (g_cfg.source == CFG_SRC_SYNTH || g_cfg.source == CFG_SRC_AUTO) &&
             g_reshade_api >= kSynthApiFloor)
         {
+            // D3D11 as well as Vulkan. It was Vulkan-only when this was written,
+            // and the first D3D11 user to switch DLSS off in a settings menu found
+            // what that meant: the panel kept saying Mirror and nothing was
+            // delivered, because arming needs SRC_NONE and nothing put it back.
+            // The undo is the same two fields on either transport, and the nine
+            // shipped titles cannot reach this at all -- it needs synth_after
+            // above 0, and 0 is the shipped default.
             reshade::api::device *d = rt->get_device();
-            if (d != nullptr && d->get_api() == reshade::api::device_api::vulkan)
+            const bool releasable =
+                d != nullptr &&
+                (d->get_api() == reshade::api::device_api::vulkan ||
+                 d->get_api() == reshade::api::device_api::d3d11);
+            if (releasable)
                 SynthReleaseLatch(now - quiet_since);
             quiet_since = now; quiet_ticks = 0;   // one attempt per window
         }
     }
 
-    // Once the game has called DLSS itself the mirror owns the session and the
-    // latch is one-way, so nothing this function measures can ever arm anything
-    // again -- every later report is a true answer to a question no longer being
-    // asked. Baldur's Gate 3 on 2026-08-31 printed six of them in forty seconds
+    // While the mirror owns the session nothing this function measures can arm
+    // anything -- every report during it is a true answer to a question no longer
+    // being asked. The latch is not permanent any more: SynthReleaseLatch hands
+    // the session back when the game's own DLSS goes quiet, and the probe resumes
+    // with it, because this returns on the state rather than on a one-time flag. Baldur's Gate 3 on 2026-08-31 printed six of them in forty seconds
     // AFTER "the synthetic contract stands down for good", each one honest and
     // each one noise: the depth binding really does alternate as generic_depth
     // swaps its backup, so keying the rate limit on the verdict cannot help when
@@ -5670,7 +5960,7 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
     // every frame, not to make a user's own edit one-way.
     if (g_ofa.ready && g_cfg.ofa_grid == 0)
     {
-        Log("[synth] optical flow: ofa_grid=0 in dlss5-dx11-bridge.cfg, so the session is "
+        Log("[synth] optical flow: ofa_grid=0 in dlss5-bridge.cfg, so the session is "
             "closed and the motion vectors come from a ReShade effect again.");
         OfaClose();
         g_ofa.tried = false;
@@ -5685,8 +5975,29 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
         f.mv_which = 0;
         f.mv_bound = 1;
     }
+    // g_ovk.ready OR still allowed to try, which is what breaks the circle.
+    //
+    // The engine opens inside SynthVkFrame, and SynthVkFrame is only reached once
+    // the arming gate has passed, and the gate wanted motion vectors -- which the
+    // engine is what supplies. So on a machine with no ReShade motion-vector
+    // shader installed, nothing ever armed and the engine never got a first
+    // chance: the user had to enable a shader once purely to open the door, then
+    // remove it. Measured on Baldur's Gate 3, 2026-08-31.
+    //
+    // Requiring only that it is ALLOWED to try lets the first frames build the
+    // transport and open the engine. Those frames deliver nothing -- the first
+    // execute has no previous frame to compare against, which is already this
+    // path's rule -- and from the next one the vectors are real. If the engine
+    // then refuses to open, SynthOfaVkIsSource stays false and SynthVkFrame
+    // stands the transport down rather than evaluating over an unwritten texture;
+    // that branch already existed and is what makes this safe to try.
+    //
+    // ofa_grid=0 is still an off switch, and a session that STOPPED is not
+    // retried -- g_ovk.stopped is one-way and is what tried collapses to.
     else if (f.device_api == static_cast<uint32_t>(reshade::api::device_api::vulkan) &&
-             g_ovk.ready)
+             g_cfg.ofa_grid != 0 && !g_ovk.stopped &&
+             (g_ovk.ready || !g_ovk.tried) &&
+             SynthArmRefusal(&f, /*ignore_mv=*/true) == nullptr)
     {
         // The Vulkan transport's own session, which opened inside SynthVkFrame
         // once the shared textures existed. Its vectors are already where the
@@ -5730,7 +6041,7 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
                     "function list this add-on recovered is the D3D11 one. The motion "
                     "vectors come from a ReShade effect.", SynthApiName(f.device_api));
             else if (g_cfg.ofa_grid == 0)
-                Log("[synth] optical flow: ofa_grid=0 in dlss5-dx11-bridge.cfg, so the "
+                Log("[synth] optical flow: ofa_grid=0 in dlss5-bridge.cfg, so the "
                     "driver's optical flow engine is not used and the motion vectors come "
                     "from a ReShade effect.");
             else
@@ -5756,7 +6067,6 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
     // exact struct SynthArmRefusal is about to be asked about, and the panel
     // asks the same function the same question.
     g_synth_panel_facts    = f;
-    g_synth_panel_measured = true;
 
     SynthMaybeDeliver(rt, cmd, rtv, &f, &depth_b, &mv_b);
 
@@ -5832,13 +6142,6 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
 // which lands in this module, which is registered.
 typedef void (*PFN_ReShadeRegisterEvent)(reshade::addon_event, void *);
 
-// Whether the three effect events above were actually taken. "Nothing has been
-// measured" has two causes that want opposite answers from a reader -- ReShade
-// has not applied its effects yet, or this add-on never asked because stage=0 or
-// source=off switched synthesis off at startup -- and the panel cannot tell them
-// apart from an unmeasured struct. Fixed once at attach, so a later config edit
-// cannot make the panel claim a registration that never happened.
-static bool g_synth_events_registered;
 
 static void SynthRegisterEvents()
 {
@@ -5863,7 +6166,6 @@ static void SynthRegisterEvents()
     reg(reshade::addon_event::reshade_reloaded_effects, reinterpret_cast<void *>(&OnSynthReloadedEffects));
     reg(reshade::addon_event::reshade_begin_effects,  reinterpret_cast<void *>(&OnSynthBeginEffects));
 
-    g_synth_events_registered = true;
 
     // Both numbers, because "registered" alone does not say whether the calls
     // this file needs are the ones that will be made. ReShadeUnregisterAddon
@@ -6193,10 +6495,18 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     const int  c_source = g_cfg.source, c_after = g_cfg.synth_after;
     const int  c_grid   = g_cfg.ofa_grid, c_perf = g_cfg.ofa_perf;
     const int  c_mvx    = g_cfg.mv_sign_x, c_mvy = g_cfg.mv_sign_y;
-    const bool o_ready  = g_ofa.ready, o_stopped = g_ofa.stopped, o_tried = g_ofa.tried;
     const UINT o_w = g_ofa.w, o_h = g_ofa.h, o_grid = g_ofa.grid;
     const int  o_perf   = g_ofa.perf;
-    const LONGLONG f_qpf = g_bridge.qpf, f_ticks = g_bridge.ofa_ticks;
+    // The frequency is asked of the OS rather than read from g_bridge, which sets
+    // it only inside TimingTick -- the D3D11 bridge's per-frame timing, which
+    // never runs on a Vulkan session. The ticks and the frame count ARE written
+    // there, by OfaFrameOn, which both transports share: so on Vulkan the panel
+    // said "not measured yet" over a cost the log was printing in the same
+    // second. A process-constant is not something to inherit from another path's
+    // start-up.
+    LARGE_INTEGER f_freq = {};
+    QueryPerformanceFrequency(&f_freq);
+    const LONGLONG f_qpf = f_freq.QuadPart, f_ticks = g_bridge.ofa_ticks;
     const UINT64   f_frames = g_bridge.ofa_frames;
 
     // What the widgets are bound to. Never &g_cfg.anything: RadioButton2 and
@@ -6248,19 +6558,47 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
                         dev_api != static_cast<uint32_t>(reshade::api::device_api::d3d11) &&
                         (src == SRC_SYNTH || src == SRC_MIRROR);
 
-    // Whether the driver's optical flow engine can run here at all.
-    // OnSynthBeginEffects tests device_api before it consults the engine, and
-    // the function list this add-on recovers from nvofapi64 is the D3D11 one --
-    // so on a D3D12 or Vulkan runtime the session never opens, ofa_grid and
-    // ofa_perf are read by nothing, and neither is a control.
+    // Whether the driver's optical flow engine can run here at all. The function
+    // list this add-on recovers from nvofapi64 is the D3D11 one, and on Vulkan the
+    // synthetic path opens it on a private D3D11 device that aliases the two
+    // shared textures -- see SynthOfaVkOpen -- so it runs there too, and ofa_grid
+    // and ofa_perf are live controls on both. Only D3D12 is not wired.
+    //
+    // This read D3D11 alone, which made a Vulkan session print "the driver's
+    // optical flow engine" as its motion-vector provider and then, three lines
+    // later, that the engine could not run there -- while hiding the cost line
+    // and both controls that were working.
+    // From the struct that belongs to THIS transport. The engine has two sessions
+    // -- g_ofa is the D3D11 one, g_ovk the private D3D11 device the Vulkan path
+    // aliases the shared textures onto -- and this read only the first. On Vulkan
+    // that made the panel print "Optical flow opens on the first synthetic frame"
+    // for the rest of the session, over a g_ovk that had already tried and
+    // failed, while the log said exactly what went wrong. The panel's whole job
+    // is to say which situation the session is in.
+    const bool on_vk_ofa = dev_api_known &&
+                           dev_api == static_cast<uint32_t>(reshade::api::device_api::vulkan);
+    const bool o_ready   = on_vk_ofa ? g_ovk.ready   : g_ofa.ready;
+    const bool o_stopped = on_vk_ofa ? g_ovk.stopped : g_ofa.stopped;
+    const bool o_tried   = on_vk_ofa ? g_ovk.tried   : g_ofa.tried;
+
     const bool ofa_here = dev_api_known &&
-                          dev_api == static_cast<uint32_t>(reshade::api::device_api::d3d11);
+                          (dev_api == static_cast<uint32_t>(reshade::api::device_api::d3d11) ||
+                           dev_api == static_cast<uint32_t>(reshade::api::device_api::vulkan));
 
     ui->SeparatorText("source");
     if (src == SRC_MIRROR)
     {
-        PanelLine("Mirror. The game's own DLSS, forwarded untouched. %ld creates, "
-                  "%ld evaluates.", creates, evals);
+        // Which of the two it is, from the predicate the delivery path itself uses.
+        // This said "forwarded untouched" unconditionally, which is false under the
+        // shipped skip_game=1: there the game's own evaluate is suppressed because
+        // this add-on's result replaces it.
+        if (BridgeWillDeliver())
+            PanelLine("Mirror. The game's own DLSS is suppressed, because this add-on's "
+                      "result replaces it (skip_game=1). %ld creates, %ld evaluates.",
+                      creates, evals);
+        else
+            PanelLine("Mirror. The game's own DLSS, forwarded untouched. %ld creates, "
+                      "%ld evaluates.", creates, evals);
         PanelLine("Full quality: the engine's own jitter, motion vectors and upscaling "
                   "ratio.");
     }
@@ -6298,8 +6636,9 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     }
 
     // The two launch settings, next to the line that reports what they decided.
-    // Live only before the latch, because the latch is one-way: a source change
-    // after it can only be a request for the next launch. off is not offered --
+    // Live whenever no source holds the session -- before the first DLSS call, and
+    // again after SynthReleaseLatch hands it back. While one holds it, a source
+    // change can only be a request for the next launch. off is not offered --
     // SynthRegisterEvents refuses outright on source=off, so the click could not
     // be undone without restarting the game, and the line below names the file.
     //
@@ -6307,14 +6646,14 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     // stands in their place rather than being buried in diagnostics.
     if (!cfg_writable)
     {
-        PanelLine("No dlss5-dx11-bridge.cfg beside this add-on: nothing here can be saved.");
+        PanelLine("No dlss5-bridge.cfg beside this add-on: nothing here can be saved.");
     }
     else if (src == SRC_NONE)
     {
         if (PanelRadioRow("Source", &w_source, kPanelSrcNames, kPanelSrcValues, 3))
             PanelSet("source", w_source, kCfgSourceName[w_source]);
         PanelLine("auto: the game's own DLSS first, synthetic only if it never asks.");
-        PanelLine("Switch off entirely with source=off in dlss5-dx11-bridge.cfg.");
+        PanelLine("Switch off entirely with source=off in dlss5-bridge.cfg.");
         PanelReceipt("source", c_source);
 
         // A checkbox, not a seconds spinner: the number's only job is "long
@@ -6328,7 +6667,7 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     }
     else
     {
-        PanelLine("dlss5-dx11-bridge.cfg: source=%s, synth_after=%d. Change it there, "
+        PanelLine("dlss5-bridge.cfg: source=%s, synth_after=%d. Change it there, "
                   "before launch.", kCfgSourceName[c_source], c_after);
     }
 
@@ -6378,8 +6717,8 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
         if (!ofa_here)
         {
             if (dev_api_known)
-                PanelLine("The driver's optical flow engine is D3D11 only, so it cannot run "
-                          "here.");
+                PanelLine("The driver's optical flow engine is not wired on a D3D12 "
+                          "runtime, so it cannot run here.");
         }
         else if (o_ready)
             PanelLine("Optical flow: grid %u, %s, %ux%u vectors.",
@@ -6445,7 +6784,7 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
                       c_mvx != 0 ? c_mvx : kSynthMv[0].sign_x,
                       c_mvy != 0 ? c_mvy : kSynthMv[0].sign_y,
                       (c_mvx != 0 || c_mvy != 0)
-                          ? "forced by mv_sign_x/mv_sign_y in dlss5-dx11-bridge.cfg"
+                          ? "forced by mv_sign_x/mv_sign_y in dlss5-bridge.cfg"
                           : "measured");
         }
         else if (cfg_writable)
@@ -6529,7 +6868,7 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     ui->Checkbox("Diagnostics", &g_panel_diag);
     if (g_panel_diag)
     {
-        PanelLine("dlss5-dx11-bridge %s, built %s, add-on API %u.",
+        PanelLine("dlss5-bridge %s, built %s, add-on API %u.",
                   BRIDGE_VERSION, __DATE__, g_reshade_api);
         if (flags >= 0)
         {
@@ -6600,7 +6939,7 @@ static void PanelRegister()
     {
         Log("[panel] this ReShade does not serve the ImGui %u function table, so no status "
             "panel is registered and its settings can only be changed in "
-            "dlss5-dx11-bridge.cfg -- ReShade.log names the version it refused. The signed "
+            "dlss5-bridge.cfg -- ReShade.log names the version it refused. The signed "
             "public build is the one that does this: it serves only the newest table. "
             "Everything else in this add-on is unaffected.", kPanelImGuiVersion);
         return;
@@ -6625,7 +6964,7 @@ static void PanelRegister()
         return;
     }
 
-    reg("DLSS 5 DX11 Bridge", &OnPanelDraw);
+    reg("DLSS 5 Bridge", &OnPanelDraw);
     Log("[panel] status panel registered in ReShade's overlay. Asked for the ImGui %u "
         "function table; ReShade reports its own ImGui as %s.",
         kPanelImGuiVersion, g_panel_gui->GetVersion());

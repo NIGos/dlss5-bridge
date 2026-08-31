@@ -1,4 +1,4 @@
-// dlss5-dx11-bridge - ReShade add-on.
+// dlss5-bridge - ReShade add-on.
 //
 // Lets a DLSS 5 neural-rendering add-on that only hooks D3D12 run inside a game
 // that renders with D3D11.
@@ -11,10 +11,12 @@
 // add-on is modified; it simply receives genuine D3D12 NGX calls.
 //
 // Nothing on disk is patched. The only writes to foreign code are 14 bytes at
-// three function entry points, in memory, restored around every call.
+// each of three function entry points in every module that exports the NGX D3D11
+// API -- six such modules in Baldur's Gate 3, twelve at most -- in memory,
+// restored around every call. vk_mirror=1 adds four more per module.
 //
-// Behaviour is driven by dlss5-dx11-bridge.cfg, re-read while the game runs, so
-// settings can be changed without restarting. dlss5-dx11-bridge.log records the
+// Behaviour is driven by dlss5-bridge.cfg, re-read while the game runs, so
+// settings can be changed without restarting. dlss5-bridge.log records the
 // contract that was read, which resource-sharing direction the driver accepted,
 // and the result of every NGX call.
 //
@@ -23,8 +25,8 @@
 // size and offset is taken from the game's own parameter block.
 //
 // Build:
-//   cl /nologo /LD /EHsc /O2 /MT dlss5-dx11-bridge.cpp \
-//      /link /OUT:dlss5-dx11-bridge.addon64 kernel32.lib user32.lib
+//   cl /nologo /LD /EHsc /O2 /MT dlss5-bridge.cpp \
+//      /link /OUT:dlss5-bridge.addon64 kernel32.lib user32.lib
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -47,16 +49,16 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.1.0"
+#define BRIDGE_VERSION "1.2.0"
 
 extern "C" __declspec(dllexport) const char *NAME =
-    "DLSS 5 DX11 Bridge " BRIDGE_VERSION;
+    "DLSS 5 Bridge " BRIDGE_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Lets D3D12-only DLSS 5 add-ons run in a D3D11 game. Intercepts the game's "
     "NVSDK_NGX_D3D11 evaluate, forwards it untouched, and mirrors the same "
     "contract onto a second NGX session on its own D3D12 device -- which is "
     "where a DLSS 5 neural-rendering add-on can insert itself. "
-    "Settings in dlss5-dx11-bridge.cfg, re-read while the game runs.";
+    "Settings in dlss5-bridge.cfg, re-read while the game runs.";
 
 // ---------------------------------------------------------------------------
 // NGX declarations
@@ -175,7 +177,7 @@ static void Warn(const char *fmt, ...)
     if (g_reshade_log != nullptr)
     {
         char tagged[1100];
-        _snprintf_s(tagged, sizeof(tagged), _TRUNCATE, "[DLSS 5 DX11 Bridge] %s", line);
+        _snprintf_s(tagged, sizeof(tagged), _TRUNCATE, "[DLSS 5 Bridge] %s", line);
         g_reshade_log(g_reshade_module, 1 /* error */, tagged);
     }
 }
@@ -315,7 +317,7 @@ struct Layer
 };
 
 // Whether the Vulkan mirror is switched on, read once at attach out of
-// dlss5-dx11-bridge.cfg. It decides whether four foreign entry points get
+// dlss5-bridge.cfg. It decides whether four foreign entry points get
 // fourteen bytes written into them, so it is a launch-time decision and not a
 // per-frame one. Kept out of BridgeCfg deliberately: bridge.inc is the file the
 // nine shipped D3D11 titles run on, and its config report line stays byte for
@@ -332,7 +334,6 @@ static volatile LONG    g_layer_count;
 // same line forty times before anything else happened.
 // Set when the host executable's own NGX exports were left alone, so the idle
 // diagnosis can name it rather than leaving the reader to guess.
-static bool             g_skipped_host_exe;
 static HMODULE          g_deferred_exe;
 static bool             g_force_exe;
 
@@ -1192,7 +1193,6 @@ static void LogFileVersion(const wchar_t *dir, const wchar_t *leaf, const char *
 // lock guards them.
 static char g_panel_addons[768];
 static char g_panel_dlss5[1024];
-static bool g_panel_ini_read;
 
 // strcat_s calls the invalid-parameter handler on overflow, which terminates the
 // process. These buffers are filled from a directory listing and a file, neither
@@ -1226,7 +1226,6 @@ static void LogReShadeConfig(const wchar_t *dir)
         return;
     }
 
-    g_panel_ini_read = true;
 
     char section[128] = "";
     char line[512];
@@ -1715,7 +1714,6 @@ static bool IsFillerStub(const void *fn)
     return true;
 }
 
-static void LogPrologue(const char *label, const BYTE *p);
 
 static int HookNewNgxModules()
 {
@@ -1803,7 +1801,6 @@ static int HookNewNgxModules()
                 "as their own layers and should carry the same calls. If nothing "
                 "calls DLSS within a minute, this one is hooked after all rather "
                 "than leaving the add-on doing nothing.", leaf);
-            g_skipped_host_exe = true;
             if (g_cfg.skip_exe == 1) g_deferred_exe = mods[i];
             RememberRejected(mods[i]);
             continue;
@@ -2159,6 +2156,49 @@ static PFN_LdrUnregisterDllNotification g_ldr_unregister;
 static volatile LONG g_hooks_installed;
 static ULONGLONG     g_hook_time;
 static volatile LONG g_idle_reported;
+// The add-on shipped as dlss5-dx11-bridge.addon64 until 1.1.0, and renaming the
+// file does not delete the old one. ReShade loads every add-on it finds, so both
+// end up in the process, each writing 14-byte jumps over the same NGX entry points
+// and each recording whatever it found there as the original bytes.
+//
+// This WARNS and does not prevent, which is the honest thing it can do. Two
+// placements were tried on 2026-08-31 in Baldur's Gate 3 and neither works:
+//
+//   at attach   -- add-ons load in name order and "dlss5-bridge" sorts before
+//                  "dlss5-dx11-bridge", so the old copy is not in the process yet.
+//   at hook time -- assumed to be later, and is not: the driver's _nvngx.dll was
+//                  already loaded, so layer 0 was hooked 39 ms before the old
+//                  add-on attached at all.
+//
+// There is no point between those two where the answer is both known and still
+// actionable. Called from the frame path, where every add-on has certainly loaded,
+// it can at least name the problem. Both copies did hook in that test and nothing
+// crashed, so this is a warning about a hazard, not a report of a failure.
+static void WarnIfOldCopyLoaded()
+{
+    static LONG said = 0;
+    if (InterlockedCompareExchange(&said, 1, 0) != 0) return;
+
+    if (HMODULE other = GetModuleHandleA("dlss5-dx11-bridge.addon64"))
+        if (other != g_self)
+            Log("WARNING: dlss5-dx11-bridge.addon64 is loaded as well as this one. That "
+                "is this add-on under the name it had before 1.1.0, and both have hooked "
+                "the same NGX entry points over each other. Delete the old file from the "
+                "game folder, or disable it in ReShade's add-on list. Settings are safe "
+                "either way: the cfg is read under both names.");
+
+    // The other redundancy, and the one that ends this project: a DLSS add-on that
+    // reaches NGX by itself needs no bridge at all. Named rather than acted on,
+    // deliberately -- whether it covers Vulkan as well as D3D11 is not established
+    // here, and standing the bridge down on a guess would take Vulkan away from
+    // somebody who still wants it. The user is told, and decides.
+    if (GetModuleHandleA("renodx-dlss.addon64") != nullptr)
+        Log("NOTE: renodx-dlss.addon64 is loaded, and it reaches NGX on its own rather "
+            "than through a bridge. Where it serves the game, this add-on has nothing "
+            "to add and can be removed. It is kept loaded here because whether it "
+            "covers every API this bridge does has not been checked.");
+}
+
 // Safe to call repeatedly and from the loader callback: it does nothing once
 // the hooks are in, and everything it does before that is a name lookup.
 static void TryInstallHooks()
@@ -2505,7 +2545,7 @@ static bool RegisterWithReShade(HMODULE self)
     return false;
 }
 
-// A standalone NGX D3D12 probe, off unless dlss5-dx11-bridge.cfg says probe=1.
+// A standalone NGX D3D12 probe, off unless dlss5-bridge.cfg says probe=1.
 //
 // The bridge only opens its D3D12 session when the game calls DLSS, which makes
 // some questions untestable: Prey 2017 has no DLSS of its own, so removing the
@@ -2584,10 +2624,17 @@ static DWORD WINAPI NgxProbeThread(LPVOID)
 // mirror's gate is deliberately not a BridgeCfg field -- see g_vk_mirror.
 static bool CfgKeyOn(const char *key_eq)
 {
+    // Same two names CfgPath tries, and for the same reason: this runs before
+    // the hooks go in, so a user upgrading from dlss5-dx11-bridge must not lose
+    // the setting that holds them back.
     char path[MAX_PATH] = {};
     GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *sl = strrchr(path, (char)92))   // backslash
-        strcpy_s(sl + 1, MAX_PATH - (sl + 1 - path), "dlss5-dx11-bridge.cfg");
+    char *sl = strrchr(path, (char)92);   // backslash
+    if (sl == nullptr) return false;
+    const size_t room = MAX_PATH - (sl + 1 - path);
+    strcpy_s(sl + 1, room, "dlss5-bridge.cfg");
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+        strcpy_s(sl + 1, room, "dlss5-dx11-bridge.cfg");
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "r") != 0 || f == nullptr) return false;
@@ -2618,7 +2665,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         GetModuleFileNameA(module, g_log_path, MAX_PATH);
         char *slash = strrchr(g_log_path, '\\');
         if (slash != nullptr)
-            strcpy_s(slash + 1, MAX_PATH - (slash + 1 - g_log_path), "dlss5-dx11-bridge.log");
+            strcpy_s(slash + 1, MAX_PATH - (slash + 1 - g_log_path), "dlss5-bridge.log");
 
         if (!RegisterWithReShade(module))
             return FALSE;  // ReShade will unload us; do not leave hooks behind
@@ -2663,7 +2710,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         // First line of every log, so a report can name the build exactly,
         // followed by everything needed to diagnose a setup remotely.
-        Log("dlss5-dx11-bridge %s (built %s %s) attached.", BRIDGE_VERSION, __DATE__, __TIME__);
+        Log("dlss5-bridge %s (built %s %s) attached.", BRIDGE_VERSION, __DATE__, __TIME__);
         if (carried[0] != '\0')
         {
             Log("The previous run crashed. What it recorded at the time:");
