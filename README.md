@@ -1,23 +1,29 @@
 # DLSS 5 DX11 Bridge
 
-> ## Project status: finished
+> ## v1.1.0 — the biggest release, and the last
 >
-> **The DLSS 5 add-on now supports D3D11 and D3D9 directly, so the reason this
-> bridge existed is gone.** For a D3D11 or D3D9 game, use that add-on on its own
-> — it is the one that gets updated.
+> **Vulkan games are supported.** A Vulkan game's own DLSS contract is mirrored
+> onto a private D3D12 session, so neural rendering runs over the game's own
+> upscale at its own quality preset, with the engine's own jitter and motion
+> vectors. Nothing reconstructed. `vk_mirror=1`.
 >
-> **v1.1.0 is the last feature release. There is no active development after it.**
+> **Motion vectors come straight from the NVIDIA driver.** The optical flow engine
+> in `nvofapi64.dll` is driven directly, so no ReShade motion-vector shader has to
+> be installed. 0.18 ms per frame at 3840x1600.
 >
-> Two things here are not covered by the add-on on its own, and are why the last
-> release is still worth taking: the **Vulkan bridge** (`vk_mirror=1`), which
-> mirrors a Vulkan game's own DLSS contract onto a private D3D12 session, and
-> **motion vectors read straight from the NVIDIA driver's optical flow engine**,
-> which removes the dependency on a third-party ReShade shader. Both are off by
-> default and both are NVIDIA-only.
+> **A game with no DLSS at all can be given one.** The two above add up to a DLSS
+> contract built from ReShade's depth and the driver's motion vectors, handed to
+> the add-on as though the game had produced it. `synth_after`.
 >
-> The repository stays up and stays MIT. The source is complete and builds from a
-> clean copy with the command below. Issues can be opened and will be read, but
-> assume nothing is fixed unless someone picks it up. Fork it freely.
+> All three are off unless turned on, and all three are NVIDIA-only.
+>
+> **This is also the last feature release.** The DLSS 5 add-on now supports D3D11
+> and D3D9 directly, which was this bridge's original reason to exist — for those
+> games, use that add-on on its own; it is the one that gets updated. There is no
+> active development after this. The repository stays up and stays MIT, the source
+> is complete and builds from a clean copy with the command below, and issues can
+> be opened and will be read — but assume nothing is fixed unless someone picks it
+> up. Fork it freely.
 
 A ReShade add-on that lets a DLSS 5 Neural Rendering add-on — which only hooks
 DirectX 12 — run inside a game that renders with DirectX 11.
