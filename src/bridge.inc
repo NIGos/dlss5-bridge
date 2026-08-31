@@ -422,11 +422,65 @@ static void CfgWriteDefault()
 
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
-    fprintf(f, "stage=%d\nmode=%d\nskip_game=%d\nflags=%d\nsubrects=%d\nreset_every=%d\npixels=%d\ndred=%d\nskip_exe=%d\nunwrap=%d\nsource=%s\nsynth_after=%d\nmv_sign_x=%d\nmv_sign_y=%d\nofa_grid=%d\nofa_perf=%d\n",
-            g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
-            g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
-            kCfgSourceName[g_cfg.source], g_cfg.synth_after, g_cfg.mv_sign_x, g_cfg.mv_sign_y,
-            g_cfg.ofa_grid, g_cfg.ofa_perf);
+    // Written with the two keys a user actually has to find, and a sentence each
+    // for the rest. The file used to be a bare list of sixteen numbers, and
+    // vk_mirror -- which decides whether half this add-on exists on a Vulkan
+    // game -- was not in it at all: it is read straight from the file, so a user
+    // who never knew the name got nothing and no way to find out why.
+    //
+    // The comment lines are safe to write here. The parser matches key=value and
+    // ignores anything else, and CfgKeyOn/CfgKeyInt match at the start of a line,
+    // so a '#' line cannot switch anything on.
+    fprintf(f,
+        "# dlss5-bridge settings. Re-read about once a second while the game runs,\n"
+        "# so most of these take effect without a restart. Delete this file to get\n"
+        "# it back with defaults.\n"
+        "\n"
+        "# THE TWO THAT MATTER\n"
+        "#\n"
+        "# vk_mirror  1 hooks the Vulkan NGX entry points as well, which is what\n"
+        "#            lets a Vulkan game's own DLSS be mirrored. Harmless on a\n"
+        "#            DirectX game, which has none to hook. Read once at launch.\n"
+        "# synth_after  seconds to wait, with no DLSS call from the game, before\n"
+        "#            building a DLSS contract FOR it out of ReShade's depth and\n"
+        "#            the NVIDIA driver's optical flow. 0 leaves that off. This is\n"
+        "#            the switch for a game with no DLSS of its own; try 10.\n"
+        "vk_mirror=%d\n"
+        "synth_after=%d\n"
+        "\n"
+        "# WHICH SOURCE MAY HOLD THE SESSION\n"
+        "# auto lets the game's own DLSS win and falls back to the synthetic\n"
+        "# contract; mirror and synth pin one; off disables both.\n"
+        "source=%s\n"
+        "\n"
+        "# THE DRIVER'S OPTICAL FLOW ENGINE, used by the synthetic contract only.\n"
+        "# ofa_grid 0 off -- a ReShade motion-vector shader is then required -- or\n"
+        "# 1, 2, 4 finest to cheapest. ofa_perf 5 SLOW, 10 MEDIUM, 20 FAST.\n"
+        "ofa_grid=%d\n"
+        "ofa_perf=%d\n"
+        "# Force the motion-vector direction instead of the provider's own\n"
+        "# convention. 0 leaves it alone; -1 or 1 forces it. For diagnosis.\n"
+        "mv_sign_x=%d\n"
+        "mv_sign_y=%d\n"
+        "\n"
+        "# THE REST. stage 0 switches the add-on off without removing the file.\n"
+        "# flags -1 copies the create flags the game declared; any other value\n"
+        "# forces one, except 107, which is treated as unset.\n"
+        "stage=%d\n"
+        "mode=%d\n"
+        "skip_game=%d\n"
+        "flags=%d\n"
+        "subrects=%d\n"
+        "reset_every=%d\n"
+        "pixels=%d\n"
+        "dred=%d\n"
+        "skip_exe=%d\n"
+        "unwrap=%d\n",
+        1, g_cfg.synth_after,
+        kCfgSourceName[g_cfg.source], g_cfg.ofa_grid, g_cfg.ofa_perf,
+        g_cfg.mv_sign_x, g_cfg.mv_sign_y,
+        g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
+        g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
     fclose(f);
     Log("[bridge] wrote default config to %s", path);
 }

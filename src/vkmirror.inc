@@ -266,6 +266,9 @@ struct VkMirror
     // saw the GPU reach a frame's ev_in before the render thread may reuse a
     // pair, and the stall path releases the render thread having seen nothing.
     volatile LONG drain;
+    // Set when the game recreated its own feature and cleared when the rebuild
+    // that follows has named itself. Only the log reads it.
+    bool    rebuild_on_game_create;
 
     // The contract the worker evaluates. Single slot: the render thread waits on
     // idle before touching this, so there is no second writer.
@@ -275,6 +278,24 @@ struct VkMirror
     LONG   n;
     bool   said_no_runtime;
 };
+
+// One NGX call at a time in this process, across both backends.
+//
+// The mirror's worker runs a D3D12 NGX evaluate while the game's render thread
+// runs its own Vulkan NGX evaluate, and until now nothing kept the two apart:
+// the worker takes no lock, and the render thread's g_hook_cs is released before
+// VkMirrorFrame wakes it. Two threads inside one NGX, on Red Dead Redemption 2,
+// fault -- and the evidence that it is a race rather than a bad contract is that
+// it is not reproducible in shape. Measured 2026-08-31, same build, same game,
+// same values: once after 89 delivered frames inside nvapi64_impl.dll, once
+// after 145 inside nvoglv64.dll, with every per-frame parameter dumped at the
+// fault and every one of them in range, and the private device reporting S_OK.
+//
+// Deliberately NOT g_hook_cs. That one is taken from the loader notification
+// while the loader lock is held, and adding a second waiter on it is the
+// deadlock the note in TryInstallHooks was written about.
+static CRITICAL_SECTION g_ngx_cs;
+static bool             g_ngx_cs_ready;
 
 static VkMirror g_vkm;
 
@@ -397,7 +418,11 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             // ahead of the truth -- the copy back executes on the game's GPU after
             // the detour returns -- but it is the last point this thread can
             // observe, and stage 2 records no copy back at all.
-            if (Synth12EvaluateShared(&g_vkm.sp))
+            // Serialised against the game's own NGX evaluate -- see g_ngx_cs.
+            if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
+            const bool ev_ok = Synth12EvaluateShared(&g_vkm.sp);
+            if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+            if (ev_ok)
             {
                 // Both counters clear here: a frame that arrived and evaluated is
                 // the evidence that neither the stall nor the refusals were the
@@ -636,6 +661,18 @@ static bool VkmReadContract(const NVSDK_NGX_Parameter *gp, SynthParams *sp, VkmR
         }
     }
     VkmMirrorU(gp, sp, "DLSS.Feature.Create.Flags", 0u);
+    // And the config override on top, so the flags the feature is CREATED with are
+    // the ones the exposure gate tested. Without this the gate opens on a value
+    // the feature does not carry, and NGX is told to read an ExposureTexture this
+    // transport never provides.
+    //
+    // The one place the mirror does not copy, and still not an invention: the
+    // value comes from a user who asked for it by name.
+    {
+        FlagsFrom ff = FLAGS_NONE;
+        const unsigned int forced = ResolveCreateFlags(gp, &ff);
+        if (ff == FLAGS_CONFIG) sp->Set("DLSS.Feature.Create.Flags", forced);
+    }
     VkmMirrorU(gp, sp, "DLSS.Enable.Output.Subrects", 0u);
 
     // The render subrect falls back to the mirrored render size, which is what
@@ -829,13 +866,46 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     // decision somebody made. AutoExposure set means DLSS computes its own and
     // the texture is not read.
     {
+        // The contract's own flags, and there is no way round this one.
+        //
+        // It was tried, on 2026-08-31, against Red Dead Redemption 2: the gate was
+        // made to read the config-resolved flags so a user could force
+        // AutoExposure and run anyway, and the mirrored feature was created with
+        // those same forced flags so the two agreed. The evaluate still raised
+        // 0xC0000005 and the game stopped presenting. So the exposure texture is
+        // not the whole of what that title's contract needs from a transport this
+        // build does not have -- it is the first thing that is detectably absent,
+        // not the last thing that is missing.
+        //
+        // A refusal that stops a session is worth more than an override that hangs
+        // one. This stays shut, and no config key opens it.
+        // The RESOLVED flags, so a user can force AutoExposure and run anyway.
+        //
+        // That escape hatch was added, removed and added again in one afternoon,
+        // and the middle step is the one worth recording: forcing it appeared to
+        // fault the evaluate, so the gate was shut again and the refusal told
+        // users there was no way past. Both conclusions were wrong. The fault was
+        // the NGX race g_ngx_cs now closes, which fires on this title with or
+        // without the override; once the two backends were serialised, Red Dead
+        // Redemption 2 ran 1800 mirrored frames with AutoExposure forced and the
+        // brightness was reported as good.
+        //
+        // So the gate is real, the override is real, and the thing that made them
+        // look connected was underneath both.
+        FlagsFrom exp_from = FLAGS_NONE;
+        const unsigned int eff_flags = ResolveCreateFlags(gp, &exp_from);
+
         void *exp = nullptr;
         if (gp->Get("ExposureTexture", &exp) == NGX_SUCCESS && exp != nullptr &&
-            (flags & 0x40) == 0)
+            (eff_flags & 0x40) == 0)
         {
             VkmRefuse("the game drives DLSS from an exposure texture and has not set "
                       "AutoExposure, and this build does not mirror that texture -- "
-                      "delivering without it would be wrong brightness");
+                      "delivering without it would be wrong brightness. To run anyway "
+                      "and let DLSS compute its own exposure, set flags in "
+                      "dlss5-bridge.cfg to the game's own value with bit 0x40 added -- "
+                      "but not to 107, which is treated as unset. Red Dead Redemption 2 "
+                      "declares 43, so 75");
             return;
         }
     }
@@ -922,7 +992,9 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
             // render width: a handover zeroes it deliberately, and letting the
             // size test answer for it printed "render size changed" over a
             // session where nothing about the size had changed.
-            : g_s12.w == 0 ? "the source changed hands"
+            : g_s12.w == 0 ? (g_vkm.rebuild_on_game_create
+                                  ? "the game replaced its own feature"
+                                  : "the source changed hands")
             : g_s12.w != rw || g_s12.h != rh ? "render size changed"
             : g_s12.out_w != ow || g_s12.out_h != oh ? "output size changed"
             : g_s12.fmt != color_fmt ? "colour format changed"
@@ -931,6 +1003,7 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         // finished with before they are destroyed, and inside a detour there is
         // no queue to idle -- so the device is. A resolution change costs one
         // visible hitch, which is what it costs everywhere else too.
+        g_vkm.rebuild_on_game_create = false;
         g_svk.DeviceWaitIdle(g_svk.dev);
         SynthVkReleaseImages();
         // The same two teardowns the synthetic path already does before its own
@@ -1148,12 +1221,16 @@ typedef NVSDK_NGX_Result (*PFN_VkCreate)(void *, int, NVSDK_NGX_Parameter *, NVS
 typedef NVSDK_NGX_Result (*PFN_VkCreate1)(void *, void *, int, NVSDK_NGX_Parameter *,
                                           NVSDK_NGX_Handle **);
 
+// g_ngx_cs OUTSIDE g_hook_cs, always in that order, so the pair is never taken
+// the other way round anywhere. The worker takes g_ngx_cs alone.
 #define VKM_FORWARD(call)                        \
+    if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs); \
     EnterCriticalSection(&g_hook_cs);            \
     HookRemove(h);                               \
     NVSDK_NGX_Result r_ = (call);                \
     HookRestore(h);                              \
     LeaveCriticalSection(&g_hook_cs);            \
+    if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs); \
     return r_;
 
 static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
@@ -1297,6 +1374,36 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
     Log("=== Vulkan CreateFeature #%ld returned %d, handle=%p ===", n, r,
         (out != nullptr && *out != nullptr) ? static_cast<void *>(*out) : nullptr);
     VkmNoteCreated(feature_id, r, out);
+
+    // The game replacing its own super-resolution feature invalidates ours, and
+    // this did nothing about it until now: the shape test is the only thing that
+    // triggers a rebuild, and a game can recreate at an unchanged render and
+    // output size. Red Dead Redemption 2 does exactly that when HDR is switched
+    // on or the window goes fullscreen -- three creates in a minute at
+    // 2560x1067 -> 3840x1600 throughout -- and the mirror carried its old feature
+    // across all three.
+    //
+    // Two things are wrong with carrying it. The temporal history it holds was
+    // accumulated under the configuration the game has just discarded, which is
+    // the same objection this file already makes to swapping motion-vector
+    // estimators mid-session. And the neural add-on downstream matches features
+    // by create: ours never created again, so it had nothing to match and said
+    // so -- "no NR feature matched" -- while the mirror went on delivering.
+    //
+    // A zero width is the rebuild request the handover path already uses, so this
+    // is the same mechanism rather than a new one. feature_id 1 only: a denoiser
+    // or another feature being created says nothing about the one we mirror.
+    if (r == NGX_SUCCESS && feature_id == 1)
+    {
+        EnterCriticalSection(&g_bridge_cs);
+        g_s12.w = 0;
+        g_s12.need_reset = true;
+        // Which of the two zeroes this is. Both ask for the same rebuild, and the
+        // log line has to tell them apart or it reports a handover that did not
+        // happen -- the source did not change, the game replaced its own feature.
+        g_vkm.rebuild_on_game_create = true;
+        LeaveCriticalSection(&g_bridge_cs);
+    }
     return r;
 }
 

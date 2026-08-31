@@ -2153,8 +2153,34 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
     {
         // An access violation inside NGX means its own state is no longer
         // trustworthy, so this stops rather than calling back in.
-        Log("[synth] the D3D12 evaluate raised exception 0x%08X, so this backend stops "
-            "here. The game keeps rendering on its own.", code);
+        // Three facts with it, all reachable here and none of them recorded until
+        // now. On Red Dead Redemption 2 this branch fires AFTER at least one
+        // evaluate over the same textures, the same parameter block and the same
+        // feature handle has already succeeded -- the render thread cannot read
+        // the next contract until the worker has set idle, and it did -- so
+        // everything fixed for the session is excluded and the question is what
+        // changed between frames.
+        //
+        // The device's removed reason is the split that matters. S_OK exonerates
+        // the GPU work and makes this a pointer walk inside NGX; HUNG, RESET or
+        // DRIVER_INTERNAL_ERROR mean the private device died on an earlier
+        // frame's work and NGX faulted on the corpse, which sends the search to
+        // the imported textures instead of the parameter block. The two want
+        // opposite next steps and guessing which costs a session.
+        const HRESULT removed = g_s12.dev != nullptr ? g_s12.dev->GetDeviceRemovedReason()
+                                                     : S_OK;
+        Log("[synth] the D3D12 evaluate raised exception 0x%08X after %ld delivered "
+            "frames; the private device's removed reason is 0x%08X. This backend stops "
+            "here. The game keeps rendering on its own.",
+            code, InterlockedCompareExchange(&g_frames_delivered, 0, 0), removed);
+        // Named for the create failure already and never for this one, which is
+        // the gap: "inside a snippet" and "inside the D3D12 runtime" are different
+        // reports, and the faulting address tells them apart for free.
+        {
+            wchar_t who[MAX_PATH + 64] = {};
+            if (NameFaultOwner(who, _countof(who)))
+                Log("[synth]   it faulted in %ls", who);
+        }
         g_s12.ready   = false;
         g_s12.feature = nullptr;
         return;
@@ -2256,8 +2282,57 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
     {
         // An access violation inside NGX means its own state is no longer
         // trustworthy, so this stops rather than calling back in.
-        Log("[synth] the D3D12 evaluate raised exception 0x%08X, so this backend stops "
-            "here. The game keeps rendering on its own.", code);
+        // The device's removed reason is the split that decides where to look
+        // next. S_OK exonerates the GPU work and makes this a pointer walk inside
+        // NGX; HUNG, RESET or DRIVER_INTERNAL_ERROR mean the private device died
+        // on an earlier frame's work and NGX faulted on the corpse, which sends
+        // the search to the imported textures instead of the parameter block.
+        // The frame count matters too: this branch is reached on Red Dead
+        // Redemption 2 only after at least one evaluate over the same textures
+        // and the same feature has succeeded.
+        const HRESULT removed = g_s12.dev != nullptr ? g_s12.dev->GetDeviceRemovedReason()
+                                                     : S_OK;
+        Log("[synth] the D3D12 evaluate raised exception 0x%08X after %ld delivered "
+            "frames; the private device's removed reason is 0x%08X. This backend stops "
+            "here. The game keeps rendering on its own.",
+            code, InterlockedCompareExchange(&g_frames_delivered, 0, 0), removed);
+        {
+            wchar_t who[MAX_PATH + 64] = {};
+            if (NameFaultOwner(who, _countof(who)))
+                Log("[synth]   it faulted in %ls", who);
+        }
+        // Every per-frame value, as the block held it when it faulted. Eighty-nine
+        // frames over the same textures and the same feature succeeded first, so
+        // the only things that can have changed are these -- the ten subrects and
+        // the five floats Synth12FrameParams copies out of the game's contract on
+        // every frame. If one is out of range for the textures NGX was given,
+        // this is where it shows.
+        {
+            static const char *const uk[] = {
+                "DLSS.Render.Subrect.Dimensions.Width", "DLSS.Render.Subrect.Dimensions.Height",
+                "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+                "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y",
+                "DLSS.Input.MV.Subrect.Base.X",    "DLSS.Input.MV.Subrect.Base.Y",
+                "DLSS.Output.Subrect.Base.X",      "DLSS.Output.Subrect.Base.Y",
+                "Width", "Height", "OutWidth", "OutHeight", "Reset",
+            };
+            for (size_t i = 0; i < _countof(uk); ++i)
+            {
+                unsigned int v = 0;
+                if (g_s12.params->Get(uk[i], &v) == NGX_SUCCESS && v != 0)
+                    Log("[synth]   at fault: %s = %u", uk[i], v);
+            }
+            static const char *const fk[] = {
+                "MV.Scale.X", "MV.Scale.Y", "Jitter.Offset.X", "Jitter.Offset.Y",
+                "Sharpness", "DLSS.Pre.Exposure", "DLSS.Exposure.Scale",
+            };
+            for (size_t i = 0; i < _countof(fk); ++i)
+            {
+                float v = 0.0f;
+                if (g_s12.params->Get(fk[i], &v) == NGX_SUCCESS)
+                    Log("[synth]   at fault: %s = %.6f", fk[i], v);
+            }
+        }
         g_s12.ready   = false;
         g_s12.feature = nullptr;
         return false;

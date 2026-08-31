@@ -49,7 +49,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.2.0"
+#define BRIDGE_VERSION "1.3.0"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -2647,6 +2647,40 @@ static bool CfgKeyOn(const char *key_eq)
     return on;
 }
 
+// The same file, read the same way, but for a key whose ABSENCE has to mean
+// something other than off. CfgKeyOn answers "is this exact line present", which
+// makes a missing key and an explicit 0 indistinguishable -- fine for probe=1,
+// wrong for anything that should default on.
+//
+// Prefix-matched at the start of a line like its sibling, so a comment line can
+// mention a key without turning it on.
+static int CfgKeyInt(const char *key, int def)
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    char *sl = strrchr(path, (char)92);   // backslash
+    if (sl == nullptr) return def;
+    const size_t room = MAX_PATH - (sl + 1 - path);
+    strcpy_s(sl + 1, room, "dlss5-bridge.cfg");
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+        strcpy_s(sl + 1, room, "dlss5-dx11-bridge.cfg");
+
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || f == nullptr) return def;
+    char line[256];
+    int  out = def;
+    const size_t n = strlen(key);
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        if (_strnicmp(line, key, n) != 0 || line[n] != '=') continue;
+        int v = 0;
+        if (sscanf_s(line + n + 1, "%d", &v) == 1) out = v;
+        break;
+    }
+    fclose(f);
+    return out;
+}
+
 static bool ProbeRequested() { return CfgKeyOn("probe=1"); }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
@@ -2657,6 +2691,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
         InitializeCriticalSection(&g_hook_cs);
+        // Both NGX backends serialise on this one -- see g_ngx_cs. The ready
+        // flag exists because VKM_FORWARD can be reached from a detour before
+        // this line on a process that loads an NGX module unusually early, and
+        // entering an uninitialised section is worse than not serialising.
+        InitializeCriticalSection(&g_ngx_cs);
+        g_ngx_cs_ready = true;
         // Before RegisterWithReShade, because that is what arms the ReShade
         // event a second source enters the frame path through, and an
         // uninitialised section is not a lock that is merely unheld.
@@ -2734,7 +2774,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         SynthRegisterEvents();
         // Read before StartWatchingForNgx, because it decides whether the module
         // scan hooks the Vulkan entry points at all.
-        g_vk_mirror = CfgKeyOn("vk_mirror=1") ? 1 : 0;
+        // ON unless the file says otherwise, which is the opposite of how this
+        // shipped. Hooking the Vulkan NGX entry points is a no-op in a process
+        // that has none -- every D3D11 game -- so the only thing the old default
+        // bought was a Vulkan user getting nothing and no way to find out why:
+        // the key was not even written into the generated config, so there was
+        // nothing to discover. It costs a Vulkan game four more patched entry
+        // points per module, which is what it is for.
+        g_vk_mirror = CfgKeyInt("vk_mirror", 1) != 0 ? 1 : 0;
         VkmRegisterEvents();
         // Not behind SynthEnabled, unlike the events above. The panel's whole
         // job is to say which situation this session is in, and "synthesis is
