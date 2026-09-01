@@ -25,12 +25,24 @@
 // size and offset is taken from the game's own parameter block.
 //
 // Build:
-//   cl /nologo /LD /EHsc /O2 /MT dlss5-bridge.cpp \
-//      /link /OUT:dlss5-bridge.addon64 kernel32.lib user32.lib
+//   cl /nologo /LD /EHsc /O2 /MT /std:c++17 /Ireshade dlss5-bridge.cpp version.res \
+//      /link /OUT:dlss5-bridge.addon64 kernel32.lib user32.lib advapi32.lib
+//
+// The line above used to omit /std:c++17, /Ireshade, version.res and advapi32.lib,
+// and did not compile: the vendored ReShade headers use nested namespace
+// definitions, and RegGetValueW is in advapi32. Nobody noticed because nobody
+// builds from the comment -- which is exactly why it is worth it being right.
+//
+// The test binary is the same file with a different entry point:
+//   cl /nologo /EHsc /MT /std:c++17 /Ireshade /Fe:probe.exe probe.cpp \
+//      /link kernel32.lib user32.lib advapi32.lib version.lib
+// See probe.cpp for what it covers and, more importantly, what it does not.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+// SHA-256 for identifying a neighbour build whose version resource does not.
+#include <bcrypt.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -49,7 +61,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.3.0"
+#define BRIDGE_VERSION "1.4.0"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -200,9 +212,75 @@ static void Breadcrumb(const char *what) { g_where = what; }
 
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prev_filter;
 
+// A module that has been unloaded cannot be named after the fact: the address is
+// free memory and every lookup returns nothing. This crash filter printed exactly
+// that -- "memory that is no longer mapped" -- for a fault at process teardown,
+// which says the code was unloaded but not whose it was.
+//
+// So the module list is photographed while it still exists, and the photograph is
+// what the filter consults when the live lookup fails. Taken at registration and
+// again whenever an effect runtime is destroyed, which is the edge every teardown
+// fault so far has been behind.
+struct ModuleShot { uintptr_t base; uintptr_t end; wchar_t name[64]; };
+static ModuleShot g_shot[256];
+static LONG       g_shot_n;
+
+static void ModuleSnapshot()
+{
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (k32 == nullptr) return;
+    auto enum_mods = reinterpret_cast<BOOL (WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD)>(
+        GetProcAddress(k32, "K32EnumProcessModules"));
+    auto mod_info = reinterpret_cast<BOOL (WINAPI *)(HANDLE, HMODULE, void *, DWORD)>(
+        GetProcAddress(k32, "K32GetModuleInformation"));
+    if (enum_mods == nullptr || mod_info == nullptr) return;
+
+    HMODULE mods[256] = {};
+    DWORD   need = 0;
+    if (!enum_mods(GetCurrentProcess(), mods, sizeof(mods), &need)) return;
+
+    struct { LPVOID base; DWORD size; LPVOID entry; } mi = {};
+    const DWORD count = need / sizeof(HMODULE) < 256 ? need / sizeof(HMODULE) : 256;
+    LONG n = 0;
+    for (DWORD i = 0; i < count; ++i)
+    {
+        if (!mod_info(GetCurrentProcess(), mods[i], &mi, sizeof(mi))) continue;
+        wchar_t path[MAX_PATH] = L"";
+        if (GetModuleFileNameW(mods[i], path, MAX_PATH) == 0) continue;
+        const wchar_t *leaf = wcsrchr(path, L'\\');
+        leaf = leaf != nullptr ? leaf + 1 : path;
+        g_shot[n].base = reinterpret_cast<uintptr_t>(mi.base);
+        g_shot[n].end  = g_shot[n].base + mi.size;
+        wcsncpy_s(g_shot[n].name, leaf, _TRUNCATE);
+        ++n;
+    }
+    InterlockedExchange(&g_shot_n, n);
+}
+
+// Names the module an address belonged to WHEN THE PHOTOGRAPH WAS TAKEN. The
+// offset is the useful half: it survives the unload and points at one function.
+static bool ModuleSnapshotNameAt(const void *addr, wchar_t *out, size_t cch)
+{
+    const uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+    const LONG n = InterlockedCompareExchange(&g_shot_n, 0, 0);
+    for (LONG i = 0; i < n; ++i)
+        if (a >= g_shot[i].base && a < g_shot[i].end)
+        {
+            swprintf_s(out, cch, L"%s+0x%llX (unloaded before the fault; named from the "
+                                 L"module list photographed at teardown)",
+                       g_shot[i].name,
+                       static_cast<unsigned long long>(a - g_shot[i].base));
+            return true;
+        }
+    return false;
+}
+
 // Defined with the hook table below; a module unloaded after being hooked is
 // no longer a module, but its base is still recorded there.
 static void NameHookedLayerAt(const void *base, wchar_t *out, size_t cch);
+
+// Defined with the detour reader below; a read that faults must not fault here.
+static bool SafeReadPtr(const void *const *slot, const void **out);
 
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 {
@@ -228,8 +306,12 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
         if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi))
         {
             if (mbi.State == MEM_FREE)
-                wcscpy_s(owner, L"memory that is no longer mapped -- the code that "
-                                L"faulted has been unloaded");
+            {
+                if (!ModuleSnapshotNameAt(addr, owner, MAX_PATH))
+                    wcscpy_s(owner, L"memory that is no longer mapped -- the code that "
+                                    L"faulted has been unloaded, and it was not in the "
+                                    L"module list photographed at teardown either");
+            }
             else
             {
                 // A module hooked earlier can be unloaded while its base is still
@@ -251,11 +333,110 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
     // happens is reliable; inferring one from a missing clean-exit marker is
     // not, because plenty of games terminate without ever running DLL detach.
     Log("### CRASH RECORDED ###");
+    // The version, inside the block. The next launch reprints this block under its
+    // own banner, so without this line a 1.3.0 fault is read against 1.4.0's
+    // offsets by whoever triages it.
+    Log("  recorded by dlss5-bridge %s (built %s %s)", BRIDGE_VERSION, __DATE__, __TIME__);
     Log("  exception 0x%08X at %p", code, addr);
     Log("  in: %ls", owner);
+
+    // For an access violation the record says what kind. Reading freed memory and
+    // executing it are different bugs with the same code, and the second one --
+    // a call into a module that has been unloaded -- is the one that looks like a
+    // mystery until this line names it.
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+    {
+        const ULONG_PTR kind = ep->ExceptionRecord->ExceptionInformation[0];
+        Log("  access violation: %s at %p",
+            kind == 0 ? "read" : kind == 1 ? "write" : kind == 8 ? "executed code" : "unknown access",
+            reinterpret_cast<void *>(ep->ExceptionRecord->ExceptionInformation[1]));
+    }
+
+    // Which thread. A fault on a thread whose entry point is in another module is
+    // that module's thread, whatever the add-on happened to be doing at the time.
+    if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
+        if (auto qti = reinterpret_cast<LONG (WINAPI *)(HANDLE, int, PVOID, ULONG, PULONG)>(
+                GetProcAddress(nt, "NtQueryInformationThread")))
+        {
+            void *start = nullptr;
+            if (qti(GetCurrentThread(), 9 /* ThreadQuerySetWin32StartAddress */,
+                    &start, sizeof(start), nullptr) == 0 && start != nullptr)
+            {
+                wchar_t who[MAX_PATH] = L"";
+                HMODULE sm = nullptr;
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       static_cast<LPCWSTR>(start), &sm) && sm != nullptr)
+                    GetModuleFileNameW(sm, who, MAX_PATH);
+                else if (!ModuleSnapshotNameAt(start, who, MAX_PATH))
+                    wcscpy_s(who, L"unknown");
+                Log("  faulting thread %lu started at %p, in %ls", GetCurrentThreadId(), start, who);
+            }
+        }
     Log("  this add-on was last doing: %s", g_where);
     Log("  %s", mod == g_self ? "That address is inside this add-on, so this one is on me."
                               : "That address is not in this add-on.");
+
+    // Who called it. "Faulted in X" names the victim; the return addresses name
+    // the path, and when the fault is a call into an unloaded module the caller
+    // is the whole question. This filter runs on the faulting thread, so its own
+    // stack is that thread's stack.
+    void *frames[32] = {};
+    const USHORT got = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+    if (got > 0)
+    {
+        Log("  called from (thread %lu):", GetCurrentThreadId());
+        // When the fault is a call into an unloaded module the stack walk stops
+        // there: unwinding needs the unwind tables of the faulting function and
+        // those went with it. The return address is still on the stack, though,
+        // and at the first instruction of the callee it is exactly at RSP.
+        if (ep->ContextRecord != nullptr && code == EXCEPTION_ACCESS_VIOLATION &&
+            ep->ExceptionRecord->NumberParameters >= 1 &&
+            ep->ExceptionRecord->ExceptionInformation[0] == 8)
+        {
+            const void *ret = nullptr;
+            if (SafeReadPtr(reinterpret_cast<const void *const *>(ep->ContextRecord->Rsp), &ret) &&
+                ret != nullptr)
+            {
+                wchar_t who[MAX_PATH] = L"";
+                HMODULE rm = nullptr;
+                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       static_cast<LPCWSTR>(ret), &rm) && rm != nullptr)
+                {
+                    wchar_t path[MAX_PATH] = L"";
+                    GetModuleFileNameW(rm, path, MAX_PATH);
+                    const wchar_t *leaf = wcsrchr(path, L'\\');
+                    swprintf_s(who, L"%s+0x%llX", leaf != nullptr ? leaf + 1 : path,
+                               static_cast<unsigned long long>(
+                                   reinterpret_cast<uintptr_t>(ret) - reinterpret_cast<uintptr_t>(rm)));
+                }
+                else if (!ModuleSnapshotNameAt(ret, who, MAX_PATH))
+                    swprintf_s(who, L"%p (no module)", ret);
+                Log("    the call came from %ls", who);
+            }
+        }
+        for (USHORT i = 0; i < got; ++i)
+        {
+            wchar_t who[MAX_PATH] = L"";
+            HMODULE fm = nullptr;
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   static_cast<LPCWSTR>(frames[i]), &fm) && fm != nullptr)
+            {
+                wchar_t path[MAX_PATH] = L"";
+                GetModuleFileNameW(fm, path, MAX_PATH);
+                const wchar_t *leaf = wcsrchr(path, L'\\');
+                swprintf_s(who, L"%s+0x%llX", leaf != nullptr ? leaf + 1 : path,
+                           static_cast<unsigned long long>(
+                               reinterpret_cast<uintptr_t>(frames[i]) -
+                               reinterpret_cast<uintptr_t>(fm)));
+            }
+            else if (!ModuleSnapshotNameAt(frames[i], who, MAX_PATH))
+                swprintf_s(who, L"%p (no module)", frames[i]);
+            Log("    %2u  %ls", i, who);
+        }
+    }
     Log("#####################################################");
 
     // Always chain: games install their own crash handlers and this must not
@@ -366,6 +547,24 @@ static void RememberRejected(HMODULE m)
         g_rejected[g_rejected_count++] = m;
 }
 static CRITICAL_SECTION g_hook_cs;
+
+// One NGX call at a time in this process, across both backends.
+//
+// The mirror's worker runs a D3D12 NGX evaluate while the game's render thread
+// runs its own Vulkan NGX evaluate, and until now nothing kept the two apart:
+// the worker takes no lock, and the render thread's g_hook_cs is released before
+// VkMirrorFrame wakes it. Two threads inside one NGX, on Red Dead Redemption 2,
+// fault -- and the evidence that it is a race rather than a bad contract is that
+// it is not reproducible in shape. Measured 2026-08-31, same build, same game,
+// same values: once after 89 delivered frames inside nvapi64_impl.dll, once
+// after 145 inside nvoglv64.dll, with every per-frame parameter dumped at the
+// fault and every one of them in range, and the private device reporting S_OK.
+//
+// Deliberately NOT g_hook_cs. That one is taken from the loader notification
+// while the loader lock is held, and adding a second waiter on it is the
+// deadlock the note in TryInstallHooks was written about.
+static CRITICAL_SECTION g_ngx_cs;
+static bool             g_ngx_cs_ready;
 
 // Depth of NGX calls this thread is currently inside. Only the outermost is the
 // caller's; anything nested is NGX talking to itself, with parameters it has
@@ -989,6 +1188,97 @@ static NVSDK_NGX_Result SafeCreateFeature(PFN_D3D12CreateFeature fn, ID3D12Graph
 // A detoured entry point no longer starts with its own prologue. Comparing what
 // is actually at the function address against the untouched bytes shows whether
 // another add-on's hook sits in front of the call this probe is about to make.
+// Only PODs, so __try is legal here. A RIP-relative indirect jump reads a slot
+// this side did not write, and a hook whose table has been unmapped would fault
+// on a diagnostic line, which is the worst place to take a process down.
+static bool SafeReadPtr(const void *const *slot, const void **out)
+{
+    __try { *out = *slot; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Where a jump at the entry actually goes, and who owns that address.
+//
+// "<== DETOURED" on its own has cost two issue threads a round trip each --
+// Batman: Arkham Knight (#7) shows both D3D12 NGX entry points hooked and
+// Final Fantasy XV (#11) shows D3D12CreateDevice hooked, and neither log says
+// by whom. The target of an E9 is arithmetic and the module owning it is one
+// call, so the question was answerable all along and simply was not asked.
+// Where a jump at a function's entry actually goes. Three encodings, one place,
+// because two callers print it and a third has to compare it.
+static const void *DetourTargetOf(const BYTE *p)
+{
+    const void *target = nullptr;
+    if (p[0] == 0xE9)
+    {
+        int rel = 0;
+        memcpy(&rel, p + 1, sizeof(rel));
+        target = p + 5 + rel;
+    }
+    else if (p[0] == 0xFF && p[1] == 0x25)
+    {
+        int rel = 0;
+        memcpy(&rel, p + 2, sizeof(rel));
+        if (!SafeReadPtr(reinterpret_cast<const void *const *>(p + 6 + rel), &target))
+            return nullptr;
+    }
+    else if (p[0] == 0x48 && p[1] == 0xB8)
+    {
+        unsigned long long imm = 0;
+        memcpy(&imm, p + 2, sizeof(imm));
+        target = reinterpret_cast<const void *>(imm);
+    }
+    return target;
+}
+
+// A jump at an entry point is not necessarily a hook. A module whose export is a
+// thunk jumps into its OWN code, and nvngx_dlss.dll does exactly that for
+// NVSDK_NGX_VULKAN_CreateFeature1: E9 into the same module, 0xEB5 back.
+//
+// That was reported as "already hooked by something else" in every log, with no
+// hook anywhere in the process -- measured on 2026-09-01 with one add-on loaded
+// and no injector. Two issue threads have already spent a round trip on this
+// line, so a false one is expensive.
+static bool JumpsInsideOwnModule(const BYTE *p)
+{
+    const void *target = DetourTargetOf(p);
+    if (target == nullptr) return false;
+    HMODULE here = nullptr, there = nullptr;
+    const DWORD f = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    if (!GetModuleHandleExW(f, reinterpret_cast<LPCWSTR>(p), &here) || here == nullptr)
+        return false;
+    if (!GetModuleHandleExW(f, static_cast<LPCWSTR>(target), &there) || there == nullptr)
+        return false;
+    return here == there;
+}
+
+static void LogDetourTarget(const BYTE *p)
+{
+    const void *target = DetourTargetOf(p);
+    if (target == nullptr) return;
+
+    HMODULE mod = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(target), &mod) != 0 &&
+        mod != nullptr && GetModuleFileNameW(mod, path, MAX_PATH) != 0)
+    {
+        // As an OFFSET as well as an address: an absolute address changes every
+        // launch and means nothing to whoever owns the module.
+        const unsigned long long off =
+            static_cast<unsigned long long>(static_cast<const BYTE *>(target) -
+                                            reinterpret_cast<const BYTE *>(mod));
+        Log("      the hook jumps into %ls +0x%llX", path, off);
+    }
+    else
+    {
+        Log("      the hook jumps to %p, which is in no loaded module -- so it is "
+            "a trampoline somebody allocated rather than a function in a DLL.", target);
+    }
+}
+
 static void LogEntryBytes(const char *label, void *fn)
 {
     if (fn == nullptr) { Log("    %-34s <not exported>", label); return; }
@@ -999,11 +1289,28 @@ static void LogEntryBytes(const char *label, void *fn)
         n += _snprintf_s(hex + n, sizeof(hex) - n, _TRUNCATE, "%02X ", p[i]);
     const bool detoured = (p[0] == 0xE9) || (p[0] == 0xFF && p[1] == 0x25) ||
                           (p[0] == 0x48 && p[1] == 0xB8) || (p[0] == 0xEB);
-    Log("    %-34s %p  %s %s", label, fn, hex, detoured ? " <== DETOURED" : "");
+    const bool thunk = detoured && JumpsInsideOwnModule(p);
+    Log("    %-34s %p  %s %s", label, fn, hex,
+        thunk ? " <== a thunk into its own module, not a hook"
+              : detoured ? " <== DETOURED" : "");
+    if (detoured) LogDetourTarget(p);
 }
 
 // Defined in bridge.inc, which is included below this point.
 static const char *NgxResultName(NVSDK_NGX_Result r);
+
+// Defined below the include; bridge.inc calls it when the D3D12 session opens.
+static void WarnIfOldCopyLoaded();
+
+// Set by the add-on inventory at attach, read where the private D3D12 device is
+// created. True when the DLSS 5 add-on beside us is a build measured to need
+// ReShade's proxy around that device -- see kKnownConsumers.
+static bool g_consumer_needs_proxy;
+
+// Filled by RegisterWithReShade, printed by the banner: see the note there for
+// why it cannot be logged where it is discovered.
+static wchar_t g_reshade_path[MAX_PATH];
+static DWORD   g_reshade_others;
 
 static void DumpCapability(NVSDK_NGX_Parameter *caps)
 {
@@ -1114,6 +1421,41 @@ struct SeenSnippet { wchar_t leaf[64]; char ver[48]; };
 static SeenSnippet   g_seen[24];
 static volatile LONG g_seen_count;
 
+// The super-resolution snippet's version, for the one decision that depends on it.
+//
+// NGX loads the GAME FOLDER's nvngx_dlss.dll before the driver's, so a game can
+// pin a very old one: Red Dead Redemption 2 ships 2.2.10.0, from 2021, and the
+// Rockstar launcher re-plants it. DLAA as an NVSDK_NGX_PerfQuality_Value member
+// arrived in SDK 3.1.13, and the synthetic contract is DLAA by construction --
+// its render size equals its output size.
+//
+// A 2.x runtime has no network for that. Measured in RDR2 on 2026-09-01, it does
+// not refuse the request either: the create returned success at PerfQualityValue
+// 5 and delivered 1800 frames, and the picture degraded progressively into
+// something the user described as an abstract painting. Accepting an enum it
+// predates is worse than refusing it, and this is the only place that can tell.
+//
+// Returns 0 when no super-resolution snippet has been scanned yet, so a caller
+// can distinguish "old" from "not known".
+static int SnippetMajorVersion(char *ver_out, size_t ver_n)
+{
+    if (ver_out != nullptr && ver_n != 0) ver_out[0] = 0;
+    for (LONG i = 0; i < g_seen_count; ++i)
+    {
+        if (_wcsicmp(g_seen[i].leaf, L"nvngx_dlss.dll") != 0) continue;
+        if (ver_out != nullptr && ver_n != 0) strcpy_s(ver_out, ver_n, g_seen[i].ver);
+        int major = 0;
+        // Only the major, and only compared against 3. NVIDIA moved to
+        // driver-style numbering at 310.x, so "greater than or equal to 3"
+        // covers 3.1.13 and everything after it without this having to parse a
+        // four-part version and rank 3.1.12 against 3.1.13 -- a distinction no
+        // measurement here supports.
+        if (sscanf_s(g_seen[i].ver, "%d", &major) == 1) return major;
+        return 0;
+    }
+    return 0;
+}
+
 static void NoteSnippetVersion(const wchar_t *leaf, const char *ver)
 {
     for (LONG i = 0; i < g_seen_count; ++i)
@@ -1178,10 +1520,34 @@ static void LogFileVersion(const wchar_t *dir, const wchar_t *leaf, const char *
     wcscat_s(path, leaf);
 
     char ver[64];
-    if (FileVersionString(path, ver, sizeof(ver)))
-        Log("    %-26ls %s  version %s", leaf, label, ver);
+    if (!FileVersionString(path, ver, sizeof(ver)))
+        strcpy_s(ver, "no version resource");
+
+    // The size and the date, beside the version, because the version alone does
+    // not identify a build. Measured on 2026-09-01: two copies of the same DLSS 5
+    // add-on, 1,732,608 bytes in one game folder and 1,703,424 in another, both
+    // declaring 0.2026.0828.0517. One of them behaved differently from the other
+    // and no line in this log could tell them apart -- the whole afternoon was
+    // spent looking for that difference in this add-on.
+    //
+    // Free: the caller already has both out of the directory enumeration, and
+    // this reads them again only because the signature took a leaf rather than a
+    // WIN32_FIND_DATA. Size and mtime separate two builds; a hash would separate
+    // them better and cost a full read of a 165 MB neighbour.
+    WIN32_FILE_ATTRIBUTE_DATA fa = {};
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fa))
+    {
+        SYSTEMTIME st = {};
+        FileTimeToSystemTime(&fa.ftLastWriteTime, &st);
+        Log("    %-26ls %s  version %s, %llu bytes, %04u-%02u-%02u %02u:%02u",
+            leaf, label, ver,
+            (static_cast<unsigned long long>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow,
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+    }
     else
-        Log("    %-26ls %s  (no version resource)", leaf, label);
+    {
+        Log("    %-26ls %s  version %s", leaf, label, ver);
+    }
 }
 
 // What the status panel says about this add-on's neighbours. Captured while the
@@ -1346,11 +1712,13 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // calling down through NGX's own plumbing. Forward it and touch nothing.
     if (g_nest > 0)
     {
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         NVSDK_NGX_Result inner = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return inner;
     }
     NestGuard nest;
@@ -1372,22 +1740,50 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                 static_cast<const void *>(handle), static_cast<const void *>(p),
                 static_cast<void *>(ctx));
 
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         NVSDK_NGX_Result bogus = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return bogus;
     }
 
     if (IsOtherFeature(handle))
     {
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         NVSDK_NGX_Result other = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return other;
+    }
+    // source=synth pins the synthetic contract, which means the mirror stands
+    // aside even when the game has DLSS of its own. The key was documented as a
+    // pin and read into the config and shown on the panel, and nothing acted on
+    // this half of it: source=mirror blocked the synthetic path, source=synth
+    // blocked nothing. The game's own call is forwarded untouched, and the latch
+    // is not taken, which is what leaves the field for the other source.
+    if (g_cfg.source == CFG_SRC_SYNTH)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[bridge] source=synth, so the game's own DLSS is forwarded and not "
+                "mirrored. Only a synthetic contract may hold this session.");
+        }
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
+        EnterCriticalSection(&g_hook_cs);
+        HookRemove(h);
+        NVSDK_NGX_Result pinned = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
+        HookRestore(h);
+        LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+        return pinned;
     }
 
     const LONG n = InterlockedIncrement(&g_eval_count);
@@ -1440,11 +1836,13 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                 "off. Forwarded untouched. The feature was created before the hooks went "
                 "in, or its handle would already be recorded.", dkey);
 
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         NVSDK_NGX_Result denoise = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return denoise;
     }
 
@@ -1454,11 +1852,13 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     NVSDK_NGX_Result r = NGX_SUCCESS;
     if (!suppress)
     {
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         r = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
     }
 
     if (n <= 5)
@@ -1483,6 +1883,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // session_ready true and every texture still null. Uncontended whenever
     // this is the only source, which the arming latch makes the usual case.
     EnterCriticalSection(&g_bridge_cs);
+    g_eval_handle = handle;
     // Inside the section, so it cannot land while a substitute is between its
     // own copies and its copy back. One-shot by construction: the exchange above
     // has already made g_source SRC_MIRROR, so the next evaluate reads
@@ -1510,12 +1911,14 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
 {
     if (g_nest > 0)
     {
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         NVSDK_NGX_Result inner =
             reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return inner;
     }
     NestGuard nest;
@@ -1533,12 +1936,14 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
                 "Forwarding it untouched and ignoring it.",
                 static_cast<void *>(p), static_cast<void *>(ctx));
 
+        if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
         EnterCriticalSection(&g_hook_cs);
         HookRemove(h);
         NVSDK_NGX_Result bogus =
             reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
         HookRestore(h);
         LeaveCriticalSection(&g_hook_cs);
+        if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return bogus;
     }
 
@@ -1566,11 +1971,13 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
         DumpInt(p, "DLSS.Enable.Output.Subrects");
     }
 
+    if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
     EnterCriticalSection(&g_hook_cs);
     HookRemove(h);
     NVSDK_NGX_Result r = reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
     HookRestore(h);
     LeaveCriticalSection(&g_hook_cs);
+    if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     Log("=== CreateFeature #%ld returned %d, handle=%p ===", n, r,
         (out != nullptr && *out != nullptr) ? static_cast<void *>(*out) : nullptr);
@@ -1583,6 +1990,8 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
     // rest of the session -- the add-on silently doing nothing while the game
     // renders on its own DLSS. A successful super-resolution create at an
     // address is exactly the event that invalidates an older entry for it.
+    if (feature_id == 1 && r == NGX_SUCCESS && out != nullptr && *out != nullptr)
+        BridgeNoteCreate(*out, p);
     if (feature_id == 1 && r == NGX_SUCCESS && out != nullptr && *out != nullptr)
         for (LONG i = 0; i < g_other_feature_count; ++i)
             if (g_other_feature[i] == *out)
@@ -1939,8 +2348,14 @@ static void LogPrologue(const char *label, const BYTE *p)
     // that explains why, so it is worth saying out loud.
     const bool detoured = (p[0] == 0xE9) || (p[0] == 0xFF && p[1] == 0x25) ||
                           (p[0] == 0x48 && p[1] == 0xB8) || (p[0] == 0xEB);
+    const bool thunk = detoured && JumpsInsideOwnModule(p);
     Log("  %-16s prologue: %s%s", label, hex,
-        detoured ? " <== already hooked by something else" : "");
+        thunk ? " <== a thunk into its own module, not a hook"
+              : detoured ? " <== already hooked by something else" : "");
+    // The target as well as the fact. "Already hooked" with no name has cost two
+    // issue threads a round trip each -- Batman: Arkham Knight (#7) and Final
+    // Fantasy XV (#11) both show one and neither log says by whom.
+    if (detoured) LogDetourTarget(p);
 }
 
 // A log that only describes this add-on cannot diagnose a setup problem. These
@@ -1963,6 +2378,24 @@ static void LogEnvironment()
             Log("  d3d11.dll: %ls", d3d);
     }
 
+    // Which ReShade this add-on registered with, and whether it had a choice.
+    // Two of them in one process is not exotic: a proxy DLL beside the executable
+    // and the machine-wide Vulkan layer both export ReShadeRegisterAddon, and the
+    // first one enumerated wins. Which one that is decides whether the effect
+    // runtime this add-on sees belongs to the game's renderer or to a secondary
+    // device the game made for something else.
+    if (g_reshade_path[0] != 0)
+    {
+        Log("  reshade: %ls", g_reshade_path);
+        if (g_reshade_others != 0)
+            Log("    %lu other module%s in this process also export%s "
+                "ReShadeRegisterAddon. Two ReShades is the shape that leaves this "
+                "add-on on the wrong device; if the mirror later reports a runtime "
+                "that is not the game's renderer, this line is why.",
+                g_reshade_others, g_reshade_others == 1 ? "" : "s",
+                g_reshade_others == 1 ? "s" : "");
+    }
+
     if (HMODULE nt = GetModuleHandleW(L"ntdll.dll"))
     {
         if (auto rtl = reinterpret_cast<PFN_RtlGetVersion>(GetProcAddress(nt, "RtlGetVersion")))
@@ -1979,6 +2412,100 @@ static void LogEnvironment()
                     vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber);
         }
     }
+}
+
+// SHA-256 of a file, for identifying a build that its own version resource does
+// not. Two copies of one DLSS 5 add-on shipped on 2026-08-28 both declare
+// 0.2026.0828.0517 and are 29 KB apart, and one of them writes nothing -- so the
+// version is not an identity and the content has to be.
+//
+// Streamed in 1 MB chunks and capped: this runs at attach, beside a 165 MB
+// neural-rendering snippet that must never be read here. Only .addon64 files
+// reach it.
+static bool Sha256File(const wchar_t *path, char *out_hex, size_t cch)
+{
+    if (cch < 65) return false;
+    out_hex[0] = 0;
+
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER sz = {};
+    if (!GetFileSizeEx(f, &sz) || sz.QuadPart > (64ll << 20)) { CloseHandle(f); return false; }
+
+    BCRYPT_ALG_HANDLE  alg = nullptr;
+    BCRYPT_HASH_HANDLE h   = nullptr;
+    bool ok = false;
+    BYTE digest[32] = {};
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+        BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0) == 0)
+    {
+        BYTE *buf = static_cast<BYTE *>(malloc(1 << 20));
+        if (buf != nullptr)
+        {
+            ok = true;
+            DWORD got = 0;
+            while (ReadFile(f, buf, 1 << 20, &got, nullptr) && got != 0)
+                if (BCryptHashData(h, buf, got, 0) != 0) { ok = false; break; }
+            free(buf);
+            if (ok && BCryptFinishHash(h, digest, sizeof(digest), 0) != 0) ok = false;
+        }
+    }
+    if (h   != nullptr) BCryptDestroyHash(h);
+    if (alg != nullptr) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(f);
+    if (!ok) return false;
+
+    static const char kHex[] = "0123456789ABCDEF";
+    for (int i = 0; i < 32; ++i)
+    { out_hex[i * 2] = kHex[digest[i] >> 4]; out_hex[i * 2 + 1] = kHex[digest[i] & 0xF]; }
+    out_hex[64] = 0;
+    return true;
+}
+
+// The DLSS 5 add-on builds this one has actually been run against, and what
+// happened. Not an authority and not a compatibility list: it is what was
+// measured on one machine, and it says so in the line it prints.
+//
+// It exists because the failure it names is silent from every other angle. A
+// build that attaches, reports itself active in its own panel and writes nothing
+// looks exactly like a working one from inside this add-on -- and cost an
+// evening before the difference turned out to be two builds under one version.
+// needs_proxy: the build recycles its scratch buffers off queue submissions it
+// learns about from ReShade, so it has to see this add-on's private D3D12 device
+// through ReShade's proxy rather than underneath it. Measured 2026-09-02 in
+// ngxGym on both backends: with the proxy stripped it attached, evaluated once
+// and wrote nothing -- output byte-identical to no add-on at all -- and with the
+// proxy kept it installed its "native D3D12 queue submission tracker", evaluated
+// every frame and changed the picture. The older build works either way.
+struct KnownConsumer { const char *sha256; bool good; bool needs_proxy; const char *note; };
+static const KnownConsumer kKnownConsumers[] = {
+    { "245C06137AD13B1CA03AFAAD5100C1E8F0DCE8C11FE50A9272EA562F33CEA601", true, false,
+      "measured 2026-09-02: neural rendering changes the picture through this bridge" },
+    { "D5ADF82EB44B065F4C590AC91FE824BAB07AFEA0EB9F994BDE936710C8593952", true, true,
+      "measured 2026-09-02: works only when this add-on keeps ReShade's proxy on its "
+      "D3D12 device, which it now does for this build automatically. Underneath the "
+      "proxy it attached, said active and wrote nothing" },
+};
+
+// "renodx-dlss5 (2).addon64" and "renodx-dlss5.addon64" are the same add-on. The
+// suffix is what Windows and every browser append when a download would overwrite
+// something, and it is the one rename that produces a second loaded copy of a
+// thing whose author only ever shipped one.
+static void StripDuplicateSuffix(const wchar_t *in, wchar_t *out, size_t cch)
+{
+    wcscpy_s(out, cch, in);
+    wchar_t *dot = wcsrchr(out, L'.');
+    wchar_t *end = dot != nullptr ? dot : out + wcslen(out);
+    // " (12)" backwards: the digits, the space before the bracket, the bracket.
+    if (end - out < 4 || *(end - 1) != L')') return;
+    wchar_t *p = end - 2;
+    if (!iswdigit(*p)) return;
+    while (p > out && iswdigit(*p)) --p;
+    if (*p != L'(' || p == out || *(p - 1) != L' ') return;
+    const size_t keep = static_cast<size_t>(p - 1 - out);
+    wcscpy_s(out + keep, cch - keep, dot != nullptr ? dot : L"");
 }
 
 // The pieces this bridge needs are supplied by other people and dropped in by
@@ -2049,6 +2576,8 @@ static void LogNeighbours()
     if (h != INVALID_HANDLE_VALUE)
     {
         Log("  add-ons present:");
+        wchar_t dup[32][MAX_PATH];
+        int     dup_n = 0;
         do
         {
             LogFileVersion(dir, fd.cFileName, "");
@@ -2072,8 +2601,94 @@ static void LogNeighbours()
                             m != nullptr ? "loaded" : "present, not loaded");
                 PanelAppend(g_panel_addons, sizeof(g_panel_addons), entry);
             }
+            // The browser-duplicate shape, collected as it goes. A re-downloaded
+            // add-on lands as "name (2).addon64" beside the one it was meant to
+            // replace, and ReShade loads BOTH: two copies detouring the same NGX
+            // entry points, each seeing the other's feature and matching neither.
+            //
+            // Found in Baldur's Gate 3 on 2026-09-01, where the folder held
+            // "renodx-dlss5 (2).addon64" and Red Dead Redemption 2 held a
+            // "renodx-dlss5.addon64" of a different size under the same declared
+            // version. The symptom reported was a DLSS 5 add-on whose panel said
+            // active while the picture did not change.
+            if (dup_n < static_cast<int>(_countof(dup)))
+            {
+                wcscpy_s(dup[dup_n], fd.cFileName);
+                ++dup_n;
+            }
+
+            // What this add-on has actually been run against. Only .addon64
+            // files, and never this one: hashing ourselves says nothing, and the
+            // neural-rendering snippet beside us is 165 MB.
+            {
+                const size_t n_leaf = wcslen(fd.cFileName);
+                const bool is_addon = n_leaf > 8 &&
+                    _wcsicmp(fd.cFileName + n_leaf - 8, L".addon64") == 0;
+                wchar_t self_leaf[MAX_PATH] = L"";
+                if (GetModuleFileNameW(g_self, self_leaf, MAX_PATH) != 0)
+                    if (const wchar_t *sl = wcsrchr(self_leaf, L'\\'))
+                        memmove(self_leaf, sl + 1, (wcslen(sl + 1) + 1) * sizeof(wchar_t));
+                if (is_addon && _wcsicmp(fd.cFileName, self_leaf) != 0)
+                {
+                    wchar_t full[MAX_PATH];
+                    wcscpy_s(full, dir);
+                    wcscat_s(full, fd.cFileName);
+                    char hex[72] = "";
+                    if (Sha256File(full, hex, sizeof(hex)))
+                    {
+                        const KnownConsumer *k = nullptr;
+                        for (size_t q = 0; q < _countof(kKnownConsumers); ++q)
+                            if (_stricmp(kKnownConsumers[q].sha256, hex) == 0)
+                            { k = &kKnownConsumers[q]; break; }
+
+                        // Short for the unknown case, long for a known bad one.
+                        // Every add-on in the folder passes through here, most of
+                        // them nothing to do with DLSS 5, and a paragraph each
+                        // would be noise that trains a reader to skip the block.
+                        if (k == nullptr)
+                            Log("        sha256 %s -- not on this add-on's measured "
+                                "list, which is one machine's experience and not a "
+                                "compatibility statement. If its panel says active "
+                                "while the picture does not change, unwrap=0 in "
+                                "dlss5-bridge.cfg is the first thing to try.", hex);
+                        else if (k->good)
+                            Log("        sha256 %s -- %s.", hex, k->note);
+                        else
+                            Log("        *** sha256 %s -- %s. ***", hex, k->note);
+                        if (k != nullptr && k->needs_proxy) g_consumer_needs_proxy = true;
+
+                        // The panel says it too, in three words. Somebody looking at
+                        // a picture that will not change is not reading a log.
+                        {
+                            char tag[96];
+                            _snprintf_s(tag, sizeof(tag), _TRUNCATE, "%ls -- %s",
+                                        fd.cFileName,
+                                        k == nullptr ? "untested build"
+                                        : k->good ? "measured working"
+                                                  : "MEASURED TO WRITE NOTHING");
+                            PanelAppend(g_panel_addons, sizeof(g_panel_addons), tag);
+                        }
+                    }
+                }
+            }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
+
+        // Names compared after a trailing " (N)" is stripped from the stem. Two
+        // that collide are the same add-on twice.
+        for (int i = 0; i < dup_n; ++i)
+            for (int j = i + 1; j < dup_n; ++j)
+            {
+                wchar_t a[MAX_PATH], b[MAX_PATH];
+                StripDuplicateSuffix(dup[i], a, MAX_PATH);
+                StripDuplicateSuffix(dup[j], b, MAX_PATH);
+                if (_wcsicmp(a, b) != 0) continue;
+                Log("  *** %ls and %ls are the same add-on twice -- one is a copy that a "
+                    "browser or an unpack renamed rather than replaced. ReShade loads every "
+                    "add-on it finds, so BOTH are running and both are detouring the same "
+                    "entry points. Delete the one you did not mean to keep. ***",
+                    dup[i], dup[j]);
+            }
     }
 
     LogReShadeConfig(dir);
@@ -2182,10 +2797,13 @@ static void WarnIfOldCopyLoaded()
     if (HMODULE other = GetModuleHandleA("dlss5-dx11-bridge.addon64"))
         if (other != g_self)
             Log("WARNING: dlss5-dx11-bridge.addon64 is loaded as well as this one. That "
-                "is this add-on under the name it had before 1.1.0, and both have hooked "
-                "the same NGX entry points over each other. Delete the old file from the "
-                "game folder, or disable it in ReShade's add-on list. Settings are safe "
-                "either way: the cfg is read under both names.");
+                "is this add-on under the name it used up to and including 1.1.0, and "
+                "both have hooked the same NGX entry points over each other. Both also "
+                "open their own D3D12 session and both deliver frames, and the one that "
+                "loaded second is the outer detour -- so the OLDER build is what reaches "
+                "the screen. Delete the old file from the game folder, or disable it in "
+                "ReShade's add-on list. Settings are safe either way: the cfg is read "
+                "under both names.");
 
     // The other redundancy, and the one that ends this project: a DLSS add-on that
     // reaches NGX by itself needs no bridge at all. Named rather than acted on,
@@ -2538,6 +3156,35 @@ static bool RegisterWithReShade(HMODULE self)
                 // detail of the negotiation.
                 g_reshade_dll = mods[i];
                 g_reshade_api = version;
+                // Which ReShade, recorded rather than logged: this runs before the
+                // log is truncated at attach, so a line written here does not
+                // survive. The banner prints it.
+                //
+                // It matters more than it looks. RegisterWithReShade takes the
+                // FIRST module that accepts, and a folder can hold two: a proxy
+                // DLL beside the executable and the machine-wide Vulkan layer.
+                // Baldur's Gate 3 with dxgi.dll in bin\ is exactly that, and the
+                // one that wins decides whether the effect runtime this add-on
+                // sees is the game's Vulkan one or a secondary D3D12 device.
+                GetModuleFileNameW(mods[i], g_reshade_path, MAX_PATH);
+                for (DWORD k = 0; k < count; ++k)
+                    if (k != i && GetProcAddress(mods[k], "ReShadeRegisterAddon") != nullptr)
+                        ++g_reshade_others;
+
+                // Pin it. On D3D11 and D3D12 ReShade arrives as a proxy DLL beside
+                // the executable and stays mapped for the life of the process; on
+                // Vulkan it is an implicit layer, and the Vulkan loader FreeLibrary's
+                // it at vkDestroyInstance. An add-on that calls a ReShade export from
+                // its own detach -- renodx-dlss5 does, from +0x2EDAA -- then jumps
+                // into memory that is no longer mapped, which is the 0xC0000005 at
+                // Vulkan teardown that four bisects attributed here.
+                //
+                // Pinning holds the module to process exit. It costs one reference
+                // and changes nothing on the D3D paths, where it was already true.
+                HMODULE pinned = nullptr;
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                   reinterpret_cast<LPCWSTR>(reg), &pinned);
                 return true;
             }
         }
@@ -2669,21 +3316,30 @@ static int CfgKeyInt(const char *key, int def)
     if (fopen_s(&f, path, "r") != 0 || f == nullptr) return def;
     char line[256];
     int  out = def;
+    int  hits = 0;
     const size_t n = strlen(key);
+    // LAST match wins, and the loop does not break. CfgReload keeps overwriting
+    // and so takes the last line for every key it reads; this one broke on the
+    // first, so a file carrying the key twice -- appending a line from a forum
+    // post to a file that already has it -- was read two different ways by the two
+    // readers of the same file. Measured with vk_mirror=0 first and vk_mirror=1
+    // last: the Vulkan half was off and nothing said so.
     while (fgets(line, sizeof(line), f) != nullptr)
     {
         if (_strnicmp(line, key, n) != 0 || line[n] != '=') continue;
         int v = 0;
-        if (sscanf_s(line + n + 1, "%d", &v) == 1) out = v;
-        break;
+        if (sscanf_s(line + n + 1, "%d", &v) == 1) { out = v; ++hits; }
     }
     fclose(f);
+    if (hits > 1)
+        Log("[bridge] %s appears %d times in the configuration file. The last one is "
+            "used, as it is for every other key.", key, hits);
     return out;
 }
 
 static bool ProbeRequested() { return CfgKeyOn("probe=1"); }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
@@ -2691,10 +3347,28 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
         InitializeCriticalSection(&g_hook_cs);
-        // Both NGX backends serialise on this one -- see g_ngx_cs. The ready
-        // flag exists because VKM_FORWARD can be reached from a detour before
-        // this line on a process that loads an NGX module unusually early, and
-        // entering an uninitialised section is worse than not serialising.
+        // BOTH backends serialise on this one now. Eight NGX forwards in this file
+        // and five in vkmirror.inc, all in the same order: g_ngx_cs OUTSIDE
+        // g_hook_cs, never the reverse.
+        //
+        // It was left off the D3D11 side for four releases, while five comments
+        // and a release note said both backends were covered. The stated reason
+        // for not closing it was that nine shipped titles run through these
+        // detours and there was no way to test D3D11 without launching one of
+        // them. That reason expired: ngxGym drives real NGX on D3D11 from a
+        // scriptable host in seconds, so the change could be looped rather than
+        // reasoned about.
+        //
+        // Pathologic 3 (issue #15) crashed 0xC0000005 inside the game's own
+        // NVUnityPlugin.DLL with this add-on last recorded "running the D3D12
+        // evaluate", after 6509 delivered frames. That is the signature this
+        // closes, not a demonstration that it was the cause -- nobody has
+        // reproduced that crash under a debugger, and a clean run here is not
+        // proof for a race that is won by timing.
+        //
+        // The ready flag exists because VKM_FORWARD can be reached from a detour
+        // before this line on a process that loads an NGX module unusually early,
+        // and entering an uninitialised section is worse than not serialising.
         InitializeCriticalSection(&g_ngx_cs);
         g_ngx_cs_ready = true;
         // Before RegisterWithReShade, because that is what arms the ReShade
@@ -2763,12 +3437,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // Written now rather than when the D3D12 session opens, so the file
         // exists even in a game where nothing ever hooks -- and so stage=0 is
         // available as an off switch before launching, without deleting this.
+        CfgRegenerateIfStale();
         CfgWriteDefault();
         // And read it. stage=0 is tested before the first evaluate, and until
         // now the only load happened inside the session opener it was meant to
         // prevent -- so the documented off switch still created a D3D12 device
         // and started an NGX session before anything looked at the file.
         CfgReload();
+        // Which file those values came from, before anything acts on them. A
+        // session that never opens a D3D12 session still gets this line.
+        CfgSayWhich();
         // After the config, never before it: stage=0 has to switch this off too,
         // and the value is not known until the file has been read.
         SynthRegisterEvents();
@@ -2782,6 +3460,17 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         // nothing to discover. It costs a Vulkan game four more patched entry
         // points per module, which is what it is for.
         g_vk_mirror = CfgKeyInt("vk_mirror", 1) != 0 ? 1 : 0;
+        // Said when it is OFF, which is the case that produced no line anywhere.
+        // vk_mirror is not a BridgeCfg field, so it is absent from the config echo
+        // too, and VkmRegisterEvents returns before its own announcement -- so a
+        // file carrying vk_mirror=0, from a version where that was the default or
+        // from a support thread that suggested it, took away the whole Vulkan half
+        // in silence.
+        if (g_vk_mirror == 0)
+            Log("[bridge] vk_mirror=0 in the configuration file, so the Vulkan NGX entry "
+                "points are not hooked and a Vulkan game's own DLSS cannot be mirrored. "
+                "Nothing else is affected; a DirectX game has none to hook. Remove the "
+                "line or set vk_mirror=1 to turn it back on.");
         VkmRegisterEvents();
         // Not behind SynthEnabled, unlike the events above. The panel's whole
         // job is to say which situation this session is in, and "synthesis is
@@ -2807,6 +3496,22 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             SetUnhandledExceptionFilter(g_prev_filter);
             g_prev_filter = nullptr;
         }
+
+        // A non-null third argument means the PROCESS is terminating, not that
+        // somebody called FreeLibrary. The loader has already begun unloading other
+        // modules, so calling into NGX, D3D12, Vulkan or the driver from here reaches
+        // code that is gone -- which is exactly what a Vulkan session recorded:
+        // 0xC0000005 "in: memory that is no longer mapped -- the code that faulted
+        // has been unloaded", with this add-on last doing "running the D3D12
+        // evaluate". Nothing below is needed on process exit; the operating system
+        // reclaims every handle, every allocation and every hook byte in this
+        // process image when the process goes.
+        //
+        // The FreeLibrary case still does all of it, and must: the note below about
+        // a module unloading with its jumps still in place is about exactly that
+        // case, and it is not hypothetical.
+        if (reserved != nullptr) return TRUE;
+
         StopWatchingForNgx();
         ReportOutcome();
 

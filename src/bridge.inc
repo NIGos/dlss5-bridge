@@ -47,11 +47,14 @@ static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
 //                  Only takes effect while the bridge is actually delivering.
 //   source=auto    which contract the D3D12 side runs on: auto, mirror, synth
 //                  or off. A word rather than a number, because auto is not a
-//                  quantity. Only mirror exists to be selected today; auto is
-//                  it, and the other two are read and reported and do nothing
-//   synth_after=0  seconds to wait for the game's own DLSS before a synthetic
-//                  contract may start. 0 is off. There is no such contract yet,
-//                  so this is read and reported and nothing waits on it
+//                  quantity. auto lets the game's own DLSS hold the session and
+//                  falls back to the synthetic contract when it has none or
+//                  stops calling it; mirror and synth pin one; off disables both
+//   synth_after=0  seconds with no DLSS call from the game before a synthetic
+//                  contract is built for a game that has never called DLSS at
+//                  all. 0 leaves that opt-in. It does NOT gate the fallback for
+//                  a game whose own DLSS is switched off mid-session: that one
+//                  needs no key and is on
 // The create flags are the only place the game states what its own buffers
 // mean: whether the colour carries values above 1.0, whether the depth is
 // reversed, whether the motion vectors are at render resolution. Spelling them
@@ -112,7 +115,34 @@ struct BridgeCfg
     int skip_exe;
     int unwrap;
     int source;        // CfgSource
-    int synth_after;   // seconds, 0 off
+    // The whole synthetic path, off by default. It is a substitute contract built
+    // from ReShade's depth and the driver's optical flow, and it looks like one:
+    // Red Dead Redemption 2 melts under it and Baldur's Gate 3 keeps its geometry
+    // but not its text. Neither is a defect to fix in the estimator -- optical
+    // flow has no idea what a glyph is, and no depth ReShade can see says which
+    // pixels are foliage -- so it is a thing a user asks for, not a thing that
+    // happens to them.
+    //
+    // Until now only the PRE-ARM case was gated, and the fallback for a game whose
+    // own DLSS is switched off armed with no key at all. That was decided on
+    // safety -- by then the game has demonstrably had DLSS and stopped calling it,
+    // so nothing is being stolen -- and safety was the wrong question.
+    int synth;
+    // Read the D3D12 output texture back once and log a hash of it. Off by
+    // default: it is one 8 MB readback and one fence wait, which is nothing in a
+    // session and still not something to do in somebody's game unasked.
+    //
+    // It answers the one question nothing else here can: whether a NEIGHBOUR
+    // add-on changed the picture. This add-on's own verdict proves it built a
+    // contract and delivered frames; a DLSS 5 add-on that attaches, says it is
+    // active and writes nothing looks identical from in here. Two runs, one with
+    // the neighbour and one without, and the same hash means it did nothing.
+    //
+    // Measured need, 2026-09-01: exactly that happened, across two games, and
+    // the afternoon went into this add-on before the difference turned out to be
+    // two builds of the neighbour.
+    int hash_out;
+    int synth_after;   // seconds; at or below 0 means kSynthAfterDefaultSec
     // Which way a third-party motion-vector shader points its Y, and its X.
     // Neither ReshadeMotionEstimation nor qUINT_of.fx states the direction in
     // its declaration, and there is no parameter, semantic or annotation that
@@ -150,7 +180,31 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 0, 0, 2, 20 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 0, 0, 0, 0, 2, 20 };
+
+// synth_after answers one question and used to answer two. It is still the
+// opt-in for synthesising a contract in a game that has never called DLSS --
+// see the measurement in SynthArmRefusal for why that cannot be automatic --
+// but it no longer gates the fallback for a game whose own DLSS is switched
+// off, which is decided by evidence rather than by a key.
+//
+// The seconds themselves: at or below zero resolves to the default, so a file
+// that only ever said 0 needs no edit once the opt-in is given elsewhere.
+static const int kSynthAfterDefaultSec = 10;
+
+static int SynthAfterSec()
+{
+    return g_cfg.synth_after > 0 ? g_cfg.synth_after : kSynthAfterDefaultSec;
+}
+
+// The one gate on the whole synthetic path. synth_after > 0 implies it: that key
+// was the opt-in for the pre-arm case before this one existed, and a
+// configuration file already carrying it is a user who has asked, so an upgrade
+// must not quietly stop doing what they set it to do.
+static bool SynthOptedIn()
+{
+    return g_cfg.synth != 0 || g_cfg.synth_after > 0;
+}
 
 // CfgReload's one-second gate, promoted out of that function so the panel can
 // reach it. Two uses, both of them reads of a clock rather than of a setting:
@@ -287,25 +341,75 @@ static bool BridgeWillDeliver()
            !g_bridge.partial_output && g_bridge.frames_done > 0;
 }
 
-// The add-on was called dlss5-dx11-bridge until 1.1.0, so a user upgrading has a
+// The add-on was called dlss5-dx11-bridge up to and including 1.1.0 -- the rename
+// landed in 1.2.0 -- so a user upgrading has a
 // cfg under the old name with their settings in it. Take the new name when it
 // exists, the old one when only that does, and the new name when neither does,
 // so a fresh install writes the current one. Silently reverting somebody to
 // defaults because a file was renamed is not an upgrade anyone forgives.
-static void CfgPath(char *out)
+enum CfgWhich { CFG_NEW_NAME, CFG_OLD_NAME, CFG_NONE };
+
+static CfgWhich CfgPathWhich(char *out)
 {
     GetModuleFileNameA(g_self, out, MAX_PATH);
     char *s = strrchr(out, '\\');
-    if (s == nullptr) return;
+    if (s == nullptr) return CFG_NONE;
     const size_t room = MAX_PATH - (s + 1 - out);
 
     strcpy_s(s + 1, room, "dlss5-bridge.cfg");
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return CFG_NEW_NAME;
 
     strcpy_s(s + 1, room, "dlss5-dx11-bridge.cfg");
-    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return;
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) return CFG_OLD_NAME;
 
     strcpy_s(s + 1, room, "dlss5-bridge.cfg");
+    return CFG_NONE;
+}
+
+static void CfgPath(char *out) { CfgPathWhich(out); }
+
+// Which file is in force, said once. Three of this add-on's own messages name
+// dlss5-bridge.cfg by hand -- the flags=107 substitution, its "set flags=-1"
+// advice, and the panel's -- and an installation first made before 1.2.0 has
+// only dlss5-dx11-bridge.cfg, which CfgWriteDefault will never replace because
+// something matching CfgPath already exists. So the advice names a file that is
+// not in that folder, and creating it by hand strands the other fifteen
+// settings, because the new name then wins and the old file is ignored whole.
+//
+// Nothing here writes or renames anything. It states which file was read.
+static void CfgSayWhich()
+{
+    static bool said = false;
+    if (said) return;
+    said = true;
+
+    char path[MAX_PATH];
+    const CfgWhich which = CfgPathWhich(path);
+    if (which == CFG_NONE)
+    {
+        Log("[bridge] no configuration file beside this add-on; defaults are in force.");
+        return;
+    }
+    Log("[bridge] settings read from %s", path);
+    if (which == CFG_OLD_NAME)
+    {
+        Log("[bridge]   that is the name this add-on used before 1.2.0. It is read as it "
+            "stands and nothing is rewritten -- but every message that names "
+            "dlss5-bridge.cfg means this file. Renaming it is safe; creating a second "
+            "file under the current name is not, because that one then wins and this "
+            "one is ignored whole.");
+        return;
+    }
+
+    char other[MAX_PATH];
+    strcpy_s(other, path);
+    char *sl = strrchr(other, '\\');
+    if (sl == nullptr) return;
+    strcpy_s(sl + 1, MAX_PATH - (sl + 1 - other), "dlss5-dx11-bridge.cfg");
+    if (GetFileAttributesA(other) != INVALID_FILE_ATTRIBUTES)
+        Log("[bridge]   dlss5-dx11-bridge.cfg is also present and is being ignored "
+            "whole -- the current name wins. Anything set only in the old file has no "
+            "effect.");
 }
 
 static void CfgReload()
@@ -357,6 +461,8 @@ static void CfgReload()
         else if (_stricmp(key, "stage")       == 0) next.stage       = val;
         else if (_stricmp(key, "skip_game")   == 0) next.skip_game   = val;
         else if (_stricmp(key, "synth_after") == 0) next.synth_after = val;
+        else if (_stricmp(key, "synth")       == 0) next.synth       = val;
+        else if (_stricmp(key, "hash_out")    == 0) next.hash_out    = val;
         else if (_stricmp(key, "ofa_grid")    == 0) next.ofa_grid    = val;
         else if (_stricmp(key, "ofa_perf")    == 0) next.ofa_perf    = val;
         // Only the sign is taken, because only the sign is unknown: the
@@ -394,34 +500,40 @@ static void CfgReload()
                          (next.dred != g_cfg.dred) || (next.skip_exe != g_cfg.skip_exe) ||
                          (next.unwrap != g_cfg.unwrap) || (next.source != g_cfg.source) ||
                          (next.synth_after != g_cfg.synth_after) ||
+                         (next.synth != g_cfg.synth) || (next.hash_out != g_cfg.hash_out) ||
                          (next.mv_sign_x != g_cfg.mv_sign_x) ||
                          (next.mv_sign_y != g_cfg.mv_sign_y) ||
                          (next.ofa_grid != g_cfg.ofa_grid) ||
                          (next.ofa_perf != g_cfg.ofa_perf);
-    if (!changed) return;
+    // The first read reports whatever it found, changed or not. Until now the echo
+    // fired only on a difference from the built-in defaults, so a session running on
+    // defaults had no config line at all -- and "no config line" then meant either
+    // "defaults" or "the file was never read", which are not the same thing to
+    // anyone triaging a report.
+    static bool said_once = false;
+    if (!changed && said_once) return;
+    said_once = true;
 
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
-        "skip_game=%d dred=%d skip_exe=%d unwrap=%d source=%s synth_after=%d "
+        "skip_game=%d dred=%d skip_exe=%d unwrap=%d source=%s synth=%d hash_out=%d synth_after=%d "
         "mv_sign_x=%d mv_sign_y=%d ofa_grid=%d ofa_perf=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
         g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
-        kCfgSourceName[g_cfg.source], g_cfg.synth_after, g_cfg.mv_sign_x, g_cfg.mv_sign_y,
-        g_cfg.ofa_grid, g_cfg.ofa_perf);
+        kCfgSourceName[g_cfg.source], g_cfg.synth, g_cfg.hash_out, g_cfg.synth_after,
+        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.ofa_grid, g_cfg.ofa_perf);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
     if (rebuild) { Log("[bridge] rebuilding feature for new creation flags"); g_bridge.frame_ready = false; }
 }
 
-static void CfgWriteDefault()
+// Writes the file at path from g_cfg, unconditionally. The first line is the
+// version that wrote it, which CfgRegenerateIfStale reads back.
+static bool CfgWriteFile(const char *path)
 {
-    char path[MAX_PATH];
-    CfgPath(path);
-    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
-
     FILE *f = nullptr;
-    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return false;
     // Written with the two keys a user actually has to find, and a sentence each
     // for the rest. The file used to be a bare list of sixteen numbers, and
     // vk_mirror -- which decides whether half this add-on exists on a Vulkan
@@ -432,25 +544,45 @@ static void CfgWriteDefault()
     // ignores anything else, and CfgKeyOn/CfgKeyInt match at the start of a line,
     // so a '#' line cannot switch anything on.
     fprintf(f,
-        "# dlss5-bridge settings. Re-read about once a second while the game runs,\n"
-        "# so most of these take effect without a restart. Delete this file to get\n"
-        "# it back with defaults.\n"
+        "# dlss5-bridge " BRIDGE_VERSION "\n"
+        "# Settings. Re-read about once a second while the game runs, so most take\n"
+        "# effect without a restart. Delete this file to get it back with defaults.\n"
+        "#\n"
+        "# The first line is the version that wrote this file. A different version\n"
+        "# replaces the file with its own defaults the first time it runs, and says\n"
+        "# so in the log; the same version never touches it. Change that line to\n"
+        "# \"# dlss5-bridge keep\" to keep this file across versions.\n"
         "\n"
         "# THE TWO THAT MATTER\n"
         "#\n"
         "# vk_mirror  1 hooks the Vulkan NGX entry points as well, which is what\n"
         "#            lets a Vulkan game's own DLSS be mirrored. Harmless on a\n"
         "#            DirectX game, which has none to hook. Read once at launch.\n"
-        "# synth_after  seconds to wait, with no DLSS call from the game, before\n"
-        "#            building a DLSS contract FOR it out of ReShade's depth and\n"
-        "#            the NVIDIA driver's optical flow. 0 leaves that off. This is\n"
-        "#            the switch for a game with no DLSS of its own; try 10.\n"
+        "# synth      1 allows a SUBSTITUTE DLSS contract, built out of ReShade's\n"
+        "#            depth and the NVIDIA driver's optical flow, when the game\n"
+        "#            provides none of its own. Off by default, and it should stay\n"
+        "#            off unless you want it: the result is visibly worse than real\n"
+        "#            DLSS. Optical flow does not know what a glyph or a leaf is, so\n"
+        "#            text goes soft and dense foliage smears. Red Dead Redemption 2\n"
+        "#            looks like it is melting; Baldur's Gate 3 holds together but\n"
+        "#            its text does not. That is the technique, not a bug.\n"
+        "#\n"
+        "#            It covers both cases: a game with no DLSS at all, and a game\n"
+        "#            whose own DLSS you switch off in its menu.\n"
+        "# synth_after  with synth=1, and ONLY for a game that has no DLSS of its\n"
+        "#            own: seconds to wait before building the contract without\n"
+        "#            ever having seen the game ask. Do not set it in a game that\n"
+        "#            HAS DLSS -- arming before the game asks costs the mirror the\n"
+        "#            whole session when it then does. Setting it also turns synth\n"
+        "#            on, so a file that already had it keeps working.\n"
         "vk_mirror=%d\n"
+        "synth=%d\n"
         "synth_after=%d\n"
         "\n"
         "# WHICH SOURCE MAY HOLD THE SESSION\n"
         "# auto lets the game's own DLSS win and falls back to the synthetic\n"
-        "# contract; mirror and synth pin one; off disables both.\n"
+        "# contract; mirror pins the game's own and is how the fallback is turned\n"
+        "# off; synth pins the synthetic one; off disables both.\n"
         "source=%s\n"
         "\n"
         "# THE DRIVER'S OPTICAL FLOW ENGINE, used by the synthetic contract only.\n"
@@ -476,13 +608,73 @@ static void CfgWriteDefault()
         "dred=%d\n"
         "skip_exe=%d\n"
         "unwrap=%d\n",
-        1, g_cfg.synth_after,
+        1, g_cfg.synth, g_cfg.synth_after,
         kCfgSourceName[g_cfg.source], g_cfg.ofa_grid, g_cfg.ofa_perf,
         g_cfg.mv_sign_x, g_cfg.mv_sign_y,
         g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
         g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
     fclose(f);
-    Log("[bridge] wrote default config to %s", path);
+    return true;
+}
+
+static void CfgWriteDefault()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    if (CfgWriteFile(path)) Log("[bridge] wrote default config to %s", path);
+}
+
+// Once at attach, before the file is read. A settings file stamped by this
+// exact version is never touched. One stamped by any other version, one with
+// no stamp, or one under the name used before 1.2.0 is replaced under the
+// current name with this version's defaults, and the log says so.
+//
+// Nothing is carried over, on purpose. A file tuned for another build, or
+// carrying keys this one no longer has, is exactly what this rules out: three
+// releases in a row spent a sentinel on a value an older default had written
+// into every file (flags=107, unwrap=1), and one report was an old file that
+// nobody had looked at. A user who wants a file kept across versions writes
+// "# dlss5-bridge keep" as its first line.
+static void CfgRegenerateIfStale()
+{
+    char path[MAX_PATH];
+    const CfgWhich which = CfgPathWhich(path);
+    if (which == CFG_NONE) return;
+
+    char first[96] = "";
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") == 0 && f != nullptr)
+    {
+        if (fgets(first, sizeof(first), f) == nullptr) first[0] = 0;
+        fclose(f);
+    }
+    first[strcspn(first, "\r\n")] = 0;
+    const char *stamp = strncmp(first, "# dlss5-bridge ", 15) == 0 ? first + 15 : nullptr;
+    if (stamp != nullptr && (strcmp(stamp, BRIDGE_VERSION) == 0 || strcmp(stamp, "keep") == 0))
+        return;
+
+    const char *old_name = which == CFG_OLD_NAME ? "dlss5-dx11-bridge.cfg" : "dlss5-bridge.cfg";
+    char *sl = strrchr(path, (char)92);
+    if (sl == nullptr) return;
+    strcpy_s(sl + 1, MAX_PATH - (sl + 1 - path), "dlss5-bridge.cfg");
+
+    if (!CfgWriteFile(path))
+    {
+        Log("[bridge] %s was written by %s%s and could not be replaced (error %lu); "
+            "it is read as it stands.", old_name,
+            stamp != nullptr ? "" : "a version before 1.4.0",
+            stamp != nullptr ? stamp : "", GetLastError());
+        return;
+    }
+    Log("[bridge] %s was written by %s%s and has been replaced with the defaults of "
+        BRIDGE_VERSION ". Nothing is carried over: a file from another version is "
+        "what this rules out. \"# dlss5-bridge keep\" as its first line keeps a "
+        "file across versions.", old_name,
+        stamp != nullptr ? "" : "a version before 1.4.0",
+        stamp != nullptr ? stamp : "");
+    if (which == CFG_OLD_NAME)
+        Log("[bridge]   dlss5-dx11-bridge.cfg is left in place and ignored; it can be deleted.");
 }
 
 // The status panel's only writer, and the only place in this add-on that writes
@@ -774,6 +966,37 @@ static void UnwrapReShadeProxy(ID3D12Device **dev)
     *dev = raw;
 }
 
+// Whether to strip ReShade's proxy, decided once for both device paths.
+//
+// unwrap=1 strips it, and is the shipped default for the reason UnwrapReShadeProxy
+// gives: a D3D11-only add-on that skipped init_device for this D3D12 device then
+// faulted on the pipeline events the proxy fires. unwrap=0 keeps it.
+//
+// A DLSS 5 add-on build measured to NEED the proxy overrides the default, once,
+// and says so. That build recycles its scratch buffers off the queue submissions
+// ReShade announces, and underneath the proxy it sees none: it attached, reported
+// active and wrote nothing, on both backends, until the proxy was kept. The
+// conflict this creates -- that build beside a D3D11-only add-on that cannot take
+// D3D12 events -- has no known instance and no knob; if it ever has one, the two
+// lines this logs are where to start.
+static void MaybeUnwrap(ID3D12Device **dev)
+{
+    if (g_cfg.unwrap == 0) return;
+    if (g_consumer_needs_proxy)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[bridge] keeping ReShade's proxy on the D3D12 device: the DLSS 5 add-on "
+                "beside this one is a build measured to need the queue it announces. "
+                "unwrap=1 in the file is overridden for this build only.");
+        }
+        return;
+    }
+    UnwrapReShadeProxy(dev);
+}
+
 // The fault here was reported inside D3D12Core.dll on an older release; device
 // creation now succeeds and what follows is where Prey stops.
 static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
@@ -786,7 +1009,7 @@ static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
     __except (CaptureFault(GetExceptionInformation()))
     { *code = GetExceptionCode(); return E_FAIL; }
 
-    if (SUCCEEDED(hr) && *out != nullptr && g_cfg.unwrap != 0) UnwrapReShadeProxy(out);
+    if (SUCCEEDED(hr) && *out != nullptr) MaybeUnwrap(out);
     return hr;
 }
 
@@ -921,6 +1144,12 @@ static void BridgeFail(const char *what)
 
 static bool   BeginCommands();
 static UINT64 EndCommands();
+
+// Defined with the frame path below; BridgeHashOutput records one copy and
+// needs both, and it sits above them so it can be called from the evaluate.
+static bool BeginCommands();
+static void Barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res,
+                    D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
 
 typedef HRESULT (WINAPI *PFN_D3DCompile_)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
                                           ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
@@ -1242,6 +1471,91 @@ static void BridgeDrainGpu()
     for (int i = 0; i < Bridge::kFrames; ++i) g_bridge.alloc_fence[i] = 0;
 }
 
+// The D3D12 output texture, read back once and reduced to one number.
+//
+// FNV-1a over every byte of every row, with the row pitch honoured: a readback
+// buffer is padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and hashing the padding
+// would make the number depend on the alignment rather than on the pixels.
+//
+// It is a hash and not a comparison because the thing it has to detect is
+// "identical", and two runs of a deterministic host produce byte-identical
+// output when nothing in between did anything. A neighbour add-on that ran
+// changes it; one that attached and wrote nothing does not.
+static void BridgeHashOutput(UINT64 fence_value)
+{
+    if (g_bridge.dev12 == nullptr || g_bridge.tex12[SLOT_OUTPUT] == nullptr) return;
+
+    const D3D12_RESOURCE_DESC rd = g_bridge.tex12[SLOT_OUTPUT]->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+    UINT   rows = 0;
+    UINT64 row_bytes = 0, total = 0;
+    g_bridge.dev12->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+    if (total == 0 || total > (64ull << 20)) return;
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource *rb = nullptr;
+    if (FAILED(g_bridge.dev12->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            __uuidof(ID3D12Resource), reinterpret_cast<void **>(&rb))) || rb == nullptr)
+        return;
+
+    if (!BeginCommands()) { rb->Release(); return; }
+    Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = rb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    src.pResource = g_bridge.tex12[SLOT_OUTPUT];
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    g_bridge.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    const UINT64 v = EndCommands();
+    (void)fence_value;
+
+    if (g_bridge.fence12 != nullptr && g_bridge.fence_event != nullptr &&
+        g_bridge.fence12->GetCompletedValue() < v)
+    {
+        g_bridge.fence12->SetEventOnCompletion(v, g_bridge.fence_event);
+        if (WaitForSingleObject(g_bridge.fence_event, 4000) != WAIT_OBJECT_0 ||
+            g_bridge.fence12->GetCompletedValue() < v)
+        { rb->Release(); Log("[bridge] output hash: the copy did not complete"); return; }
+    }
+
+    void *mapped = nullptr;
+    D3D12_RANGE all = { 0, static_cast<SIZE_T>(total) };
+    if (FAILED(rb->Map(0, &all, &mapped)) || mapped == nullptr)
+    { rb->Release(); return; }
+
+    unsigned long long hash = 1469598103934665603ull;
+    const BYTE *base = static_cast<const BYTE *>(mapped);
+    for (UINT r = 0; r < rows; ++r)
+    {
+        const BYTE *row = base + static_cast<size_t>(r) * fp.Footprint.RowPitch;
+        for (UINT64 i = 0; i < row_bytes; ++i)
+        { hash ^= row[i]; hash *= 1099511628211ull; }
+    }
+    D3D12_RANGE none = { 0, 0 };
+    rb->Unmap(0, &none);
+    rb->Release();
+
+    Log("[bridge] output hash after evaluate %llu: %016llX  (%ux%u %s, %llu rows of %llu "
+        "bytes). Two runs that differ only in which neighbour add-ons were present "
+        "must not produce the same number.",
+        g_bridge.frames_done, hash, static_cast<unsigned>(rd.Width),
+        static_cast<unsigned>(rd.Height), FormatName(rd.Format),
+        static_cast<unsigned long long>(rows), row_bytes);
+}
+
 static void BridgeReleaseTextures()
 {
     BridgeDrainGpu();
@@ -1250,6 +1564,24 @@ static void BridgeReleaseTextures()
     // handle and a D3D12 resource alive for the life of the process on a
     // session that had already told the user it was disabled.
     BridgeReleaseExposureFwd();
+
+    // The four resource keys, cleared before the textures they name are freed.
+    // Same rule as the exposure one above and the same reason: NGX does not
+    // AddRef what a parameter block names, this block is allocated once per
+    // session and never Reset, so a rebuild left it naming four freed
+    // ID3D12Resources -- and the next call handed it is CreateFeature.
+    //
+    // renodx-dlss5 detours NVSDK_NGX_D3D12_CreateFeature and faulted 0xC0000005
+    // at +0xD006 reading them, then threw out through ReShade and fastfailed the
+    // process. Measured on the D3D11 host, and the identical defect on the
+    // Vulkan path took two scenarios from 3 passes in 8 to 12 in 12.
+    if (g_bridge.params != nullptr)
+    {
+        g_bridge.params->Set("Color",         static_cast<ID3D12Resource *>(nullptr));
+        g_bridge.params->Set("Output",        static_cast<ID3D12Resource *>(nullptr));
+        g_bridge.params->Set("Depth",         static_cast<ID3D12Resource *>(nullptr));
+        g_bridge.params->Set("MotionVectors", static_cast<ID3D12Resource *>(nullptr));
+    }
 
     if (g_bridge.depth_uav != nullptr) { g_bridge.depth_uav->Release(); g_bridge.depth_uav = nullptr; }
     if (g_bridge.depth_srv != nullptr) { g_bridge.depth_srv->Release(); g_bridge.depth_srv = nullptr; }
@@ -1308,8 +1640,17 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     Breadcrumb("opening the D3D12 session");
     Log("################ bridge: opening D3D12 session ################");
     CfgReload();
-    Log("[bridge] config: mode=%d flags=%d subrects=%d reset_every=%d pixels=%d",
-        g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels);
+    // Once-latched, so a second call site is free -- and it needs one. Its only
+    // caller was the synthetic path's effects callback, which SynthRegisterEvents
+    // does not register at all when stage=0 or source=off, so exactly the sessions
+    // most likely to have been configured by hand were the ones that never got the
+    // warning. By the time a D3D12 session opens, every add-on has loaded.
+    WarnIfOldCopyLoaded();
+    // The full set is echoed by CfgReload above, on the first read and on every
+    // change. This used to print five of the eighteen keys under the same
+    // "[bridge] config:" prefix, so a reader grepping for that prefix got whichever
+    // line came first and a key set that stopped being complete in 1.0.17.
+    CfgSayWhich();
 
     IDXGIDevice  *dxgi_dev = nullptr;
     IDXGIAdapter *adapter  = nullptr;
@@ -1385,6 +1726,39 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // nowhere in this add-on. Had the second attempt happened to succeed it
         // would have reported DRED as the cause of a configuration that never
         // existed. dred=0 is the only thing that produces a DRED-off attempt.
+        // One second attempt on the DEFAULT adapter, and only after a FAULT on a
+        // named one. Asked for in issue #11: Final Fantasy XV faults inside
+        // D3D12Core.dll at the same module offset on two different drivers, with
+        // the adapter taken from the game's own D3D11 device. This add-on's other
+        // D3D12 path -- the synthetic transport in synth.inc -- has always passed
+        // nullptr here, so the two were inconsistent and only one of them had ever
+        // been tried on that title.
+        //
+        // Not a retry of a FAILURE: an HRESULT is an answer and is left alone. A
+        // fault is the runtime losing its footing, and the only variable this side
+        // controls is which adapter it was handed. On one GPU the two are the same
+        // device and this costs a call; where they are not, it is the difference
+        // between a session and no session at all.
+        if (dcode != 0 && adapter != nullptr)
+        {
+            Log("[bridge] D3D12CreateDevice raised 0x%08X on the game's own adapter. "
+                "Trying once on the default adapter, which is a different argument "
+                "and not a different setting.", dcode);
+            DWORD dcode2 = 0;
+            HRESULT hr2 = SafeCreateDevice(create_device, nullptr, &g_bridge.dev12, &dcode2);
+            if (dcode2 == 0 && SUCCEEDED(hr2) && g_bridge.dev12 != nullptr)
+            {
+                Log("[bridge] the default adapter worked where the game's own faulted. "
+                    "The two are the same GPU on a single-GPU machine, so if this line "
+                    "appears the fault was in what was passed rather than in the device.");
+                dcode = 0; hr = hr2;
+            }
+            else if (dcode2 != 0)
+                Log("[bridge] the default adapter faulted too, 0x%08X. The adapter is "
+                    "not the variable.", dcode2);
+            else
+                Log("[bridge] the default adapter answered 0x%08X without faulting.", hr2);
+        }
         if (dcode != 0)
         {
             {
@@ -2070,7 +2444,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // nowhere else: Assetto Corsa asks for 2, and was being told its SDR colour
     // is HDR and its normal depth is inverted. Copy it, and let the config
     // force a value only when it is set to something other than -1.
-    // 107 was this add-on's own default until 1.0.15, so a configuration file
+    // 107 was this add-on's own default up to and including 1.0.14, so a configuration file
     // carrying it is repeating that default rather than stating a choice --
     // and it keeps every existing installation on the old behaviour, where the
     // correction reaches only whoever reads the log. Trails beyond the Horizon
@@ -2102,8 +2476,8 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         InterlockedExchange(&g_panel_flags, static_cast<LONG>(used));
 
         if (old_default && copying)
-            Log("[bridge]   dlss5-bridge.cfg says flags=107, which was this "
-                "add-on's default before 1.0.16 rather than a description of this "
+            Log("[bridge]   the configuration file says flags=107, which was this "
+                "add-on's default up to and including 1.0.14 rather than a description of this "
                 "game. It is being ignored in favour of the game's own value. To "
                 "force it, use flags=108 -- any value that is not 107 or -1 is "
                 "taken as deliberate.");
@@ -2173,6 +2547,27 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         }
         g_bridge.presets_reported = true;
     }
+
+
+    // The four resource keys, set to the textures that were just built, BEFORE
+    // the create rather than only at the first evaluate.
+    //
+    // They used to arrive here holding the PREVIOUS build's pointers, dangling
+    // since BridgeReleaseTextures freed them, and a neighbour add-on that reads
+    // this block at CreateFeature read freed memory -- the 0xC0000005 fixed
+    // earlier today. Clearing them to null fixed that and left a second problem
+    // in its place: a DLSS 5 add-on captures the contract at the create, and on
+    // every REBUILD it now captured one whose four resources are null. On the
+    // first build of a session they were unset either way, which is why this only
+    // shows after a resolution, preset, HDR or mode change.
+    //
+    // Neither state is a description of anything. These are the exact resources
+    // the evaluates will use, they exist by this line, and naming them is the
+    // only answer here that is true.
+    g_bridge.params->Set("Color",         g_bridge.tex12[SLOT_COLOR]);
+    g_bridge.params->Set("Output",        g_bridge.tex12[SLOT_OUTPUT]);
+    g_bridge.params->Set("Depth",         g_bridge.tex12[SLOT_DEPTH]);
+    g_bridge.params->Set("MotionVectors", g_bridge.tex12[SLOT_MV]);
 
     g_bridge.params->Set("CreationNodeMask", 1u);
     g_bridge.params->Set("VisibilityNodeMask", 1u);
@@ -2719,6 +3114,74 @@ static bool BridgeEnsureExposure(ID3D11Device *dev11, ID3D11Texture2D *src)
     return true;
 }
 
+// The size a super-resolution handle was CREATED with, per handle. The four
+// scalars in an evaluate block are whatever create last wrote into that block,
+// which need not be this feature's: Baldur's Gate 3's character creator creates
+// a preview feature through the same block, and from then on every evaluate of
+// the main feature carries 1920x1080 -> 1280x720 on a 3413x960 -> 5120x1440
+// session, for the rest of the session (#18). Read as a contract those scalars
+// name a partial region, and the bridge declined every frame until restart. The
+// Vulkan mirror has read the create since 1.3.0 (VkmNoteGameCreate); this is
+// the same thing for D3D11, per handle because that game holds two.
+//
+// Written by the create hook after it has released the NGX locks, read by the
+// frame path; both under g_bridge_cs. Eight entries, oldest replaced: a game
+// holds one or two live handles and NGX reuses freed addresses, which is why a
+// create at a known address replaces its entry rather than adding one.
+struct BridgeCreateShape { const NVSDK_NGX_Handle *handle; unsigned int w, h, ow, oh; };
+static BridgeCreateShape        g_create_shape[8];
+static int                      g_create_shape_next;
+static const NVSDK_NGX_Handle  *g_eval_handle;   // the evaluate being mirrored, set by its hook
+
+static void BridgeNoteCreate(const NVSDK_NGX_Handle *handle, const NVSDK_NGX_Parameter *p)
+{
+    unsigned int w = 0, h = 0, ow = 0, oh = 0;
+    if (p != nullptr)
+    {
+        p->Get("Width", &w);     p->Get("Height", &h);
+        p->Get("OutWidth", &ow); p->Get("OutHeight", &oh);
+    }
+    // All four or none: a half-stated shape would fall back to the evaluate for
+    // the missing half and the two would disagree.
+    if (w == 0 || h == 0 || ow == 0 || oh == 0)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[bridge] the game's create block carries no complete size (%ux%u -> %ux%u), "
+                "so the contract comes from the evaluate. Not a fault: not every engine "
+                "states it there.", w, h, ow, oh);
+        }
+        return;
+    }
+    EnterCriticalSection(&g_bridge_cs);
+    int slot = -1;
+    for (int i = 0; i < static_cast<int>(_countof(g_create_shape)); ++i)
+        if (g_create_shape[i].handle == handle) slot = i;
+    if (slot < 0) slot = g_create_shape_next++ % static_cast<int>(_countof(g_create_shape));
+    g_create_shape[slot] = { handle, w, h, ow, oh };
+    LeaveCriticalSection(&g_bridge_cs);
+    Log("[bridge] the game's create states %ux%u -> %ux%u for handle %p. That is the shape "
+        "its evaluates mean, in preference to the four scalars they carry.",
+        w, h, ow, oh, static_cast<const void *>(handle));
+}
+
+// Under g_bridge_cs.
+static bool BridgeCreateShapeOf(const NVSDK_NGX_Handle *handle, unsigned int *w,
+                                unsigned int *h, unsigned int *ow, unsigned int *oh)
+{
+    if (handle == nullptr) return false;
+    for (int i = 0; i < static_cast<int>(_countof(g_create_shape)); ++i)
+        if (g_create_shape[i].handle == handle)
+        {
+            *w = g_create_shape[i].w;   *h = g_create_shape[i].h;
+            *ow = g_create_shape[i].ow; *oh = g_create_shape[i].oh;
+            return true;
+        }
+    return false;
+}
+
 static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter *gp)
 {
     BridgeRescueStalledQueue();
@@ -2820,6 +3283,29 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     gp->Get("OutHeight", &goh);
     if (gw == 0 || gh == 0) { gw = d[SLOT_COLOR].Width;  gh = d[SLOT_COLOR].Height; }
     if (gow == 0 || goh == 0) { gow = d[SLOT_OUTPUT].Width; goh = d[SLOT_OUTPUT].Height; }
+
+    // The shape this handle was created with, when the create was seen -- see
+    // BridgeNoteCreate. The repairs below still run on it: an engine that fills
+    // the create in backwards fills the evaluate in backwards too. A create is
+    // not always seen -- this add-on can attach after the game's create, and
+    // skip_exe holds the hooks back a minute -- and then the evaluate's scalars
+    // stand as before.
+    {
+        unsigned int cw = 0, ch = 0, cow = 0, coh = 0;
+        if (BridgeCreateShapeOf(g_eval_handle, &cw, &ch, &cow, &coh))
+        {
+            static bool said = false;
+            if (!said && (cw != gw || ch != gh || cow != gow || coh != goh))
+            {
+                said = true;
+                Log("[bridge] this evaluate declares %ux%u -> %ux%u where the game's create "
+                    "stated %ux%u -> %ux%u for this handle. The create is used. Said once; "
+                    "the periodic dump shows what is being mirrored.",
+                    gw, gh, gow, goh, cw, ch, cow, coh);
+            }
+            gw = cw; gh = ch; gow = cow; goh = coh;
+        }
+    }
 
     // DLSS never produces an image smaller than the one it is given, so an
     // output size below the render size is not a contract: the two pairs have
@@ -3184,6 +3670,34 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 
     const UINT64 v_out = EndCommands();
+
+    // No CPU wait here, and that is deliberate rather than an omission: the
+    // signal above is a GPU-side fence and the game's queue waits on it, so this
+    // transport never blocks the calling thread.
+    //
+    // Tested as an accommodation on 2026-09-02 and it changes nothing. A DLSS 5
+    // add-on build whose own log announces a "GPU-safe NR workset pool ... exact
+    // queue fences recycle only completed submissions" exhausts that pool after
+    // its first evaluation here and writes nothing thereafter. Draining this
+    // queue on the CPU after every evaluate -- a full pipeline bubble per frame
+    // -- left the output byte-identical and the pool still exhausted. So the
+    // recycling is not observing this queue, and there is nothing on this side
+    // to give it. Measured in ngxGym: same hash, same one evaluation, same
+    // exhaustion, drain on and off.
+
+    // One readback, one frame, once per session, and only when asked. See the
+    // note on hash_out: this is the only measurement here that can tell a
+    // neighbour add-on which changed the picture from one which said it did.
+    //
+    // The 60th delivered frame rather than the first: DLSS has temporal history
+    // and a neighbour may attach a frame or two in, so the first frame is the one
+    // most likely to be identical whatever happens afterwards.
+    if (g_cfg.hash_out != 0 && !g_bridge.hashed && g_bridge.frames_done >= 60 &&
+        code == 0 && re == NGX_SUCCESS)
+    {
+        g_bridge.hashed = true;
+        BridgeHashOutput(v_out);
+    }
 
     if (code != 0)
     {

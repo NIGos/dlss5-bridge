@@ -39,6 +39,25 @@
 // for the whole game, so that is written as an unconditional statement at the
 // end of the worker's body and not as a line inside an if.
 //
+// The Khronos validation layer reports the park, and the report is accurate.
+// Two VUIDs, once per parked frame, measured in ngxGym on 2026-09-01:
+//
+//   VUID-vkSetEvent-event-09543          setting an event a pending command
+//                                        buffer is waiting on
+//   VUID-vkCmdWaitEvents-srcStageMask-01158  a HOST_BIT wait recorded before
+//                                        anything has host-set the event
+//
+// Both are the park itself rather than a mistake in how it is written, and there
+// is no arrangement of these calls that avoids them. The alternatives all need
+// something this add-on does not have: adding a wait semaphore needs the game's
+// vkQueueSubmit, a device-set event needs a second queue, and an imported D3D12
+// fence needs the submit as well. Blocking the render thread instead of the GPU
+// would avoid the events and cost a full CPU-GPU serialisation every frame.
+//
+// So it is documented rather than silenced. It has run correctly on every NVIDIA
+// driver measured; a driver that enforces this strictly would break the mirror,
+// and this comment is where to start when one does.
+//
 // Off unless vk_mirror=1 is in dlss5-bridge.cfg. Nothing here is reached,
 // and none of the four Vulkan entry points is even hooked, without it.
 //
@@ -99,6 +118,10 @@ static const uint32_t kVkFmtB8G8R8A8Unorm   = 44;
 static const uint32_t kVkFmtB8G8R8A8Srgb    = 50;
 static const uint32_t kVkFmtA2B10G10R10     = 64;
 static const uint32_t kVkFmtR16G16B16A16Sf  = 97;
+// The exposure texture's one accepted format, and deliberately NOT an entry in
+// MapVkColor: that table is the Colour/Output gate, and widening it widens what
+// the mirror will accept as a game's Colour image.
+static const uint32_t kVkFmtR32Sfloat       = 100;
 static const uint32_t kVkFmtB10G11R11Uf     = 122;
 static const uint32_t kVkFmtD16UnormS8Uint  = 128;
 static const uint32_t kVkFmtD24UnormS8Uint  = 129;
@@ -226,6 +249,17 @@ static const DWORD kVkmIdleMs      = kVkmSeeCopiesMs + kVkmEvaluateMs + 200;
 struct VkMirror
 {
     bool    refused;     // and refused, or something later stood the mirror down
+    // NOT the same thing as refused, and conflating the two retired the mirror
+    // for the session every time a game changed display mode. ReShade destroys
+    // and recreates its effect runtime on a swapchain change, VkmShutdown runs on
+    // the destroy, and the flag it raised was the one-way one -- so the first
+    // resize, borderless toggle or HDR toggle killed the mirror silently, with no
+    // refusal line to say so. Measured in ngxGym on 2026-09-01 and reported from
+    // Baldur's Gate 3 before that.
+    //
+    // This one means "the worker is going away, do not arm a frame" and is
+    // cleared when a runtime comes back. refused stays one-way.
+    bool    stopping;
 
     // TWO pairs, alternating, and the second pair is not pipelining -- there is
     // still exactly one frame in flight. It exists because a VkEvent must not be
@@ -270,6 +304,12 @@ struct VkMirror
     // that follows has named itself. Only the log reads it.
     bool    rebuild_on_game_create;
 
+    // The four dimensions the game states in its CREATE block, which is where the
+    // shape of a feature actually belongs. Zero means no create has been seen --
+    // this add-on can latch onto an evaluate without ever having seen one, if it
+    // attaches after the game has already created its feature.
+    unsigned int cw, ch, cow, coh;
+
     // The contract the worker evaluates. Single slot: the render thread waits on
     // idle before touching this, so there is no second writer.
     SynthParams sp;
@@ -279,23 +319,11 @@ struct VkMirror
     bool   said_no_runtime;
 };
 
-// One NGX call at a time in this process, across both backends.
-//
-// The mirror's worker runs a D3D12 NGX evaluate while the game's render thread
-// runs its own Vulkan NGX evaluate, and until now nothing kept the two apart:
-// the worker takes no lock, and the render thread's g_hook_cs is released before
-// VkMirrorFrame wakes it. Two threads inside one NGX, on Red Dead Redemption 2,
-// fault -- and the evidence that it is a race rather than a bad contract is that
-// it is not reproducible in shape. Measured 2026-08-31, same build, same game,
-// same values: once after 89 delivered frames inside nvapi64_impl.dll, once
-// after 145 inside nvoglv64.dll, with every per-frame parameter dumped at the
-// fault and every one of them in range, and the private device reporting S_OK.
-//
-// Deliberately NOT g_hook_cs. That one is taken from the loader notification
-// while the loader lock is held, and adding a second waiter on it is the
-// deadlock the note in TryInstallHooks was written about.
-static CRITICAL_SECTION g_ngx_cs;
-static bool             g_ngx_cs_ready;
+// The NGX serialisation lock now lives beside g_hook_cs in dlss5-bridge.cpp.
+// It moved because the D3D11 detours are compiled before this file is
+// included and could not see it here -- which is why they went without it
+// for four releases while five comments said both backends were serialised.
+
 
 static VkMirror g_vkm;
 
@@ -305,8 +333,100 @@ static VkMirror g_vkm;
 // frames -- which is exactly what the two-ReShades check below tests.
 static reshade::api::effect_runtime *g_vkm_rt;
 
-static void OnVkmInitRuntime(reshade::api::effect_runtime *rt)    { g_vkm_rt = rt; }
-static void OnVkmDestroyRuntime(reshade::api::effect_runtime *rt) { if (g_vkm_rt == rt) g_vkm_rt = nullptr; }
+// A runtime arrives. On Vulkan this happens again after every swapchain change,
+// so it is also where the stand-down VkmShutdown raised is lifted -- the mirror
+// rebuilds itself on the next evaluate.
+static void OnVkmInitRuntime(reshade::api::effect_runtime *rt)
+{
+    // A Vulkan one, or none. This used to take whatever ReShade announced, and a
+    // process can hold more than one runtime: Baldur's Gate 3 launched as bg3.exe
+    // renders with Vulkan and still creates a secondary D3D12 device, and with a
+    // ReShade proxy in the game folder that device gets an effect runtime of its
+    // own. Latching it left the mirror holding a runtime whose device is not the
+    // one the game's DLSS runs on, and the first Vulkan evaluate then refused --
+    // permanently, for a condition that was never permanent.
+    //
+    // Choosing here rather than refusing there is the difference between taking
+    // the wrong one of two and waiting for the right one.
+    reshade::api::device *dev = rt != nullptr ? rt->get_device() : nullptr;
+    const bool is_vk = dev != nullptr &&
+                       dev->get_api() == reshade::api::device_api::vulkan;
+
+    // Every runtime, named once each, taken or not. Without this the log could say
+    // the runtime was wrong and never that there were two.
+    static int seen = 0;
+    if (seen < 8)
+    {
+        ++seen;
+        const char *api =
+            dev == nullptr ? "no device"
+            : is_vk ? "Vulkan"
+            : dev->get_api() == reshade::api::device_api::d3d12  ? "D3D12"
+            : dev->get_api() == reshade::api::device_api::d3d11  ? "D3D11"
+            : dev->get_api() == reshade::api::device_api::d3d10  ? "D3D10"
+            : dev->get_api() == reshade::api::device_api::d3d9   ? "D3D9"
+            : dev->get_api() == reshade::api::device_api::opengl ? "OpenGL"
+            : "an API this build does not name";
+        Log("[vkmirror] ReShade created an effect runtime on %s. %s", api,
+            is_vk ? "The mirror takes it."
+                  : "The mirror leaves it: only a Vulkan runtime can carry the "
+                    "import, and one may still arrive.");
+    }
+    if (!is_vk) return;
+
+    g_vkm_rt = rt;
+    if (g_vkm.stopping)
+    {
+        g_vkm.stopping = false;
+        g_vkm.said_no_runtime = false;
+        Log("[vkmirror] a new ReShade effect runtime exists, so the mirror is armed again "
+            "and rebuilds on the next evaluate.");
+    }
+}
+// Defined below, next to the worker it stops. Forward-declared because the runtime
+// teardown hook has to run before it in this file and after it in time.
+static void VkmShutdown();
+
+// The game is taking its VkDevice away, and everything this add-on imported onto
+// that device has to go first.
+//
+// This used to clear one pointer and nothing else. The Khronos validation layer
+// reported the consequence exactly: "vkDestroyDevice(): VkDevice has 14 leaked
+// objects that have not been destroyed", and the fourteen are this side's -- four
+// VkImages, their memory, and the buffer the depth aspect travels through. The
+// same shutdown recorded 0xC0000005 with the add-on last doing "running the D3D12
+// evaluate", which is the worker still inside a frame while the device under it is
+// being destroyed.
+//
+// Order matters and is the same order VkmShutdown already establishes: the worker
+// is stopped and joined first, so nothing is inside an evaluate, and only then are
+// the images released. Doing it the other way round frees memory a submitted
+// command buffer still names.
+//
+// ReShade destroys the effect runtime for a device before that device goes, which
+// is what makes this the right hook rather than DllMain -- by DllMain the device
+// is already gone and releasing against it is worse than leaking.
+static void OnVkmDestroyRuntime(reshade::api::effect_runtime *rt)
+{
+    if (g_vkm_rt != rt) return;
+    g_vkm_rt = nullptr;
+
+    if (g_vkm.worker != nullptr || g_svk.ready)
+        Log("[vkmirror] the game is destroying the effect runtime, so the mirror stops "
+            "and everything imported onto its VkDevice is released before the device is.");
+
+    // Photograph the module list here, while every layer, add-on and driver DLL
+    // is still mapped. If something faults after the unloads start, this is the
+    // only record that can name it.
+    ModuleSnapshot();
+    Breadcrumb("shutdown: stopping the Vulkan mirror worker");
+    VkmShutdown();
+    Breadcrumb("shutdown: taking the bridge lock");
+    EnterCriticalSection(&g_bridge_cs);
+    SynthVkShutdownForDevice();
+    LeaveCriticalSection(&g_bridge_cs);
+    Breadcrumb("shutdown: the runtime teardown returned");
+}
 
 // g_vk_mirror is declared beside the layer table, because the module scan reads
 // it and that runs long before this file is included.
@@ -358,8 +478,14 @@ static void VkmRegisterEvents()
         "game's own DLSS contract mirrored onto the private D3D12 session.");
 }
 
+// The panel's read of the flag below. Non-static because synth.inc is included
+// first and forward-declares it; it is the one symbol these two files share.
+bool VkmStoodDown() { return g_vkm.refused; }
+
 // Said once, and then the mirror never tries again this session. Everything it
-// refuses on is a property of the game or the machine, not of the frame.
+// refuses on is a property of the game or the machine, not of the frame -- which
+// the merged size test in VkMirrorFrame finally made true, by taking the two
+// frame properties out of this function's reach.
 static void VkmRefuse(const char *why)
 {
     if (g_vkm.refused) return;
@@ -508,7 +634,7 @@ static void VkmShutdown()
     // so a render thread that has not started a frame yet cannot arm one behind
     // this function -- which would reset ev_out after the release below and then
     // park the game's GPU on an event no code left in the process would ever set.
-    g_vkm.refused = true;
+    g_vkm.stopping = true;
 
     if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
         for (int i = 0; i < 2; ++i)
@@ -529,6 +655,26 @@ static void VkmShutdown()
 
     CloseHandle(g_vkm.worker);
     g_vkm.worker = nullptr;
+
+    // The four park events, on the game's device. Only now: every EvSet above needs
+    // them, and the worker has been joined, so nothing can wait on one after this.
+    // They were the last four of the fourteen objects the Khronos validation layer
+    // reported leaked at vkDestroyDevice -- and the only four whose leak this file
+    // owned outright, since the other ten belong to the import layer.
+    if (g_svk.EvDestroy != nullptr && g_svk.dev != nullptr)
+        for (int i = 0; i < 2; ++i)
+        {
+            if (g_vkm.ev_in[i]  != 0) { g_svk.EvDestroy(g_svk.dev, g_vkm.ev_in[i],  nullptr); g_vkm.ev_in[i]  = 0; }
+            if (g_vkm.ev_out[i] != 0) { g_svk.EvDestroy(g_svk.dev, g_vkm.ev_out[i], nullptr); g_vkm.ev_out[i] = 0; }
+        }
+
+    // The Win32 pair goes with them, and stop goes back to 0. VkmEnsureEvents
+    // remakes all of this on the next frame after a runtime returns, and without
+    // these three lines it would leak a handle pair per mode change and start a
+    // worker whose first act is to see stop and exit.
+    if (g_vkm.idle != nullptr) { CloseHandle(g_vkm.idle); g_vkm.idle = nullptr; }
+    if (g_vkm.wake != nullptr) { CloseHandle(g_vkm.wake); g_vkm.wake = nullptr; }
+    g_vkm.stop = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +781,107 @@ static bool VkmReadContract(const NVSDK_NGX_Parameter *gp, SynthParams *sp, VkmR
     VkmMirrorU(gp, sp, "OutWidth",  res[SLOT_OUTPUT].w);
     VkmMirrorU(gp, sp, "OutHeight", res[SLOT_OUTPUT].h);
 
+    // FIRST, above the allocation repair: the shape the game stated in its own
+    // CREATE. That is the answer to the question the other two are estimating --
+    // the game saying what it built, once, rather than four per-frame scalars.
+    // The rule and the reasoning are the maintainer's, from the discussion on
+    // pull request #9: neither the swap the D3D11 path performs nor the
+    // allocation repair below is reading the value the bridge already receives
+    // and throws away, and both are reconstructions of it.
+    //
+    // The allocation repair stays underneath as the fallback, and it is not
+    // redundant: a create is not always seen. This add-on can attach to a process
+    // whose game created its feature already, and some engines state no size in
+    // the create block at all -- VkmNoteGameCreate logs which case a session is in.
+    if (g_vkm.cw != 0 && g_vkm.ch != 0 && g_vkm.cow != 0 && g_vkm.coh != 0)
+    {
+        unsigned int ew = 0, eh = 0, eow = 0, eoh = 0;
+        sp->Get("Width", &ew);     sp->Get("Height", &eh);
+        sp->Get("OutWidth", &eow); sp->Get("OutHeight", &eoh);
+
+        static bool said = false;
+        if (!said && (ew != g_vkm.cw || eh != g_vkm.ch ||
+                      eow != g_vkm.cow || eoh != g_vkm.coh))
+        {
+            said = true;
+            Log("[vkmirror] this evaluate declares %ux%u -> %ux%u where the game's create "
+                "stated %ux%u -> %ux%u. The create is used. Said once; if the two keep "
+                "disagreeing the periodic dump below shows what is being mirrored.",
+                ew, eh, eow, eoh, g_vkm.cw, g_vkm.ch, g_vkm.cow, g_vkm.coh);
+        }
+
+        sp->Set("Width",     g_vkm.cw);
+        sp->Set("Height",    g_vkm.ch);
+        sp->Set("OutWidth",  g_vkm.cow);
+        sp->Set("OutHeight", g_vkm.coh);
+    }
+
+    // The images are an allocation; the four scalars above are a claim. When the
+    // two contradict each other the allocation wins -- the same repair bridge.inc
+    // has run in nine D3D11 titles, and it belongs here for the same reason and
+    // on better evidence: res[] was read out of THIS evaluate's own image views
+    // forty lines up, not inferred from a previous frame.
+    //
+    // Baldur's Gate 3, 2026-09-01. After a borderless <-> fullscreen change the
+    // game keeps writing Width/Height = 3840x1600 and OutWidth/OutHeight =
+    // 2560x1067 while handing over a 2560x1067 Colour image and a 3840x1600
+    // Output image in the same call, and it does not stop doing it. Read as
+    // given, every frame was skipped and the mirror delivered nothing for the
+    // rest of the session while the game went on evaluating -- silently, because
+    // the skip is said once. The periodic dump printing the contract and the four
+    // image sizes side by side is what finally decided this instead of guessing;
+    // the earlier reading, that a synthetic session had leaked its size in, was
+    // wrong and was disproved by a run with source=mirror.
+    //
+    // No swap. bridge.inc swaps the pair first because four named D3D11 engines
+    // are persistently reversed and the swap is their true shape. Here the two
+    // allocation repairs alone land on the right pair, with nobody having to
+    // decide what the game meant.
+    {
+        unsigned int cw = 0, ch = 0, co = 0, cp = 0;
+        sp->Get("Width",    &cw);  sp->Get("Height",    &ch);
+        sp->Get("OutWidth", &co);  sp->Get("OutHeight", &cp);
+
+        // The output first. Repairing the render size first would leave this test
+        // comparing a corrected value against an uncorrected one, and it would not
+        // fire at all: 2560 is not smaller than 2560.
+        if (res[SLOT_OUTPUT].w != 0 && res[SLOT_OUTPUT].h != 0 && (co < cw || cp < ch))
+        {
+            static bool said_out = false;
+            if (!said_out)
+            {
+                said_out = true;
+                Log("[vkmirror] this evaluate declares an output of %ux%u for a render of "
+                    "%ux%u, which is smaller rather than larger. Its Output image is %ux%u, "
+                    "and an image is an allocation rather than a claim, so that is used.",
+                    co, cp, cw, ch, res[SLOT_OUTPUT].w, res[SLOT_OUTPUT].h);
+            }
+            co = res[SLOT_OUTPUT].w; cp = res[SLOT_OUTPUT].h;
+            sp->Set("OutWidth", co); sp->Set("OutHeight", cp);
+        }
+
+        // And the render size, which cannot exceed the image holding it: a
+        // subrect has to fit inside its own allocation. A game that renders into
+        // PART of a larger Colour image declares smaller than the image, not
+        // larger, so that case does not come through here.
+        if (res[SLOT_COLOR].w != 0 && res[SLOT_COLOR].h != 0 &&
+            (cw > res[SLOT_COLOR].w || ch > res[SLOT_COLOR].h))
+        {
+            static bool said_in = false;
+            if (!said_in)
+            {
+                said_in = true;
+                Log("[vkmirror] this evaluate asks for a render of %ux%u from a Colour image "
+                    "of %ux%u. A subrect has to fit inside its own allocation, so the image is "
+                    "used and the contract reads %ux%u -> %ux%u.",
+                    cw, ch, res[SLOT_COLOR].w, res[SLOT_COLOR].h,
+                    res[SLOT_COLOR].w, res[SLOT_COLOR].h, co, cp);
+            }
+            sp->Set("Width",  res[SLOT_COLOR].w);
+            sp->Set("Height", res[SLOT_COLOR].h);
+        }
+    }
+
     unsigned int rw = 0, rh = 0;
     sp->Get("Width", &rw);
     sp->Get("Height", &rh);
@@ -710,7 +957,8 @@ static bool VkmReadContract(const NVSDK_NGX_Parameter *gp, SynthParams *sp, VkmR
 // What the first few evaluates report, and the whole reason to run this stage
 // with the transport switched off first: nothing in this project has ever seen
 // what a Vulkan title actually declares in an NGX block.
-static void VkmLogContract(const SynthParams *sp, const VkmRes res[SLOT_COUNT], LONG n)
+static void VkmLogContract(const NVSDK_NGX_Parameter *gp, const SynthParams *sp,
+                           const VkmRes res[SLOT_COUNT], LONG n)
 {
     unsigned int w = 0, h = 0, ow = 0, oh = 0, q = 0, fl = 0;
     sp->Get("Width", &w); sp->Get("Height", &h);
@@ -724,7 +972,27 @@ static void VkmLogContract(const SynthParams *sp, const VkmRes res[SLOT_COUNT], 
     Log("=== Vulkan evaluate #%ld ===", n);
     Log("  contract: %ux%u -> %ux%u  quality=%u  jitter %.4f,%.4f  MV.Scale %.1f,%.1f",
         w, h, ow, oh, q, jx, jy, mx, my);
-    LogCreateFlags("the game's own create", fl);
+    // Both values, each labelled by where it came from. The first line keeps its
+    // exact old wording so older logs still compare, and it now reads the GAME'S
+    // block rather than the mirrored one -- which is what it always claimed to do
+    // and did not: with flags= set, VkmReadContract has already overwritten the
+    // mirrored block with the forced value, so this line reported a user's own
+    // override as the game's declaration. It cost a night: Red Dead Redemption 2
+    // was read as declaring 75 when it declares 43, and the override was called a
+    // no-op on that evidence.
+    unsigned int asked = 0;
+    if (gp != nullptr && gp->Get("DLSS.Feature.Create.Flags", &asked) == NGX_SUCCESS)
+        LogCreateFlags("the game's own create", asked);
+    {
+        // The label only, from ResolveCreateFlags; the VALUE is fl, read off the
+        // block the feature is built from. They differ in the absent-key case,
+        // where the mirror falls back to 0 and ResolveCreateFlags answers 107, and
+        // the "created with zero" note above must not be contradicted by the line
+        // under it.
+        FlagsFrom ff = FLAGS_NONE;
+        ResolveCreateFlags(gp, &ff);
+        LogCreateFlags(kFlagsFromLabel[ff], fl);
+    }
     for (int i = 0; i < SLOT_COUNT; ++i)
         Log("  %-13s VkImage=%016llX view=%016llX VkFormat=%u %ux%u aspect=0x%X mip=%u layer=%u",
             kSlotName[i], static_cast<unsigned long long>(res[i].image),
@@ -738,30 +1006,44 @@ static void VkmLogContract(const SynthParams *sp, const VkmRes res[SLOT_COUNT], 
 
 static bool VkmEnsureEvents()
 {
-    if (g_vkm.ev_in[0] != 0) return true;
+    if (g_vkm.ev_in[0] != 0 && g_vkm.worker != nullptr) return true;
 
-    SVkEventCreateInfo eci = {};
-    eci.sType = kSVkStEventCreateInfo;
-    for (int i = 0; i < 2; ++i)
-        if (g_svk.EvCreate(g_svk.dev, &eci, nullptr, &g_vkm.ev_in[i]) != kSVkSuccess ||
-            g_svk.EvCreate(g_svk.dev, &eci, nullptr, &g_vkm.ev_out[i]) != kSVkSuccess)
-        { VkmRefuse("vkCreateEvent refused, so the frame cannot be parked"); return false; }
+    // Each piece tested on its own rather than all of them off the first. A
+    // teardown can leave the VkEvents destroyed and the worker joined while the
+    // Win32 pair survives, or the reverse when the device went before the events
+    // could be destroyed -- and remaking a piece that already exists leaks a
+    // handle, or in the worker's case starts a second thread on the same slot.
+    if (g_vkm.ev_in[0] == 0)
+    {
+        SVkEventCreateInfo eci = {};
+        eci.sType = kSVkStEventCreateInfo;
+        for (int i = 0; i < 2; ++i)
+            if (g_svk.EvCreate(g_svk.dev, &eci, nullptr, &g_vkm.ev_in[i]) != kSVkSuccess ||
+                g_svk.EvCreate(g_svk.dev, &eci, nullptr, &g_vkm.ev_out[i]) != kSVkSuccess)
+            { VkmRefuse("vkCreateEvent refused, so the frame cannot be parked"); return false; }
+    }
 
-    g_vkm.idle = CreateEventW(nullptr, TRUE, TRUE, nullptr);    // manual reset, starts set
-    g_vkm.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto reset
+    if (g_vkm.idle == nullptr) g_vkm.idle = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+    if (g_vkm.wake == nullptr) g_vkm.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (g_vkm.idle == nullptr || g_vkm.wake == nullptr)
     { VkmRefuse("the park's own Win32 events could not be created"); return false; }
+    // Set, not merely present. A shutdown can join the worker while idle is clear,
+    // and the next frame's wait would then time out and refuse the session for a
+    // park that no longer exists.
+    SetEvent(g_vkm.idle);
 
-    g_vkm.worker = CreateThread(nullptr, 0, &VkmWorkerProc, nullptr, 0, nullptr);
     if (g_vkm.worker == nullptr)
-    { VkmRefuse("the mirror's worker thread would not start"); return false; }
+    {
+        g_vkm.stop = 0;
+        g_vkm.worker = CreateThread(nullptr, 0, &VkmWorkerProc, nullptr, 0, nullptr);
+        if (g_vkm.worker == nullptr)
+        { VkmRefuse("the mirror's worker thread would not start"); return false; }
+    }
 
-    // ponytail: the four VkEvents and the worker thread live for the life of the
-    // process. Two events per pair is 64 bytes of driver object; destroying them
-    // would need a point at which no submitted command buffer can still name
-    // them, and the only such point is the one VkmShutdown already covers, where
-    // the device may already be gone. Bounded and reported; revisit if a title
-    // ever creates and destroys its Vulkan device more than once.
+    // The four VkEvents, the two Win32 events and the worker are all torn down by
+    // VkmShutdown when ReShade destroys the effect runtime, and remade here the
+    // next time a runtime exists. A title that changes display mode does that on
+    // every change, so this runs more than once per session by design.
     return true;
 }
 
@@ -770,7 +1052,25 @@ static bool VkmEnsureEvents()
 // be replaced.
 static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
 {
-    if (g_vkm.refused || g_cfg.stage < 2) return;
+    // stage is a D3D11 word in the documentation and has grown two more meanings
+    // since: below 3 the synthetic contract refuses, and below 2 the mirror does
+    // not record a frame at all. The synthetic side says so twice; this returned
+    // without a word, so a file left at stage=2 by a support thread took the whole
+    // Vulkan mirror away in silence.
+    if (g_cfg.stage < 2)
+    {
+        static bool said_stage = false;
+        if (!said_stage)
+        {
+            said_stage = true;
+            Log("[vkmirror] stage=%d in the configuration file, and the mirror needs 2 or "
+                "more to record a frame. The game's own DLSS is forwarded untouched and "
+                "the picture is correct; nothing is mirrored. stage=3 is the default.",
+                g_cfg.stage);
+        }
+        return;
+    }
+    if (g_vkm.refused || g_vkm.stopping) return;
 
     if (g_vkm_rt == nullptr)
     {
@@ -783,19 +1083,30 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         return;
     }
 
-    // The two-ReShades condition, and it is a real one: with dxgi.dll in the game
-    // folder AND the Vulkan layer registered, a Vulkan game can create a
-    // secondary D3D12 device that ReShade latches onto first, and the add-on then
-    // attaches to a runtime that is not where frames are presented. Baldur's Gate
-    // 3 did exactly this and reported a 3840x2160 back buffer instead of the real
-    // 3840x1600. Refusing beats mirroring onto the wrong device.
+    // The two-ReShades condition, and it is a real one: with a ReShade proxy in
+    // the game folder AND the Vulkan layer registered, a Vulkan game that also
+    // creates a D3D12 device gets an effect runtime for that device too. Baldur's
+    // Gate 3 does exactly this and reported a 3840x2160 back buffer instead of the
+    // real 3840x1600.
+    //
+    // OnVkmInitRuntime now refuses to latch a runtime that is not Vulkan, so this
+    // is reached only if the one it holds stopped being one -- a state a later
+    // runtime can fix. It is therefore a skip and not a refusal: retiring the
+    // session here cost Baldur's Gate 3 the whole mirror on 2026-09-01, from the
+    // first evaluate, for a condition that was never permanent.
     reshade::api::device *rdev = g_vkm_rt->get_device();
     if (rdev == nullptr || rdev->get_api() != reshade::api::device_api::vulkan)
     {
-        VkmRefuse("a Vulkan NGX evaluate arrived but ReShade is attached to a runtime that is "
-                  "not Vulkan -- with dxgi.dll in the game folder a Vulkan game can create a "
-                  "secondary D3D12 device that ReShade latches onto first. Rename dxgi.dll out "
-                  "of the game folder so ReShade loads from C:\\ProgramData\\ReShade\\");
+        static bool said_not_vk = false;
+        if (!said_not_vk)
+        {
+            said_not_vk = true;
+            Log("[vkmirror] the effect runtime this add-on holds is not a Vulkan one, so "
+                "nothing is recorded for now. The game's own DLSS is forwarded and the "
+                "picture is correct. Retried on every evaluate, and a Vulkan runtime is "
+                "taken as soon as ReShade creates one.");
+        }
+        g_vkm_rt = nullptr;
         return;
     }
 
@@ -835,7 +1146,7 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     if (!VkmReadContract(gp, &g_vkm.sp, res)) return;
 
     const LONG n = ++g_vkm.n;
-    if (n <= 3 || (n % 1800) == 0) VkmLogContract(&g_vkm.sp, res, n);
+    if (n <= 3 || (n % 1800) == 0) VkmLogContract(gp, &g_vkm.sp, res, n);
 
     unsigned int rw = 0, rh = 0, ow = 0, oh = 0, flags = 0;
     g_vkm.sp.Get("Width", &rw);
@@ -844,71 +1155,104 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     g_vkm.sp.Get("OutHeight", &oh);
     g_vkm.sp.Get("DLSS.Feature.Create.Flags", &flags);
 
-    if (rw == 0 || rh == 0 || ow == 0 || oh == 0)
-    { VkmRefuse("the contract declares a zero dimension, so there is nothing to build"); return; }
-
-    // The four D3D11 engines that forced bridge.inc's size repairs are not
-    // carried here: no Vulkan title has been measured swapping the pairs, and a
-    // repair applied to a case nobody has seen is a guess. Refuse and name it;
-    // the repair goes in the day a Vulkan log shows it.
-    if (ow < rw || oh < rh)
+    // NOT a refusal, and both of these were. VkmRefuse is for a property of the
+    // game or the machine; these four scalars are a property of ONE evaluate's
+    // parameter block, and a block can be momentarily wrong. Baldur's Gate 3 on
+    // 2026-08-31 sent one evaluate declaring 3840x1600 -> 2560x1067 while the
+    // display mode changed, between two healthy creates 2.3 s apart, and the
+    // mirror was retired for the rest of the session over that single frame.
+    // Nothing was even at risk: the game's own evaluate is always forwarded
+    // before this runs, so the picture was correct throughout.
+    //
+    // So the frame is skipped and the next one is tried, which is what
+    // VkmReadContract already does with a contract it cannot read. Free here:
+    // g_vkm.idle is manual-reset and is not cleared until the park is armed
+    // further down, so returning costs the next frame nothing.
+    //
+    // bridge.inc's swap repair is deliberately NOT ported. There the reversed
+    // pair is the standing true shape of four named D3D11 engines; here it would
+    // be a shape inferred from one stale frame, and vkmirror has no allocation to
+    // check the guess against -- SynthVkCopyImage clamps rather than failing, so
+    // a wrong swap would ship wrong pixels with nothing in the log.
+    if (rw == 0 || rh == 0 || ow == 0 || oh == 0 || ow < rw || oh < rh)
     {
-        char msg[192];
-        _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                    "the contract declares an output of %ux%u smaller than its render size of "
-                    "%ux%u, which no Vulkan title has been measured doing", ow, oh, rw, rh);
-        VkmRefuse(msg);
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[vkmirror] this evaluate declares %ux%u -> %ux%u, which is not a contract. "
+                "The frame is skipped and the next one is tried again. If this is the "
+                "steady state rather than one frame of a mode change, the every-1800 "
+                "contract dump below keeps printing the sizes.", rw, rh, ow, oh);
+        }
         return;
     }
 
-    // An exposure texture the mirror does not carry across is wrong brightness
-    // rather than a broken frame, which is the worse failure: it looks like a
-    // decision somebody made. AutoExposure set means DLSS computes its own and
-    // the texture is not read.
+    // The exposure texture, carried the way the four slots are: a fifth D3D12
+    // texture created shareable, imported into the game's VkDevice, and copied
+    // into with one vkCmdCopyImage per frame. bridge.inc has done exactly this on
+    // D3D11 since 1.0.16 -- see BridgeEnsureExposure and the Bannerlord note
+    // above it, which records what carrying nothing actually costs: "DLSS
+    // accumulated without knowing the exposure, which is ghosting". Until now the
+    // Vulkan side stood the whole session down instead, and a hand-edited flags=
+    // was the only cure.
+    //
+    // Read every frame and never cached: the pointer is borrowed for the length
+    // of this evaluate, the way VkmGetRes borrows the other four, and a stale
+    // exposure is as wrong as none.
+    VkmRes exp_res = {};
+    bool   want_exp = false;
     {
-        // The contract's own flags, and there is no way round this one.
-        //
-        // It was tried, on 2026-08-31, against Red Dead Redemption 2: the gate was
-        // made to read the config-resolved flags so a user could force
-        // AutoExposure and run anyway, and the mirrored feature was created with
-        // those same forced flags so the two agreed. The evaluate still raised
-        // 0xC0000005 and the game stopped presenting. So the exposure texture is
-        // not the whole of what that title's contract needs from a transport this
-        // build does not have -- it is the first thing that is detectably absent,
-        // not the last thing that is missing.
-        //
-        // A refusal that stops a session is worth more than an override that hangs
-        // one. This stays shut, and no config key opens it.
-        // The RESOLVED flags, so a user can force AutoExposure and run anyway.
-        //
-        // That escape hatch was added, removed and added again in one afternoon,
-        // and the middle step is the one worth recording: forcing it appeared to
-        // fault the evaluate, so the gate was shut again and the refusal told
-        // users there was no way past. Both conclusions were wrong. The fault was
-        // the NGX race g_ngx_cs now closes, which fires on this title with or
-        // without the override; once the two backends were serialised, Red Dead
-        // Redemption 2 ran 1800 mirrored frames with AutoExposure forced and the
-        // brightness was reported as good.
-        //
-        // So the gate is real, the override is real, and the thing that made them
-        // look connected was underneath both.
-        FlagsFrom exp_from = FLAGS_NONE;
-        const unsigned int eff_flags = ResolveCreateFlags(gp, &exp_from);
+        const char *why = nullptr;
+        const bool have = VkmGetRes(gp, "ExposureTexture", &exp_res, &why);
+        want_exp = have && exp_res.fmt == kVkFmtR32Sfloat &&
+                   exp_res.w != 0 && exp_res.h != 0;
 
-        void *exp = nullptr;
-        if (gp->Get("ExposureTexture", &exp) == NGX_SUCCESS && exp != nullptr &&
-            (eff_flags & 0x40) == 0)
+        // Once per session, and it prints whether or not the surface is carried:
+        // nothing in this tree has ever decoded a Vulkan ExposureTexture, and
+        // NVIDIA documents the parameter only as a 1x1 texture holding the
+        // exposure scale, without stating a format. So the transport refuses by
+        // number rather than guessing, and this line is what turns the next
+        // report into a one-line change.
+        static bool said = false;
+        if (have && !said)
         {
-            VkmRefuse("the game drives DLSS from an exposure texture and has not set "
-                      "AutoExposure, and this build does not mirror that texture -- "
-                      "delivering without it would be wrong brightness. To run anyway "
-                      "and let DLSS compute its own exposure, set flags in "
-                      "dlss5-bridge.cfg to the game's own value with bit 0x40 added -- "
-                      "but not to 107, which is treated as unset. Red Dead Redemption 2 "
-                      "declares 43, so 75");
+            said = true;
+            Log("[vkmirror] the game supplies an exposure texture (VkFormat %u %ux%u "
+                "aspect=0x%X); it is %s.", exp_res.fmt, exp_res.w, exp_res.h,
+                exp_res.aspect, want_exp
+                    ? "mirrored to D3D12 so both sides run the same contract"
+                    : "not a 1-component 32-bit float image, which is the only shape "
+                      "this transport carries");
+        }
+
+        // The flags the feature is ACTUALLY CREATED with, read back off the block
+        // VkmReadContract filled -- not ResolveCreateFlags. The two disagree in
+        // exactly one case, a game that declares no create flags at all: VkmMirrorU
+        // falls back to 0 above and ResolveCreateFlags answers 107, which has 0x40
+        // set. Testing the resolved value here opened this gate on an AutoExposure
+        // the mirrored feature does not carry, and ran it with no exposure input at
+        // all -- the Bannerlord defect, on Vulkan, silently.
+        if (have && !want_exp && (flags & 0x40) == 0)
+        {
+            char msg[320];
+            _snprintf_s(msg, sizeof(msg), _TRUNCATE,
+                        "the game drives DLSS from an exposure texture this transport "
+                        "cannot carry (%s, VkFormat %u, %ux%u) and has not set "
+                        "AutoExposure -- delivering without it would be wrong "
+                        "brightness. To run anyway and let DLSS compute its own "
+                        "exposure, set flags in dlss5-bridge.cfg to the game's own "
+                        "value with bit 0x40 added -- but not to 107, which is treated "
+                        "as unset. The line above names the format, and adding it is a "
+                        "one-line change once a report shows what it is",
+                        why != nullptr ? why : "an image view",
+                        exp_res.fmt, exp_res.w, exp_res.h);
+            VkmRefuse(msg);
             return;
         }
     }
+    const UINT exp_w = want_exp ? exp_res.w : 0;
+    const UINT exp_h = want_exp ? exp_res.h : 0;
 
     const DXGI_FORMAT color_fmt = MapVkColor(res[SLOT_COLOR].fmt);
     if (color_fmt == DXGI_FORMAT_UNKNOWN)
@@ -979,7 +1323,8 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
 
     const bool rebuild = g_s12.feature == nullptr || g_s12.w != rw || g_s12.h != rh ||
                          g_s12.out_w != ow || g_s12.out_h != oh || g_s12.fmt != color_fmt ||
-                         g_s12.depth_packed != depth_packed;
+                         g_s12.depth_packed != depth_packed ||
+                         g_s12.exp_w != exp_w || g_s12.exp_h != exp_h;
     if (rebuild)
     {
         // Which of the seven conditions fired, because "building" twice at an
@@ -998,7 +1343,8 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
             : g_s12.w != rw || g_s12.h != rh ? "render size changed"
             : g_s12.out_w != ow || g_s12.out_h != oh ? "output size changed"
             : g_s12.fmt != color_fmt ? "colour format changed"
-            : "depth packing changed");
+            : g_s12.depth_packed != depth_packed ? "depth packing changed"
+            : "the exposure texture appeared, vanished or changed shape");
         // Every submitted command buffer that names the old images has to be
         // finished with before they are destroyed, and inside a detour there is
         // no queue to idle -- so the device is. A resolution change costs one
@@ -1017,8 +1363,16 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         // mirror-only session both of these no-op.
         SynthOfaVkRebuild();
         SynthDepthCsRelease();
-        if (!Synth12Build(&g_vkm.sp, rw, rh, ow, oh, color_fmt, depth_packed))
-        { g_s12.ready = false; SetEvent(g_vkm.idle); VkmRefuse("the D3D12 feature could not be built"); return; }
+        if (!Synth12Build(&g_vkm.sp, rw, rh, ow, oh, color_fmt, depth_packed, exp_w, exp_h))
+        {
+            // The mirror stands down -- its own build failed -- but the shared
+            // session is only written off after a run of failures, so this does
+            // not also take away the synthetic contract.
+            Synth12NoteBuildFailure(false);
+            SetEvent(g_vkm.idle);
+            VkmRefuse("the D3D12 feature could not be built");
+            return;
+        }
         // AFTER the build, not before it. Everything this says about the packed
         // path is only true if Synth12Build made the texture, the shader, the
         // root signature, the pipeline and the heap -- and saying it first is
@@ -1101,6 +1455,20 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     }
     SynthVkBarrier(cb, g_svk.img[SLOT_OUTPUT],
                    g_svk.laid_out ? kSVkLayoutGeneral : kSVkLayoutUndefined, kSVkLayoutGeneral);
+    // ASSUMED, NOT MEASURED, exactly as for the four slots above and for the same
+    // two reasons: NVSDK_NGX_Resource_VK carries no usage field, so this add-on
+    // cannot see whether the game created its exposure image with
+    // VK_IMAGE_USAGE_TRANSFER_SRC_BIT, and it cannot read the layout the image is
+    // actually in. A 1x1 compute-written target is the likeliest surface in the
+    // set to be storage-only or in SHADER_READ_ONLY_OPTIMAL. One session with the
+    // Khronos validation layer settles both by name and needs no code.
+    if (want_exp)
+    {
+        SynthVkBarrier(cb, exp_res.image, kSVkLayoutGeneral, kSVkLayoutTransferSrc);
+        SynthVkBarrier(cb, g_svk.img[kExpTex],
+                       g_svk.laid_out ? kSVkLayoutGeneral : kSVkLayoutUndefined,
+                       kSVkLayoutGeneral);
+    }
     g_svk.laid_out = true;
 
     SynthVkCopyImage(cb, res[SLOT_COLOR].image, kSVkLayoutTransferSrc,
@@ -1109,6 +1477,10 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     SynthVkCopyImage(cb, res[SLOT_MV].image, kSVkLayoutTransferSrc,
                      g_svk.img[SLOT_MV], kSVkLayoutGeneral,
                      res[SLOT_MV].w, res[SLOT_MV].h, rw, rh);
+    if (want_exp)
+        SynthVkCopyImage(cb, exp_res.image, kSVkLayoutTransferSrc,
+                         g_svk.img[kExpTex], kSVkLayoutGeneral,
+                         exp_res.w, exp_res.h, exp_w, exp_h);
     {
         // The depth aspect out to the buffer and back in as colour, tightly
         // packed -- exactly what the synthetic Vulkan transport does, for the
@@ -1145,6 +1517,8 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         if (i != SLOT_OUTPUT)
             SynthVkBarrier(cb, res[i].image, kSVkLayoutTransferSrc, kSVkLayoutGeneral,
                            barrier_aspect[i]);
+    if (want_exp)
+        SynthVkBarrier(cb, exp_res.image, kSVkLayoutTransferSrc, kSVkLayoutGeneral);
 
     // The park. Everything above has to have executed before the worker submits
     // the D3D12 evaluate that reads it, and the copy back below has to run after
@@ -1261,6 +1635,21 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
 
     if (IsOtherFeature(handle)) { VKM_FORWARD(fwd(cmd, handle, p, cb)) }
 
+    // source=synth pins the synthetic contract, so the mirror stands aside even
+    // when the game has DLSS of its own. See the same block in dlss5-bridge.cpp:
+    // the key was documented as a pin and only half of it was ever acted on.
+    if (g_cfg.source == CFG_SRC_SYNTH)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[vkmirror] source=synth, so the game's own DLSS is forwarded and not "
+                "mirrored. Only a synthetic contract may hold this session.");
+        }
+        VKM_FORWARD(fwd(cmd, handle, p, cb))
+    }
+
     const LONG n = InterlockedIncrement(&g_eval_count);
     if (n == 1) RetractIdleNote();
 
@@ -1292,11 +1681,20 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
     // frame on screen is the game's own DLSS output and is correct. That property
     // is what lets nearly every failure row end in a working frame.
     Breadcrumb("forwarding the game's Vulkan DLSS evaluate");
+    // g_ngx_cs here as well as in VKM_FORWARD, and this is the call that made the
+    // lock worth adding: the game's super-resolution evaluate is written out by
+    // hand rather than going through the macro, so for one build it was the ONE
+    // NGX call in this file that took no part in the serialisation -- while five
+    // comments, the release notes and a measured result all said the two backends
+    // could no longer be inside NGX at once. Order as everywhere else: g_ngx_cs
+    // outside g_hook_cs, never the reverse.
+    if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
     EnterCriticalSection(&g_hook_cs);
     HookRemove(h);
     NVSDK_NGX_Result r = fwd(cmd, handle, p, cb);
     HookRestore(h);
     LeaveCriticalSection(&g_hook_cs);
+    if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     if (n <= 5) Log("--- Vulkan EvaluateFeature #%ld returned %d ---", n, r);
 
@@ -1343,6 +1741,85 @@ static void VkmNoteCreated(int feature_id, NVSDK_NGX_Result r, NVSDK_NGX_Handle 
     }
 }
 
+// What the game's own create says, and what it costs the mirror.
+//
+// Extracted so BOTH create entry points call it. ForwardVkCreate1 had none of
+// this: it forwarded the create, noted the handle, and returned -- so a game
+// reaching DLSS through CreateFeature1 replaced its own feature and the mirror
+// kept ours, which is the defect the paragraph below describes, in the one entry
+// point that exists precisely because some game uses it.
+//
+// THE SHAPE. The four dimensions are read here and preferred over the evaluate's
+// in VkmReadContract, because the shape belongs to the create: it is the game
+// stating what it built, once, rather than four scalars in a per-frame block that
+// two D3D11 engines are known to fill in backwards and that Baldur's Gate 3 was
+// measured transposing for the rest of a session after a display-mode change.
+// They are LOGGED as well as stashed -- preferring a value nobody has ever seen
+// printed is how the transposed reading survived two nights.
+static void VkmNoteGameCreate(int feature_id, NVSDK_NGX_Result r,
+                              const NVSDK_NGX_Parameter *p)
+{
+    if (r != NGX_SUCCESS || feature_id != 1) return;
+
+    unsigned int cw = 0, ch = 0, cow = 0, coh = 0;
+    if (p != nullptr)
+    {
+        p->Get("Width", &cw);     p->Get("Height", &ch);
+        p->Get("OutWidth", &cow); p->Get("OutHeight", &coh);
+    }
+
+    EnterCriticalSection(&g_bridge_cs);
+    // All four or none: a half-stated shape is worse than none, because the half
+    // that is missing would fall back to the evaluate and the two would disagree.
+    if (cw != 0 && ch != 0 && cow != 0 && coh != 0)
+    {
+        const bool changed = cw != g_vkm.cw || ch != g_vkm.ch ||
+                             cow != g_vkm.cow || coh != g_vkm.coh;
+        g_vkm.cw = cw; g_vkm.ch = ch; g_vkm.cow = cow; g_vkm.coh = coh;
+        if (changed)
+            Log("[vkmirror] the game's create states %ux%u -> %ux%u. That is the shape "
+                "the mirror will use, in preference to the four scalars its evaluates "
+                "carry.", cw, ch, cow, coh);
+    }
+    else
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[vkmirror] the game's create block carries no complete size (%ux%u -> "
+                "%ux%u), so the contract still comes from the evaluate. Not a fault: "
+                "not every engine states it there.", cw, ch, cow, coh);
+        }
+    }
+
+    // The game replacing its own super-resolution feature invalidates ours, and
+    // this did nothing about it until now: the shape test is the only thing that
+    // triggers a rebuild, and a game can recreate at an unchanged render and
+    // output size. Red Dead Redemption 2 does exactly that when HDR is switched
+    // on or the window goes fullscreen -- three creates in a minute at
+    // 2560x1067 -> 3840x1600 throughout -- and the mirror carried its old feature
+    // across all three.
+    //
+    // Two things are wrong with carrying it. The temporal history it holds was
+    // accumulated under the configuration the game has just discarded, which is
+    // the same objection this file already makes to swapping motion-vector
+    // estimators mid-session. And the neural add-on downstream matches features
+    // by create: ours never created again, so it had nothing to match and said
+    // so -- "no NR feature matched" -- while the mirror went on delivering.
+    //
+    // A zero width is the rebuild request the handover path already uses, so this
+    // is the same mechanism rather than a new one. feature_id 1 only: a denoiser
+    // or another feature being created says nothing about the one we mirror.
+    g_s12.w = 0;
+    g_s12.need_reset = true;
+    // Which of the two zeroes this is. Both ask for the same rebuild, and the log
+    // line has to tell them apart or it reports a handover that did not happen --
+    // the source did not change, the game replaced its own feature.
+    g_vkm.rebuild_on_game_create = true;
+    LeaveCriticalSection(&g_bridge_cs);
+}
+
 static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
                                         NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
@@ -1365,11 +1842,16 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
     Log("=== Vulkan CreateFeature #%ld  feature_id=%d  thread %lu ===", n, feature_id,
         GetCurrentThreadId());
 
+    // The game's create is an NGX call like any other, so it takes the same
+    // section as its evaluate -- see the note there. A create running while the
+    // worker is inside its own evaluate is the same two-threads-in-one-NGX shape.
+    if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
     EnterCriticalSection(&g_hook_cs);
     HookRemove(h);
     NVSDK_NGX_Result r = fwd(cmd, feature_id, p, out);
     HookRestore(h);
     LeaveCriticalSection(&g_hook_cs);
+    if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     Log("=== Vulkan CreateFeature #%ld returned %d, handle=%p ===", n, r,
         (out != nullptr && *out != nullptr) ? static_cast<void *>(*out) : nullptr);
@@ -1393,17 +1875,7 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
     // A zero width is the rebuild request the handover path already uses, so this
     // is the same mechanism rather than a new one. feature_id 1 only: a denoiser
     // or another feature being created says nothing about the one we mirror.
-    if (r == NGX_SUCCESS && feature_id == 1)
-    {
-        EnterCriticalSection(&g_bridge_cs);
-        g_s12.w = 0;
-        g_s12.need_reset = true;
-        // Which of the two zeroes this is. Both ask for the same rebuild, and the
-        // log line has to tell them apart or it reports a handover that did not
-        // happen -- the source did not change, the game replaced its own feature.
-        g_vkm.rebuild_on_game_create = true;
-        LeaveCriticalSection(&g_bridge_cs);
-    }
+    VkmNoteGameCreate(feature_id, r, p);
     return r;
 }
 
@@ -1434,15 +1906,21 @@ static NVSDK_NGX_Result ForwardVkCreate1(Hook &h, void *dev, void *cmd, int feat
     Log("=== Vulkan CreateFeature1 #%ld  feature_id=%d  VkDevice=%p  thread %lu ===", n,
         feature_id, dev, GetCurrentThreadId());
 
+    // The game's create is an NGX call like any other, so it takes the same
+    // section as its evaluate -- see the note there. A create running while the
+    // worker is inside its own evaluate is the same two-threads-in-one-NGX shape.
+    if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
     EnterCriticalSection(&g_hook_cs);
     HookRemove(h);
     NVSDK_NGX_Result r = fwd(dev, cmd, feature_id, p, out);
     HookRestore(h);
     LeaveCriticalSection(&g_hook_cs);
+    if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     Log("=== Vulkan CreateFeature1 #%ld returned %d, handle=%p ===", n, r,
         (out != nullptr && *out != nullptr) ? static_cast<void *>(*out) : nullptr);
     VkmNoteCreated(feature_id, r, out);
+    VkmNoteGameCreate(feature_id, r, p);
     return r;
 }
 

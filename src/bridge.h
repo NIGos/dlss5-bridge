@@ -77,6 +77,7 @@ struct Bridge
     bool disabled;          // set after a hard failure; never retried
     bool session_ready;     // device, queue, fences, NGX session
     bool frame_ready;       // shared textures and NGX feature match the game
+    bool hashed;            // the one output readback of this session has been taken
     bool msaa_reported;     // the MSAA notice is said once per spell of it
 
     // The game's queue is made to wait for this fence value. A GPU-side wait

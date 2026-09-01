@@ -7,9 +7,9 @@
 // there. It reads, it measures, and it prints, and it touches no NGX parameter.
 //
 // The building half, below the report, does the thing the report was measuring
-// for -- but only when the config asks for it, the configured delay has passed
-// and the game has still never called DLSS itself. It ships off: synth_after
-// defaults to 0, and a user opts in with one line.
+// for -- but only when the configured delay has passed and the game has still
+// never called DLSS itself. It ships ON, because source=auto is the default and
+// falling back is what auto means. source=mirror is how a user turns it off.
 //
 // Kept out of bridge.inc on purpose. bridge.inc is the file that runs in nine
 // shipped titles and nobody should have to edit it for a reason that belongs to
@@ -675,9 +675,16 @@ static void SynthReport(const SynthFacts *f)
             else if (f->mv_which == 0)
                 // Above the provider branch below because this one is not a
                 // convention read out of somebody's source. It was measured here.
-                Log("[synth]     direction: %+d,%+d, measured -- 1,166,400 vectors within "
-                    "0.5 px of ground truth on this machine, not a convention read out of "
-                    "somebody's source", px, py);
+                // The number below is a STORED RESULT, not this session's. It was
+                // measured once on this machine against a synthetic scene with a
+                // known displacement; nothing re-measures it at runtime, and
+                // printing it in the present tense told every reader of every log
+                // that their own session had verified it. What this session does
+                // verify is the conversion, which the self-check reports
+                // separately and which is a different claim.
+                Log("[synth]     direction: %+d,%+d. Established once on this machine -- "
+                    "1,166,400 vectors, all within 0.5 px of a known displacement -- rather "
+                    "than read out of somebody's source. Not re-measured here", px, py);
             else if (kSynthMv[f->mv_which].sign_x != 0)
                 Log("[synth]     direction: %+d,%+d, this provider's own documented convention",
                     px, py);
@@ -1182,6 +1189,13 @@ static void SynthBuild(SynthParams *sp, unsigned int w, unsigned int h,
 // it took -- so both cases are correct and the log records which one happened.
 // ---------------------------------------------------------------------------
 
+// One past the slots. The exposure mirror is a fifth texture and deliberately
+// NOT a fifth slot, for the reason bridge.h gives beside exp12: every
+// "i < SLOT_COUNT" loop dereferences its entry unconditionally, and the games
+// that supply no exposure texture are the common case. Every loop below stops at
+// SLOT_COUNT except the two that name this constant.
+static const int kExpTex = SLOT_COUNT;
+
 struct Synth12
 {
     bool tried;      // the session open was attempted; a failure is never retried
@@ -1223,9 +1237,21 @@ struct Synth12
     // is a second thing to keep in step. On the game's own D3D12 device only
     // SLOT_COLOR and SLOT_OUTPUT are filled: Depth and MotionVectors are the
     // game's resources and are handed to NGX untouched.
-    ID3D12Resource *tex[SLOT_COUNT];
+    ID3D12Resource *tex[SLOT_COUNT + 1];
     // Only when shared: the NT handle the other API imports the texture through.
-    HANDLE          share[SLOT_COUNT];
+    HANDLE          share[SLOT_COUNT + 1];
+
+    // Consecutive failed builds. A build that fails is "this attempt failed", not
+    // "this session is unusable" -- Synth12Build already nulls the feature and
+    // gives the textures back, so the rebuild guard tries again on its own. Only
+    // a run of them means the transport is really gone.
+    int             build_fails;
+
+    // The game's own exposure texture, mirrored at index kExpTex. Zero here means
+    // this session carries none, which is every synthetic session and every game
+    // that supplies no ExposureTexture. Its shape is independent of the render
+    // shape, so it is remembered rather than derived from w/h.
+    UINT            exp_w, exp_h;
 
     // The Vulkan mirror's depth arrives packed rather than as floats when the
     // game's depth is D24_UNORM_S8_UINT -- see Synth12MakeDepthUnpack. Then
@@ -1287,22 +1313,69 @@ static void Synth12CopyF(const NVSDK_NGX_Parameter *src, NVSDK_NGX_Parameter *ds
     if (src->Get(key, &v) == NGX_SUCCESS) dst->Set(key, v);
 }
 
+// One auto-reset event serves every fence wait on this device, and
+// SetEventOnCompletion cannot be cancelled -- so a wait that timed out leaves a
+// live registration behind, and when the fence finally reaches that value the
+// event is signalled with nobody waiting. The NEXT wait then returns at once,
+// for a value the GPU has not reached, and whatever that wait was protecting
+// runs anyway. bridge.inc states this rule and tests the fence as well as the
+// event; this side did not, in five places, one of them the colour copy the
+// optical-flow engine reads.
+//
+// The event is the wake; the fence is the answer.
+static bool Synth12WaitFence(UINT64 value, DWORD ms)
+{
+    if (g_s12.fence == nullptr || g_s12.event == nullptr) return false;
+    if (g_s12.fence->GetCompletedValue() >= value) return true;
+    if (FAILED(g_s12.fence->SetEventOnCompletion(value, g_s12.event))) return false;
+    if (WaitForSingleObject(g_s12.event, ms) != WAIT_OBJECT_0) return false;
+    return g_s12.fence->GetCompletedValue() >= value;
+}
+
 // D3D12 keeps no reference to the resources a submitted command list names, so
 // the last frame has to be finished with before any of them is freed. This runs
 // on a resolution change, which is rare enough that a full wait costs nothing
 // and a use-after-free costs a GPU reset.
 static void Synth12ReleaseTextures()
 {
-    if (g_s12.fence != nullptr && g_s12.event != nullptr &&
-        g_s12.fence->GetCompletedValue() < g_s12.fence_value)
-    {
-        g_s12.fence->SetEventOnCompletion(g_s12.fence_value, g_s12.event);
-        WaitForSingleObject(g_s12.event, 4000);
-    }
+    Synth12WaitFence(g_s12.fence_value, 4000);
     if (g_s12.feature != nullptr && g_s12.release_feature != nullptr)
         g_s12.release_feature(g_s12.feature);
     g_s12.feature = nullptr;
-    for (int i = 0; i < SLOT_COUNT; ++i)
+    // The exposure key, cleared BEFORE its texture is freed and after the drain
+    // above. bridge.inc states the rule beside BridgeReleaseExposure: NGX does
+    // not AddRef what a parameter block names, this block is allocated once per
+    // session and never Reset, so freeing the texture without clearing the key
+    // leaves the driver a freed pointer on the very next evaluate.
+    //
+    // ONLY when this session actually set it. Clearing unconditionally put an
+    // ExposureTexture key, valued null, into the block handed to CreateFeature in
+    // every session including those that carry none -- a key the block had never
+    // carried before 2026-09-01. Whether NGX minds is not established; that it is
+    // a change nobody needed is, so it is not made.
+    if (g_s12.params != nullptr && g_s12.tex[kExpTex] != nullptr)
+        g_s12.params->Set("ExposureTexture", static_cast<ID3D12Resource *>(nullptr));
+    g_s12.exp_w = g_s12.exp_h = 0;
+
+    // The same rule, and the other four keys it was never applied to. Every
+    // evaluate writes Color, Output, Depth and MotionVectors into this block; the
+    // block is allocated once per session and never Reset, so once the textures
+    // below are Released it still names four freed ID3D12Resources -- and the
+    // next call handed that block is CreateFeature, on a rebuild.
+    //
+    // Whatever inspects it then reads freed memory. On this machine that is
+    // renodx-dlss5, which detours NVSDK_NGX_D3D12_CreateFeature and faulted
+    // 0xC0000005 at +0xD006 in roughly one rebuild in three -- intermittent
+    // exactly as a read of a freed allocation is, and never on the first build,
+    // when the block is still empty.
+    if (g_s12.params != nullptr)
+    {
+        g_s12.params->Set("Color",         static_cast<ID3D12Resource *>(nullptr));
+        g_s12.params->Set("Output",        static_cast<ID3D12Resource *>(nullptr));
+        g_s12.params->Set("Depth",         static_cast<ID3D12Resource *>(nullptr));
+        g_s12.params->Set("MotionVectors", static_cast<ID3D12Resource *>(nullptr));
+    }
+    for (int i = 0; i < SLOT_COUNT + 1; ++i)
     {
         if (g_s12.tex[i]   != nullptr) { g_s12.tex[i]->Release(); g_s12.tex[i] = nullptr; }
         // The handle is the importing API's only route to the texture, and the
@@ -1327,8 +1400,7 @@ static bool Synth12Begin()
     const UINT64 retire = g_s12.alloc_fence[slot];
     if (retire != 0 && g_s12.fence->GetCompletedValue() < retire)
     {
-        if (FAILED(g_s12.fence->SetEventOnCompletion(retire, g_s12.event))) return false;
-        if (WaitForSingleObject(g_s12.event, 4000) != WAIT_OBJECT_0) return false;
+        if (!Synth12WaitFence(retire, 4000)) return false;
     }
     if (FAILED(g_s12.alloc[slot]->Reset())) return false;
     if (FAILED(g_s12.list->Reset(g_s12.alloc[slot], nullptr))) return false;
@@ -1443,7 +1515,7 @@ static bool Synth12Open(reshade::api::effect_runtime *rt)
     // it is the knob a user is told to turn when unwrapping is what breaks their
     // driver, and a knob that only reaches one of two devices is worse than no
     // knob at all.
-    if (!g_s12.shared && g_cfg.unwrap != 0) UnwrapReShadeProxy(&g_s12.dev);
+    if (!g_s12.shared) MaybeUnwrap(&g_s12.dev);
 
     // The scan first, because a game that has DLSS has already loaded NGX and the
     // module it loaded is the one to use. Only when nothing is there is the
@@ -1611,7 +1683,8 @@ static bool Synth12MakeTexture(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool u
     if (FAILED(hr))
     {
         Log("[synth] could not create%s the %ux%u %s texture for %s: 0x%08X", 
-            g_s12.shared ? " or share" : "", w, h, FormatName(fmt), kSlotName[slot], hr);
+            g_s12.shared ? " or share" : "", w, h, FormatName(fmt),
+            slot < SLOT_COUNT ? kSlotName[slot] : "Exposure", hr);
         return false;
     }
     return true;
@@ -1838,8 +1911,58 @@ static bool Synth12MakeDepthUnpack(UINT w, UINT h)
 // depth_packed defaults false, so the two synthetic call sites are untouched and
 // keep the R32_FLOAT depth slot they have always had. Only the Vulkan mirror
 // passes true, and only when the game's depth is D24_UNORM_S8_UINT.
+// What a failed build costs. Red Dead Redemption 2, 2026-09-01: the SYNTHETIC
+// contract's create was refused with 0xBAD00010, the caller cleared g_s12.ready,
+// and g_s12.ready is one-way behind g_s12.tried -- so a minute later, when the
+// game asked for DLSS again, the MIRROR was told "the private D3D12 session could
+// not be opened" and stood down for the rest of the session. A failure on one
+// path took away the other, which was working.
+//
+// Three in a row before the session is written off, so a transport that is really
+// gone still stops instead of rebuilding every frame.
+static const int kSynth12MaxBuildFails = 3;
+
+// NOT g_s12.ready. That flag means "the private D3D12 session opened" -- device,
+// queue, NGX, params, list and fence all exist -- and its three other clear sites
+// are genuine session deaths: an SEH fault inside an evaluate, the same on the
+// shared path, and a fence overrun. A clean 0xBAD00010 out of CreateFeature is
+// none of those: the device is fine and one parameter block was refused.
+//
+// Clearing ready for it took the WORKING Vulkan mirror down together with the
+// synthetic contract, in Red Dead Redemption 2 on 2026-09-01, because Synth12Open
+// is one-way behind g_s12.tried and BOTH transports open through it. The comment
+// above Synth12Build already said a failed build is "this attempt failed" and not
+// "this session is unusable"; the code did not do it.
+//
+// And the first attempt at this bound was wrong in a second way: it counted three
+// consecutive CALLS, and the caller retries immediately, so all three were spent
+// in seventeen milliseconds. Pacing them changes nothing -- the refusal is
+// deterministic and the user came back thirty seconds later either way. What was
+// wrong was what tripping the bound DID.
+static bool g_synth_build_dead;
+
+// Returned by SynthArmRefusal and compared by ADDRESS, which is why it is a named
+// object and not a literal inside the return: SynthMaybeDeliver's rate limit and
+// the release below both key on pointer identity.
+static const char kSynthContractDead[] =
+    "the D3D12 feature for this contract was refused on three builds in a row, so the "
+    "synthetic contract stops. The log says what NGX refused";
+
+static void Synth12NoteBuildFailure(bool synthetic)
+{
+    if (++g_s12.build_fails < kSynth12MaxBuildFails) return;
+    Log("[synth] %d D3D12 builds in a row failed, so this contract stops being "
+        "retried. Everything above says why each one failed.", g_s12.build_fails);
+    // Only from the synthetic call sites. The mirror's own stand-down is VkmRefuse,
+    // which fires on its FIRST failed build, so this count was never the mirror's
+    // stop switch -- and a mirror failure must not write off a contract it does
+    // not own.
+    if (synthetic) g_synth_build_dead = true;
+}
+
 static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT out_h,
-                         DXGI_FORMAT back_fmt, bool depth_packed = false)
+                         DXGI_FORMAT back_fmt, bool depth_packed = false,
+                         UINT exp_w = 0, UINT exp_h = 0)
 {
     Synth12ReleaseTextures();
     g_s12.w = w; g_s12.h = h; g_s12.fmt = back_fmt;
@@ -1869,6 +1992,17 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
         if (!Synth12MakeTexture(i, i == SLOT_OUTPUT ? out_w : w, i == SLOT_OUTPUT ? out_h : h,
                                 slot_fmt[i], i == SLOT_OUTPUT))
         { Synth12ReleaseTextures(); return false; }
+
+    // The exposure mirror. Not in the loop above: it is not a slot, it has its
+    // own size, and it exists only when this frame's caller read one off the
+    // game. R32_FLOAT is pinned rather than mapped -- the mirror accepts only
+    // VK_FORMAT_R32_SFLOAT from the game, and SynthVkFormat already maps
+    // R32_FLOAT back to exactly that, so the import round-trips with no entry
+    // added to any format table. No UAV: NGX reads it and nothing writes it here.
+    g_s12.exp_w = exp_w; g_s12.exp_h = exp_h;
+    if (exp_w != 0 && exp_h != 0 &&
+        !Synth12MakeTexture(kExpTex, exp_w, exp_h, DXGI_FORMAT_R32_FLOAT, false))
+    { Synth12ReleaseTextures(); return false; }
 
     if (depth_packed && !Synth12MakeDepthUnpack(w, h))
     { Synth12ReleaseTextures(); return false; }
@@ -1934,13 +2068,20 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
         // states what was set rather than what was intended.
         unsigned int used = 0;
         g_s12.params->Get("DLSS.Feature.Create.Flags", &used);
-        LogCreateFlags("the synthetic contract's create", used);
-        // The other of the two places a create-flags value reaches NGX. The
-        // mirror publishes its own in BridgeBuildResources; this transport never
-        // goes through that function, so without this line the panel would show
-        // whatever the mirror last sent -- or nothing at all in a session that
-        // never had a mirror.
-        g_panel_flags_from = kFlagsFromLabel[FLAGS_SYNTH];
+        // Which contract this build is for, read off the source rather than
+        // assumed. The VULKAN mirror builds through this same function, so in a
+        // mirror session both lines below said "synthetic" over the game's own
+        // flags: Red Dead Redemption 2's log carries "the synthetic contract's
+        // create flags 43" on every mirror rebuild, and 43 is the game's.
+        const bool for_mirror =
+            InterlockedCompareExchange(&g_source, 0, 0) == SRC_MIRROR;
+        LogCreateFlags(for_mirror ? "the mirrored contract's create"
+                                  : "the synthetic contract's create", used);
+        // The other of the two places a create-flags value reaches NGX. The D3D11
+        // mirror publishes its own in BridgeBuildResources and never comes through
+        // here; the Vulkan mirror does, so the label has to follow the source or
+        // the panel attributes the game's flags to a contract that does not exist.
+        g_panel_flags_from = kFlagsFromLabel[for_mirror ? FLAGS_GAME : FLAGS_SYNTH];
         InterlockedExchange(&g_panel_flags, static_cast<LONG>(used));
     }
 
@@ -1948,31 +2089,100 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     // Nothing retries after one -- the caller clears ready -- so what is left
     // behind is left for the life of the process, and on the shared path that is
     // four committed resources and four NT handles rather than only VRAM.
-    if (!Synth12Begin())
-    { Log("[synth] could not start a command list"); Synth12ReleaseTextures(); return false; }
-    DWORD code = 0;
-    Breadcrumb("creating the D3D12 DLSS feature for the synthetic contract");
-    NVSDK_NGX_Result rf = SafeCreateFeature(g_s12.create_feature, g_s12.list,
-                                            g_s12.params, &g_s12.feature, &code);
-    const UINT64 v = Synth12End();
-
-    // A one-off, so it is waited out rather than pipelined -- but on ReShade's
-    // present thread, so not for long enough to read as a hang.
-    if (g_s12.fence->GetCompletedValue() < v)
+    // NVSDK_NGX_PerfQuality_Value spells DLAA 5, and that member arrived in DLSS
+    // SDK 3.1.13. NGX loads the GAME FOLDER's super-resolution snippet before the
+    // driver's, and a game folder can carry a much older one: Red Dead Redemption
+    // 2 holds nvngx_dlss.dll 2.2.10.0, from 2021, which has no such member and
+    // answers UnsupportedParameter. Replacing that file is not a way out either --
+    // measured on 2026-09-01, the Rockstar launcher re-planted it within six
+    // minutes, before the game had even hooked NGX.
+    //
+    // So the second attempt asks for the same thing in a spelling every DLSS 2.x
+    // understands. The geometry is untouched, and a contract whose render size
+    // equals its output size IS DLAA whatever the enum says -- the ratio is the
+    // request, the value is only how it is named. This does not break copy, don't
+    // invent: 5 is this add-on's own literal with no game-declared value behind
+    // it, so changing which spelling it sends changes nothing the game stated.
+    //
+    // It also DECIDES what two nights of logs could not. Only one attempt differs
+    // from the other, so if the retry succeeds the enum value was the obstacle,
+    // and if it fails identically the 1:1 ratio is. Either answer is written down
+    // rather than guessed at.
+    // The four resource keys, set to the textures just built, BEFORE the create.
+    // Same reason as the D3D11 path: they used to arrive holding the previous
+    // build's freed pointers, clearing them to null fixed that fault and left the
+    // create describing four resources that are null, and a neighbour add-on
+    // captures the contract at the create. These exist by this line and are the
+    // ones the evaluates will name.
+    if (g_s12.params != nullptr)
     {
-        g_s12.fence->SetEventOnCompletion(v, g_s12.event);
-        if (WaitForSingleObject(g_s12.event, 4000) != WAIT_OBJECT_0)
+        g_s12.params->Set("Color",         g_s12.tex[SLOT_COLOR]);
+        g_s12.params->Set("Output",        g_s12.tex[SLOT_OUTPUT]);
+        g_s12.params->Set("Depth",         g_s12.tex[SLOT_DEPTH]);
+        g_s12.params->Set("MotionVectors", g_s12.tex[SLOT_MV]);
+    }
+
+    static const unsigned int kPqDlaa    = 5;
+    static const unsigned int kPqQuality = 2;
+
+    unsigned int pq[2] = { 0, kPqQuality };
+    g_s12.params->Get("PerfQualityValue", &pq[0]);
+    const int attempts = pq[0] == kPqDlaa ? 2 : 1;
+
+    NVSDK_NGX_Result rf = NGX_SUCCESS;
+    DWORD code = 0;
+    for (int a = 0; a < attempts; ++a)
+    {
+        if (a > 0)
         {
-            // The one failure that does NOT hand the textures back. Four seconds
-            // without a fence signal means the GPU never finished the create, so
-            // the textures it was recorded against may still be in flight, and
-            // freeing those is the use after free the wait exists to prevent.
-            // Leaking them is the cheaper of the two mistakes.
-            Log("[synth] feature creation did not complete within 4 s; giving up. The "
-                "textures it was recorded against are left allocated rather than freed "
-                "underneath a GPU that has not finished with them.");
-            return false;
+            Log("[synth] the create was refused as unsupported at PerfQualityValue %u, so "
+                "it is asked once more at %u. The contract is unchanged -- %ux%u in and "
+                "%ux%u out is DLAA by ratio whichever value names it -- and the snippet "
+                "this process hooked is what decides which spelling it knows.",
+                pq[0], pq[a], w, h, out_w, out_h);
+            g_s12.params->Set("PerfQualityValue", pq[a]);
         }
+
+        if (!Synth12Begin())
+        { Log("[synth] could not start a command list"); Synth12ReleaseTextures(); return false; }
+        code = 0;
+        Breadcrumb("creating the D3D12 DLSS feature for the synthetic contract");
+        rf = SafeCreateFeature(g_s12.create_feature, g_s12.list,
+                               g_s12.params, &g_s12.feature, &code);
+        const UINT64 v = Synth12End();
+
+        // A one-off, so it is waited out rather than pipelined -- but on ReShade's
+        // present thread, so not for long enough to read as a hang.
+        {
+            if (!Synth12WaitFence(v, 4000))
+            {
+                // The one failure that does NOT hand the textures back. Four seconds
+                // without a fence signal means the GPU never finished the create, so
+                // the textures it was recorded against may still be in flight, and
+                // freeing those is the use after free the wait exists to prevent.
+                // Leaking them is the cheaper of the two mistakes.
+                Log("[synth] feature creation did not complete within 4 s; giving up. The "
+                    "textures it was recorded against are left allocated rather than freed "
+                    "underneath a GPU that has not finished with them.");
+                return false;
+            }
+        }
+
+        // A fault is never retried: whatever raised it is not a spelling. Nor is a
+        // success, nor any refusal other than the one a missing enum member gives.
+        if (code != 0 || (rf == NGX_SUCCESS && g_s12.feature != nullptr) ||
+            rf != kSynthNoSuchKey)
+            break;
+    }
+
+    if (rf == NGX_SUCCESS && g_s12.feature != nullptr && pq[0] == kPqDlaa)
+    {
+        unsigned int used = 0;
+        g_s12.params->Get("PerfQualityValue", &used);
+        if (used != kPqDlaa)
+            Log("[synth] accepted at PerfQualityValue %u. So the snippet this process "
+                "hooked has no DLAA member, and the 1:1 contract itself was never the "
+                "obstacle -- which is the thing the logs could not decide before.", used);
     }
 
     if (code != 0)
@@ -2004,7 +2214,74 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     if (rf != NGX_SUCCESS || g_s12.feature == nullptr)
     {
         Log("[synth] CreateFeature failed with result 0x%08X, %s", rf, NgxResultName(rf));
+
+        // FeatureNotFound names a missing FILE, and which file is not obvious.
+        // NGX loads the super-resolution snippet, nvngx_dlss.dll, from the
+        // application folder, and a current driver store does not carry one:
+        // measured on 2026-09-01, C:\WINDOWS\System32\DriverStore\FileRepository
+        // holds nvngx_dlssg.dll and _nvngx.dll and no nvngx_dlss.dll at all.
+        //
+        // So a game that ships DLSS brings the file and this works, and a game
+        // with NO DLSS brings nothing -- which is exactly the case the substitute
+        // contract exists for. Reproduced in ngxGym by deleting that one file from
+        // a run folder that still had nvngx_dlssnr.dll: SuperSampling went
+        // unavailable with FeatureInitResult 0xBAD00004.
+        if (rf == static_cast<NVSDK_NGX_Result>(0xBAD00004))
+            Log("[synth]   that result means NGX found no super-resolution snippet to "
+                "load. It takes nvngx_dlss.dll from the folder the executable is in, "
+                "and current drivers do not ship one -- the driver store carries "
+                "nvngx_dlssg.dll for frame generation and nothing for super "
+                "resolution. A game that has DLSS brings the file with it; a game "
+                "that has none brings nothing, so a copy has to be placed beside the "
+                "executable for this contract to be buildable at all. Version 3.1.13 "
+                "or newer, for the same reason the version check at arming gives.");
+        // NGX names no parameter when it answers UnsupportedParameter, so the block
+        // that was handed over is the only evidence there is. Red Dead Redemption 2
+        // on 2026-09-01 returned 0xBAD00010 here and this line was not present, so
+        // the report said only that something in the block was unacceptable.
+        {
+            unsigned int uw = 0, uh = 0, uow = 0, uoh = 0, upq = 0, ufl = 0, usr = 0;
+            g_s12.params->Get("Width", &uw);      g_s12.params->Get("Height", &uh);
+            g_s12.params->Get("OutWidth", &uow);  g_s12.params->Get("OutHeight", &uoh);
+            g_s12.params->Get("PerfQualityValue", &upq);
+            g_s12.params->Get("DLSS.Feature.Create.Flags", &ufl);
+            g_s12.params->Get("DLSS.Enable.Output.Subrects", &usr);
+            // The six values above are read back off the block; the three below
+            // are this side's own state and are labelled as such, because a line
+            // that says "the block it refused" must not mix the two silently.
+            Log("[synth]   the block it refused: %ux%u -> %ux%u, PerfQualityValue %u, "
+                "create flags %u, output subrects %u. This transport: exposure "
+                "texture %s, colour %s, depth %s.",
+                uw, uh, uow, uoh, upq, ufl, usr,
+                g_s12.tex[kExpTex] != nullptr ? "carried" : "not set",
+                FormatName(g_s12.fmt), g_s12.depth_packed ? "packed" : "unpacked");
+            // The same ten keys the evaluate-fault dump prints, because the block
+            // is allocated once per session and never Reset: a mirror's 1800
+            // frames leave their subrect dimensions in it, and a synthetic create
+            // that follows carries them. Whether that matters is exactly what a
+            // reader of the next 0xBAD00010 needs to rule in or out, and until now
+            // it could only be done by re-reading the source.
+            static const char *const stale[] = {
+                "DLSS.Render.Subrect.Dimensions.Width", "DLSS.Render.Subrect.Dimensions.Height",
+                "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+                "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y",
+                "DLSS.Input.MV.Subrect.Base.X",    "DLSS.Input.MV.Subrect.Base.Y",
+                "DLSS.Output.Subrect.Base.X",      "DLSS.Output.Subrect.Base.Y",
+            };
+            for (size_t i = 0; i < _countof(stale); ++i)
+            {
+                unsigned int sv = 0;
+                if (g_s12.params->Get(stale[i], &sv) == NGX_SUCCESS && sv != 0)
+                    Log("[synth]   and still carries: %s = %u", stale[i], sv);
+            }
+        }
         g_s12.feature = nullptr;
+        // The shape is cleared too. It is set before the create can fail, so the
+        // panel printed "3840x1600 in, 3840x1600 out. No upscale: DLAA." over a
+        // contract NGX had just refused. Zero makes it print "No contract yet",
+        // and the rebuild predicate in both transports already tests the feature
+        // pointer first, so the rebuild reason still reads "no feature yet".
+        g_s12.w = 0;
         Synth12ReleaseTextures();
         return false;
     }
@@ -2013,6 +2290,12 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
         g_s12.shared ? "this add-on's own D3D12 device" : "the game's own device",
         w, h, out_w, out_h, static_cast<void *>(g_s12.feature));
     g_s12.need_reset = true;
+    g_s12.build_fails = 0;
+    // ponytail: cleared on ANY successful build, the mirror's included. So a game
+    // toggled off a second time pays three more refused builds before it stops
+    // again. Keying this to the refused shape would avoid that; three builds once
+    // per toggle is not worth the state.
+    g_synth_build_dead = false;
     return true;
 }
 
@@ -2074,7 +2357,7 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
     if (g_s12.feature == nullptr || g_s12.w != w || g_s12.h != h || g_s12.fmt != back_fmt)
     {
         Log("[synth] building the D3D12 feature for %ux%u %s", w, h, FormatName(back_fmt));
-        if (!Synth12Build(sp, w, h, w, h, back_fmt)) { g_s12.ready = false; return; }
+        if (!Synth12Build(sp, w, h, w, h, back_fmt)) { Synth12NoteBuildFailure(true); return; }
     }
 
     // ReShade's own commands for this frame are still sitting in an open list.
@@ -2257,6 +2540,13 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
     ID3D12Resource *const mv_engine = SynthOfaVkMvTexture();
     g_s12.params->Set("MotionVectors", mv_engine != nullptr ? mv_engine
                                                             : g_s12.tex[SLOT_MV]);
+    // Only when this session carries one. It was unconditional for one build, on
+    // the argument that a key set every frame cannot go stale -- true, but it also
+    // introduced the key into every block that had never had it, and the staleness
+    // it guards against is already handled by Synth12ReleaseTextures clearing it
+    // before the texture is freed.
+    if (g_s12.tex[kExpTex] != nullptr)
+        g_s12.params->Set("ExposureTexture", g_s12.tex[kExpTex]);
     Synth12FrameParams(sp);
 
     DWORD code = 0;
@@ -2318,9 +2608,9 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
             };
             for (size_t i = 0; i < _countof(uk); ++i)
             {
-                unsigned int v = 0;
-                if (g_s12.params->Get(uk[i], &v) == NGX_SUCCESS && v != 0)
-                    Log("[synth]   at fault: %s = %u", uk[i], v);
+                unsigned int uv = 0;
+                if (g_s12.params->Get(uk[i], &uv) == NGX_SUCCESS && uv != 0)
+                    Log("[synth]   at fault: %s = %u", uk[i], uv);
             }
             static const char *const fk[] = {
                 "MV.Scale.X", "MV.Scale.Y", "Jitter.Offset.X", "Jitter.Offset.Y",
@@ -2328,9 +2618,9 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
             };
             for (size_t i = 0; i < _countof(fk); ++i)
             {
-                float v = 0.0f;
-                if (g_s12.params->Get(fk[i], &v) == NGX_SUCCESS)
-                    Log("[synth]   at fault: %s = %.6f", fk[i], v);
+                float fv = 0.0f;
+                if (g_s12.params->Get(fk[i], &fv) == NGX_SUCCESS)
+                    Log("[synth]   at fault: %s = %.6f", fk[i], fv);
             }
         }
         g_s12.ready   = false;
@@ -2357,10 +2647,8 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
     // this returns, and Windows resets a device that stops for two seconds -- so
     // the mirror sets a shorter one and gives up inside the TDR window.
     const DWORD budget = g_s12.wait_ms != 0 ? g_s12.wait_ms : 4000;
-    if (g_s12.fence->GetCompletedValue() < v)
     {
-        g_s12.fence->SetEventOnCompletion(v, g_s12.event);
-        if (WaitForSingleObject(g_s12.event, budget) != WAIT_OBJECT_0)
+        if (!Synth12WaitFence(v, budget))
         {
             Log("[synth] the D3D12 evaluate did not complete within %lu ms, so this backend "
                 "stops rather than read a texture the GPU may still be writing.", budget);
@@ -2436,6 +2724,7 @@ static const uint32_t kSVkStImageCreateInfo     = 14;
 static const uint32_t kSVkStImageMemoryBarrier  = 45;
 static const uint32_t kSVkStExternalMemoryImage = 1000072001;   // VK_KHR_external_memory
 static const uint32_t kSVkStImportMemoryWin32   = 1000073000;   // VK_KHR_external_memory_win32
+static const uint32_t kSVkStMemoryWin32Props    = 1000073002;   // ...HANDLE_PROPERTIES_KHR
 static const uint32_t kSVkStMemoryDedicated     = 1000127001;   // promoted into Vulkan 1.1
 static const uint32_t kSVkHandleTypeD3D12Res    = 0x40;         // D3D12_RESOURCE_BIT
 static const uint32_t kSVkImageType2D           = 1;
@@ -2527,6 +2816,18 @@ struct SVkImportMemoryWin32HandleInfoKHR
     LPCWSTR     name;
 };
 
+// What vkGetMemoryWin32HandlePropertiesKHR answers: the memory types an imported
+// handle may be allocated from. The specification requires memoryTypeIndex to be
+// one of these for an import, and the image's own memoryTypeBits is a separate,
+// wider set -- picking from that one alone is what the validation layer reported
+// as VUID-VkMemoryAllocateInfo-memoryTypeIndex-00645.
+struct SVkMemoryWin32HandleProperties
+{
+    uint32_t sType;
+    void    *pNext;
+    uint32_t memoryTypeBits;
+};
+
 struct SVkMemoryAllocateInfo
 {
     uint32_t    sType;
@@ -2573,6 +2874,8 @@ typedef uint32_t(*PFN_SVkCreateImage)(SVkDevice, const SVkImageCreateInfo *, con
 typedef void    (*PFN_SVkDestroyImage)(SVkDevice, SVkHandle, const void *);
 typedef void    (*PFN_SVkGetImageMemoryRequirements)(SVkDevice, SVkHandle, SVkMemoryRequirements *);
 typedef uint32_t(*PFN_SVkAllocateMemory)(SVkDevice, const SVkMemoryAllocateInfo *, const void *, SVkHandle *);
+typedef uint32_t(*PFN_SVkGetMemoryWin32HandleProperties)(SVkDevice, uint32_t, void *,
+                                                        SVkMemoryWin32HandleProperties *);
 typedef void    (*PFN_SVkFreeMemory)(SVkDevice, SVkHandle, const void *);
 typedef uint32_t(*PFN_SVkBindImageMemory)(SVkDevice, SVkHandle, SVkHandle, uint64_t);
 typedef uint32_t(*PFN_SVkCreateBuffer)(SVkDevice, const SVkBufferCreateInfo *, const void *, SVkHandle *);
@@ -2622,6 +2925,7 @@ struct SynthVk
     PFN_SVkDestroyImage                DestroyImage;
     PFN_SVkGetImageMemoryRequirements  GetImageMemoryRequirements;
     PFN_SVkAllocateMemory              AllocateMemory;
+    PFN_SVkGetMemoryWin32HandleProperties GetMemoryWin32HandleProperties;
     PFN_SVkFreeMemory                  FreeMemory;
     PFN_SVkBindImageMemory             BindImageMemory;
     PFN_SVkCreateBuffer                CreateBuffer;
@@ -2641,9 +2945,12 @@ struct SynthVk
     PFN_SVkCmdWaitEvents               CmdWaitEvents;
     PFN_SVkDeviceWaitIdle              DeviceWaitIdle;
 
-    // The same four slots the D3D12 side created, seen from Vulkan.
-    SVkHandle img[SLOT_COUNT];
-    SVkHandle mem[SLOT_COUNT];
+    // The same four slots the D3D12 side created, seen from Vulkan, plus the
+    // exposure mirror at kExpTex. Every loop over these stops at SLOT_COUNT
+    // except SynthVkImport's and SynthVkReleaseImages', which is why the
+    // synthetic path -- which never creates a fifth texture -- is untouched.
+    SVkHandle img[SLOT_COUNT + 1];
+    SVkHandle mem[SLOT_COUNT + 1];
 
     // Depth cannot be copied image to image into anything: vkCmdCopyImage and
     // vkCmdBlitImage both require the two formats to match exactly when either
@@ -2764,7 +3071,10 @@ static void SynthVkReleaseImages()
     // that most needs this is a half-finished import -- which sets ready false
     // on its way out and would otherwise leave every image it did create behind.
     if (g_svk.dev == nullptr || g_svk.DestroyImage == nullptr) return;
-    for (int i = 0; i < SLOT_COUNT; ++i)
+    // SLOT_COUNT + 1: the exposure mirror too. Both entries are zero when this
+    // session never made one, so a synthetic session pays nothing for the extra
+    // turn of the loop.
+    for (int i = 0; i < SLOT_COUNT + 1; ++i)
     {
         if (g_svk.img[i] != 0) { g_svk.DestroyImage(g_svk.dev, g_svk.img[i], nullptr); g_svk.img[i] = 0; }
         if (g_svk.mem[i] != 0) { g_svk.FreeMemory(g_svk.dev, g_svk.mem[i], nullptr);   g_svk.mem[i] = 0; }
@@ -2882,6 +3192,13 @@ static bool SynthVkOpen(reshade::api::effect_runtime *rt)
         return false;
     }
 
+    // From the same extension the gate above just proved, so it is resolved here
+    // rather than in the core list, where a miss is fatal and the message would
+    // say the device was created without a core command.
+    g_svk.GetMemoryWin32HandleProperties =
+        reinterpret_cast<PFN_SVkGetMemoryWin32HandleProperties>(
+            get_proc(g_svk.dev, "vkGetMemoryWin32HandlePropertiesKHR"));
+
     Log("[synth] Vulkan side ready: VkDevice %p, VK_KHR_external_memory_win32 enabled, "
         "VK_KHR_push_descriptor %s, %d entry points resolved out of vulkan-1.dll with no "
         "import of it.", static_cast<void *>(g_svk.dev),
@@ -2898,8 +3215,14 @@ static bool SynthVkOpen(reshade::api::effect_runtime *rt)
 static bool SynthVkImport()
 {
     bool said_memory = false;
-    for (int i = 0; i < SLOT_COUNT; ++i)
+    // The fifth image only when the D3D12 side made one. Everything inside the
+    // loop reads the texture that was actually created, so the exposure mirror
+    // needs no special case: R32_FLOAT goes through SynthVkFormat to
+    // VK_FORMAT_R32_SFLOAT like any other.
+    const int count = g_s12.tex[kExpTex] != nullptr ? SLOT_COUNT + 1 : SLOT_COUNT;
+    for (int i = 0; i < count; ++i)
     {
+        const char *const nm = i < SLOT_COUNT ? kSlotName[i] : "Exposure";
         // Read back off the texture that was actually created rather than
         // recomputed from back_fmt, so a slot whose format was decided elsewhere
         // cannot be imported as something else.
@@ -2911,7 +3234,7 @@ static bool SynthVkImport()
         {
             Log("[synth] %s is %s on the D3D12 side and this add-on has no Vulkan format "
                 "for it, so the import refuses rather than guess one.",
-                kSlotName[i], FormatName(rd.Format));
+                nm, FormatName(rd.Format));
             return false;
         }
 
@@ -2943,7 +3266,7 @@ static bool SynthVkImport()
         if (r != kSVkSuccess)
         {
             Log("[synth] vkCreateImage refused the %ux%u %s image for %s with VkResult %d",
-                w, h, FormatName(rd.Format), kSlotName[i], static_cast<int>(r));
+                w, h, FormatName(rd.Format), nm, static_cast<int>(r));
             return false;
         }
 
@@ -2960,16 +3283,42 @@ static bool SynthVkImport()
         // imported D3D12 memory can live in. The bits and the choice are logged
         // because a report is the only thing that can settle it on a vendor this
         // has not run on.
+        // The intersection of two sets, not one of them. The image's
+        // memoryTypeBits says what the image can bind to; the handle's says what
+        // THIS D3D12 allocation can be imported as, and the specification requires
+        // the index to come from the second. Taking the lowest bit of the first
+        // alone is what the Khronos validation layer reported four times a run as
+        // VUID-VkMemoryAllocateInfo-memoryTypeIndex-00645 -- it happened to work
+        // on this driver, where both sets are 0x3, and is not portable.
+        SVkMemoryWin32HandleProperties hp = {};
+        hp.sType = kSVkStMemoryWin32Props;
+        const uint32_t hr_props = g_svk.GetMemoryWin32HandleProperties != nullptr
+            ? g_svk.GetMemoryWin32HandleProperties(g_svk.dev, kSVkHandleTypeD3D12Res,
+                                                   g_s12.share[i], &hp)
+            : 0xFFFFFFFFu;
+        const uint32_t allowed = hr_props == kSVkSuccess && hp.memoryTypeBits != 0
+                                     ? (req.memoryTypeBits & hp.memoryTypeBits)
+                                     : req.memoryTypeBits;
+        if (allowed == 0)
+        {
+            Log("[synth] no memory type is accepted by both the %s image (0x%08X) and its "
+                "imported D3D12 handle (0x%08X), so the import is refused rather than "
+                "allocated from a type the specification forbids.",
+                nm, req.memoryTypeBits, hp.memoryTypeBits);
+            return false;
+        }
         uint32_t type_index = 0;
         for (uint32_t b = 0; b < 32; ++b)
-            if (req.memoryTypeBits & (1u << b)) { type_index = b; break; }
+            if (allowed & (1u << b)) { type_index = b; break; }
         if (!said_memory)
         {
             said_memory = true;
-            Log("[synth] imported memory: the driver allows types 0x%08X for these images "
-                "and the lowest is taken, index %u. UNVERIFIED on AMD and on Intel -- if "
-                "the import fails or the picture is wrong on one of those, this line is "
-                "the first thing to compare.", req.memoryTypeBits, type_index);
+            Log("[synth] imported memory: the image allows types 0x%08X, the imported "
+                "handle allows 0x%08X (query returned %u), and the lowest of the two "
+                "together is taken, index %u. UNVERIFIED on AMD and on Intel -- if the "
+                "import fails or the picture is wrong on one of those, this line is the "
+                "first thing to compare.",
+                req.memoryTypeBits, hp.memoryTypeBits, hr_props, type_index);
         }
 
         // Mandatory for an imported D3D12 resource: the allocation is that one
@@ -3011,14 +3360,14 @@ static bool SynthVkImport()
                 "VkResult %d. The likeliest cause is that the D3D12 device this add-on "
                 "created is on a different GPU from the one the game renders with, which "
                 "nothing here can see: there is no VkPhysicalDevice to read a LUID off.",
-                kSlotName[i], static_cast<int>(r));
+                nm, static_cast<int>(r));
             return false;
         }
         r = g_svk.BindImageMemory(g_svk.dev, g_svk.img[i], g_svk.mem[i], 0);
         if (r != kSVkSuccess)
         {
             Log("[synth] vkBindImageMemory failed for %s with VkResult %d",
-                kSlotName[i], static_cast<int>(r));
+                nm, static_cast<int>(r));
             return false;
         }
     }
@@ -3061,9 +3410,10 @@ static bool SynthVkImport()
         return false;
     }
 
-    Log("[synth] %d D3D12 textures imported into the game's VkDevice, and a %llu-byte "
+    Log("[synth] %d D3D12 textures imported into the game's VkDevice%s, and a %llu-byte "
         "buffer made for the depth aspect to travel through.",
-        static_cast<int>(SLOT_COUNT), breq.size);
+        count, count > SLOT_COUNT ? " (the fifth is the game's exposure texture)" : "",
+        breq.size);
     return true;
 }
 
@@ -3435,6 +3785,11 @@ static bool SynthOfaVkFrame();
 // source. True once it has opened AND once it has given up, because a session
 // that gave up stops delivering rather than swapping estimator.
 static bool SynthOfaVkIsSource();
+// Whether the engine is running right now, and whether it gave up. IsSource above
+// is true for BOTH, on purpose; these two tell them apart for the one caller that
+// has to. g_ovk is defined far below.
+static bool SynthOfaVkReady();
+static bool SynthOfaVkStopped();
 // Dropped and allowed to open again when the shared textures it aliases are
 // replaced, which is what a resolution or format change does.
 static void SynthOfaVkRebuild();
@@ -3500,7 +3855,7 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
         // submitted still names them. The pipeline, the layout and the sampler
         // survive -- none of them depends on the size.
         SynthDepthCsRelease();
-        if (!Synth12Build(sp, w, h, w, h, back_fmt)) { g_s12.ready = false; return; }
+        if (!Synth12Build(sp, w, h, w, h, back_fmt)) { Synth12NoteBuildFailure(true); return; }
         if (!SynthVkImport()) { SynthVkReleaseImages(); g_svk.ready = false; return; }
     }
 
@@ -3536,15 +3891,35 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     // Stand down instead. The engine gets its next chance on the next frame if it
     // has not given up; if it has, g_ovk.stopped closes the gate above and this
     // session is over.
-    if (!ofa_mv && mv.handle == 0)
+    // Two ways to arrive here without a usable source, and this used to catch only
+    // the first. The engine never opened and there is no ReShade texture either --
+    // or the engine opened, ran, and then STOPPED, which leaves ofa_mv true because
+    // a stopped session must not swap estimator under a feature whose history came
+    // from the other one.
+    //
+    // In that second case the arming gate disagrees with this function: it refuses
+    // the engine on g_ovk.stopped, walks the ReShade names, and hands over a live
+    // motion-vector texture -- which the copy below then skips, because ofa_mv is
+    // true. Every frame did the full round after that, barriers and copies and the
+    // queue idle included, and delivered nothing, silently, while the panel named a
+    // ReShade shader as the source. Standing down is the same decision; doing it out
+    // loud and without the work is the fix.
+    if (!SynthOfaVkReady() && (ofa_mv || mv.handle == 0))
     {
         static bool said = false;
         if (!said)
         {
             said = true;
-            Log("[synth] the driver's optical flow engine has not opened and there is no "
-                "ReShade motion-vector texture either, so nothing is delivered until one "
-                "of the two arrives. The log above says why the engine did not open.");
+            if (SynthOfaVkStopped())
+                Log("[synth] the driver's optical flow engine has stopped, so this "
+                    "transport stops delivering rather than change estimator underneath "
+                    "a feature whose temporal history was built from its vectors. The "
+                    "game keeps rendering on its own.");
+            else
+                Log("[synth] the driver's optical flow engine has not opened and there "
+                    "is no ReShade motion-vector texture either, so nothing is delivered "
+                    "until one of the two arrives. The log above says why the engine did "
+                    "not open.");
         }
         return;
     }
@@ -3809,10 +4184,65 @@ static void SynthLatchSelfCheck()
 // false and gets exactly the function that was here.
 static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
 {
-    if (g_cfg.synth_after <= 0)
-        return "synth_after=0 in dlss5-bridge.cfg";
+    // First, above every other test: once the transport that would carry the frame
+    // has refused this contract, no answer below is the reason any more. It also
+    // stops the two optical-flow pre-gates opening an engine for a contract that
+    // nothing will deliver.
+    if (g_synth_build_dead) return kSynthContractDead;
+
+    // Two questions wear this one key, and only one of them can be answered
+    // without evidence.
+    //
+    // A game whose own DLSS was running and has been switched off is not a
+    // guess. g_release_n counts the episodes where the mirror held the session
+    // and then went quiet for five seconds and thirty presents, which is the
+    // game itself saying it has stopped asking. That case consults no key.
+    //
+    // A game that has simply not called DLSS YET is a guess. It used to be a
+    // second opt-in, synth_after, because on 2026-08-31 arming ten seconds in
+    // and then handing over to the game's own contract raised 0xC0000005 inside
+    // the DLSS 5 add-on. That fault was the parameter block naming four freed
+    // resources at the rebuild, fixed on 2026-09-01 and measured 12 rebuilds out
+    // of 12 -- so the guess now costs what a guess should: one rebuild when the
+    // game does ask, since its own DLSS wins from any state. One switch covers
+    // both cases, and synth_after is only how long the wait is.
+    if (!SynthOptedIn())
+        return "synth=0: a substitute contract is off by default. It is built from "
+               "ReShade's depth and the driver's optical flow, and it looks like it: "
+               "text goes soft and dense foliage smears, because optical flow does not "
+               "know what a glyph or a leaf is. Set synth=1 to allow it";
     if (g_cfg.source != CFG_SRC_SYNTH && g_cfg.source != CFG_SRC_AUTO)
         return "source is not synth or auto";
+
+    // The super-resolution snippet this process actually loaded. NGX takes the
+    // game folder's copy before the driver's, and a game can pin a very old one.
+    //
+    // This contract is DLAA by construction -- its render size equals its output
+    // size -- and DLAA arrived in DLSS SDK 3.1.13. A 2.x runtime has no network
+    // for it, and measured in Red Dead Redemption 2 on 2026-09-01 it does not say
+    // so: the create returned success at PerfQualityValue 5 against 2.2.10.0 and
+    // delivered 1800 frames whose picture degraded progressively into something
+    // unrecognisable. The retry at PerfQualityValue 2 further down never fires
+    // here, because nothing was refused.
+    //
+    // The mirror is unaffected: it copies the game's own value and its ratio is
+    // whatever the game asked for, which is what that runtime was built to serve.
+    {
+        static char ver[64];
+        const int major = SnippetMajorVersion(ver, sizeof(ver));
+        if (major != 0 && major < 3)
+        {
+            static char why[448];
+            _snprintf_s(why, sizeof(why), _TRUNCATE,
+                        "the super-resolution snippet in this process is nvngx_dlss.dll %s, "
+                        "which predates DLAA (DLSS SDK 3.1.13). A substitute contract is DLAA "
+                        "by ratio, that runtime has no network for it and accepts the request "
+                        "anyway, and the picture degrades progressively. Replacing the game "
+                        "folder's nvngx_dlss.dll with 3.1.13 or newer is what makes this "
+                        "usable here; the game's own DLSS is unaffected either way", ver);
+            return why;
+        }
+    }
     if (g_cfg.stage < 3)
         return "stage is below 3, so no evaluate is run at all";
 
@@ -3833,7 +4263,7 @@ static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
     // and that question is settled once. What ends a synthetic session is the
     // mirror latch, not a timer.
     if (InterlockedCompareExchange(&g_source, 0, 0) != SRC_SYNTH &&
-        GetTickCount64() - g_hook_time < static_cast<ULONGLONG>(g_cfg.synth_after) * 1000)
+        GetTickCount64() - g_hook_time < static_cast<ULONGLONG>(SynthAfterSec()) * 1000)
         return "the configured delay has not elapsed";
 
     if (!f->depth_bound)     return "no depth buffer is bound";
@@ -3870,7 +4300,6 @@ static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
     // is still copied, not sampled.
     if (f->device_api == static_cast<uint32_t>(reshade::api::device_api::vulkan))
     {
-        const uint32_t copy_src = static_cast<uint32_t>(reshade::api::resource_usage::copy_source);
         const uint32_t shader_r = static_cast<uint32_t>(reshade::api::resource_usage::shader_resource);
         if ((f->depth_usage & shader_r) == 0)
             return "the Vulkan depth binding was not created as a shader resource, so the "
@@ -4167,6 +4596,14 @@ static void OfaClose()
     if (g_ofa.flow != nullptr) { g_ofa.flow->Release(); g_ofa.flow = nullptr; }
     if (g_ofa.mv   != nullptr) { g_ofa.mv->Release();   g_ofa.mv   = nullptr; }
 
+    // The two compute shaders, which this function did not release. OfaOpen
+    // compiles a fresh pair on every shape change, so each change leaked one of
+    // each -- and a shader holds a reference on the D3D11 device it was compiled
+    // by, so the private device outlived the session that owned it and could not
+    // be reclaimed for the life of the process.
+    if (g_ofa.luma_cs != nullptr) { g_ofa.luma_cs->Release(); g_ofa.luma_cs = nullptr; }
+    if (g_ofa.flow_cs != nullptr) { g_ofa.flow_cs->Release(); g_ofa.flow_cs = nullptr; }
+
     if (g_ofa.session != nullptr)
     {
         auto destroy = reinterpret_cast<PFN_OfaDestroy>(g_ofa.slot[7]);
@@ -4223,7 +4660,16 @@ static bool OfaMakeShader(ID3D11Device *dev11, const char *src, const char *name
 // saturate and the estimator then has nothing to lock onto in exactly the bright
 // regions that carry the most detail. Reinhard is monotone, so nothing it
 // matches on is reordered.
-static const char kOfaLumaSrc[] =
+// Split in two so the middle line can be chosen from the back buffer format.
+//
+// The engine's input surface is B8G8R8A8_UNORM -- eight bits of luma. The
+// Reinhard curve l/(l+1) was written for a float back buffer that can exceed
+// 1.0, where compressing the range is the only way to get it into eight bits at
+// all. Applied to a UNORM buffer, whose luma is already in [0,1], it maps that
+// range onto [0,0.5] and hands the estimator seven bits instead of eight, for
+// nothing. Red Dead Redemption 2 and Baldur's Gate 3 both present
+// R10G10B10A2_UNORM, so both were paying it, and so is every 8-bit SDR title.
+static const char kOfaLumaHead[] =
     "Texture2D<float4>   src : register(t0);\n"
     "RWTexture2D<float4> dst : register(u0);\n"
     "[numthreads(8,8,1)]\n"
@@ -4232,8 +4678,10 @@ static const char kOfaLumaSrc[] =
     "    uint w, h; dst.GetDimensions(w, h);\n"
     "    if (id.x >= w || id.y >= h) return;\n"
     "    float3 c = src[id.xy].rgb;\n"
-    "    float  l = dot(c, float3(0.2126, 0.7152, 0.0722));\n"
-    "    l = l / (l + 1.0);\n"
+    "    float  l = dot(c, float3(0.2126, 0.7152, 0.0722));\n";
+static const char kOfaLumaTonemap[] = "    l = l / (l + 1.0);\n";
+static const char kOfaLumaClamp[]   = "    l = saturate(l);\n";
+static const char kOfaLumaTail[] =
     "    dst[id.xy] = float4(l, l, l, 1.0);\n"
     "}\n";
 
@@ -4304,6 +4752,18 @@ static bool OfaOpen(ID3D11Device *dev11, ID3D11DeviceContext *ctx, UINT w, UINT 
     g_ofa.tried = true;
     g_ofa.w = w; g_ofa.h = h; g_ofa.back_fmt = back_fmt; g_ofa.dev = dev11;
     g_ofa.grid = static_cast<UINT>(g_cfg.ofa_grid);
+    // Validated where it is divided by rather than only where it is set. Every
+    // caller checks for zero before getting here, and that is exactly the kind of
+    // agreement that a later caller breaks silently: the two divisions below turn a
+    // zero into an integer divide fault, which takes the game with it rather than
+    // refusing. The config parser accepts 0 as "engine off", so this value reaches
+    // the function from a user's file and from a panel click.
+    if (g_ofa.grid == 0)
+    {
+        Log("[synth] optical flow: ofa_grid is 0, which switches the engine off, so "
+            "the session is not opened. The motion vectors come from a ReShade effect.");
+        return false;
+    }
 
     if (g_ofa.lib == nullptr)
     {
@@ -4353,7 +4813,18 @@ static bool OfaOpen(ID3D11Device *dev11, ID3D11DeviceContext *ctx, UINT w, UINT 
         }
     }
 
-    if (!OfaMakeShader(dev11, kOfaLumaSrc, "ofaluma", &g_ofa.luma_cs)) return false;
+    {
+        const bool hdrish = SynthFormatCanExceedOne(back_fmt);
+        char luma[sizeof(kOfaLumaHead) + sizeof(kOfaLumaTonemap) + sizeof(kOfaLumaTail) + 8];
+        _snprintf_s(luma, sizeof(luma), _TRUNCATE, "%s%s%s", kOfaLumaHead,
+                    hdrish ? kOfaLumaTonemap : kOfaLumaClamp, kOfaLumaTail);
+        if (!OfaMakeShader(dev11, luma, "ofaluma", &g_ofa.luma_cs)) return false;
+        Log("[synth] optical flow: luma is %s, because the back buffer is %s.",
+            hdrish ? "tone-mapped with l/(l+1) before the 8-bit conversion"
+                   : "clamped rather than tone-mapped, so all eight bits of the "
+                     "engine's input carry signal",
+            FormatName(back_fmt));
+    }
     if (!OfaMakeShader(dev11, kOfaFlowSrc, "ofaflow", &g_ofa.flow_cs)) return false;
 
     const UINT fw = (w + g_ofa.grid - 1) / g_ofa.grid;
@@ -4576,6 +5047,9 @@ static void OfaSelfCheck(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 
     int   sampled = 0, bad = 0, nonzero = 0;
     float worst = 0.0f;
+    // How far past its own tolerance the worst offender was, so a real defect
+    // report carries a number that is not confusable with rounding.
+    float worst_over = 0.0f;
     int   bx = 0, by = 0, bfx = 0, bfy = 0;
     float bex = 0.0f, bey = 0.0f, bax = 0.0f, bay = 0.0f;
 
@@ -4604,14 +5078,34 @@ static void OfaSelfCheck(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             const float ay = DirectX::PackedVector::XMConvertHalfToFloat(mrow[px * 2 + 1]);
 
             // Compared in PIXELS, which is the unit a reader of the log can act
-            // on. 0.02 px is generous against half-float rounding -- about 5e-4
-            // px at these magnitudes -- and still catches every way this can be
-            // wrong: a missing /32 errs by 32x, a wrong grid ratio picks another
-            // cell's vector entirely, a Y flip errs by twice the value, and a
-            // shader that never ran leaves zeros.
+            // on. The tolerance has to scale, and the flat 0.02 px it used to be
+            // was below the storage precision:
+            //
+            // The texture holds the vector in UV, in half-float. Half has a
+            // 10-bit mantissa, so the step between representable values at
+            // magnitude m is about m * 2^-10 -- and multiplied back by the axis
+            // that is (m * axis) * 2^-10, which is a PIXEL magnitude times 2^-10.
+            // At 36.5 px one step is 0.0293 px, larger than the 0.02 px this
+            // compared against. Measured in Red Dead Redemption 2 on 2026-09-01:
+            // expected -36.500 px, stored -36.475 px, a difference of 0.025 px
+            // that is less than one representable step -- and the log reported a
+            // DEFECT, told the user the image would smear, and blamed this
+            // add-on for arithmetic that was exact.
+            //
+            // The comment that justified 0.02 said rounding was "about 5e-4 px at
+            // these magnitudes", which is the relative precision without the
+            // multiplication back into pixels.
+            //
+            // 2^-9 rather than 2^-10 leaves one step of headroom, and still
+            // catches every way this can be wrong: a missing /32 errs by 32x, a
+            // wrong grid ratio picks another cell's vector entirely, a Y flip
+            // errs by twice the value, and a shader that never ran leaves zeros.
             const float dx = fabsf(ax - ex) * static_cast<float>(g_ofa.w);
             const float dy = fabsf(ay - ey) * static_cast<float>(g_ofa.h);
             const float d  = dx > dy ? dx : dy;
+            const float mx = fabsf(ex) * static_cast<float>(g_ofa.w);
+            const float my = fabsf(ey) * static_cast<float>(g_ofa.h);
+            const float tol = 0.02f + (mx > my ? mx : my) * (1.0f / 512.0f);
             ++sampled;
             if (d > worst)
             {
@@ -4621,7 +5115,8 @@ static void OfaSelfCheck(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
                 bex = ex * static_cast<float>(g_ofa.w); bey = ey * static_cast<float>(g_ofa.h);
                 bax = ax * static_cast<float>(g_ofa.w); bay = ay * static_cast<float>(g_ofa.h);
             }
-            if (d > 0.02f) ++bad;
+            if (d > tol) ++bad;
+            if (d > tol && d > worst_over) worst_over = d - tol;
         }
     }
 
@@ -4661,9 +5156,10 @@ static void OfaSelfCheck(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         // scale.
         Log("[synth] DEFECT: the optical flow conversion disagrees with its own input at "
             "cell (%d,%d): flow (%+d,%+d) is %+.3f,%+.3f px, and the motion vector texture "
-            "holds %+.3f,%+.3f px. %d of %d cells sampled disagree by more than 0.02 px. "
-            "The image will smear; this is a defect in this add-on and not in the estimator.",
-            bx, by, bfx, bfy, bex, bey, bax, bay, bad, sampled);
+            "holds %+.3f,%+.3f px. %d of %d cells sampled disagree by more than their own "
+            "storage precision, the worst by %.3f px beyond it. The image will smear; this "
+            "is a defect in this add-on and not in the estimator.",
+            bx, by, bfx, bfy, bex, bey, bax, bay, bad, sampled, worst_over);
 }
 
 // One frame. Returns true when out holds a motion vector texture NGX may read.
@@ -4793,8 +5289,21 @@ static bool OfaFrameOn(ID3D11Device *dev11, ID3D11DeviceContext *ctx,
                     g_ofa.frames, r, OfaStatusName(r), msg);
             }
             // This frame is not delivered and the game's own frame goes to screen
-            // untouched. primed and the previous frame are kept, so the next
-            // frame retries.
+            // untouched.
+            //
+            // The slot still advances, and it has to. The luma dispatch above has
+            // ALREADY written this frame into src[cur], destroying what was there --
+            // so the frame this comment used to call "the previous frame, kept" is
+            // gone whatever happens next. Leaving cur alone made the following
+            // frame overwrite src[cur] again and compare against a reference two
+            // frames old, reporting two frames of motion as one. Advancing it
+            // costs the one comparison that was already lost and puts the next
+            // pair back in step.
+            //
+            // Never fired in the sessions measured so far -- Red Dead Redemption 2
+            // delivered 1800 frames out of 1800 with no refusal -- so this is a
+            // defect found by reading rather than one seen.
+            g_ofa.cur ^= 1;
             if (++g_ofa.fails >= 3)
             {
                 Log("[synth] optical flow: three consecutive failures, so this stops. No "
@@ -5038,10 +5547,19 @@ static ID3D12Resource *SynthOfaVkMvTexture() { return g_ovk.mv12; }
 static ID3D11Device   *SynthOfaVkDevice()    { return g_ovk.dev; }
 
 static bool SynthOfaVkIsSource() { return g_ovk.ready || g_ovk.stopped; }
+static bool SynthOfaVkReady()    { return g_ovk.ready; }
+static bool SynthOfaVkStopped()  { return g_ovk.stopped; }
 
 static void SynthOfaVkClose()
 {
-    // D3D12 aliases first, then the NT handles, then the D3D11 textures that own
+    // The GPU first. color12 and mv12 are D3D12 resources on the private device,
+    // and the last command list submitted there names them -- D3D12 keeps no
+    // reference to what a submitted list names, so releasing before the fence has
+    // reached that submission is a use after free. Every other teardown on this
+    // device drains first; this one did not.
+    Synth12WaitFence(g_s12.fence_value, 4000);
+
+    // Then D3D12 aliases, then the NT handles, then the D3D11 textures that own
     // the memory. Releasing the owner while the other device still holds a view
     // of it is the one ordering that is wrong here.
     if (g_ovk.color12 != nullptr) { g_ovk.color12->Release(); g_ovk.color12 = nullptr; }
@@ -5054,6 +5572,61 @@ static void SynthOfaVkClose()
     if (g_ovk.ctx   != nullptr) { g_ovk.ctx->Release();   g_ovk.ctx   = nullptr; }
     if (g_ovk.dev   != nullptr) { g_ovk.dev->Release();   g_ovk.dev   = nullptr; }
     g_ovk.ready = false;
+}
+
+// Everything this add-on put on the GAME'S VkDevice, released because that device
+// is about to be destroyed. Called from ReShade's destroy_effect_runtime, which is
+// the last moment the device is still valid.
+//
+// Not the same as SynthVkReleaseImages: that one is the per-rebuild teardown and
+// leaves the session able to import again. This ends it.
+//
+// The Khronos validation layer reported what its absence cost, in as many words:
+// "vkDestroyDevice(): VkDevice has 14 leaked objects that have not been destroyed",
+// and the fourteen are this side's -- four VkImages, their memory, and the buffer
+// the depth aspect travels through. The same shutdown recorded 0xC0000005 with this
+// add-on last doing "running the D3D12 evaluate", which is the worker still inside
+// a frame while the device under it goes away.
+//
+// The optical flow engine goes too: its D3D11 aliases are opened over shared handles
+// the private D3D12 side owns, and left to DllMain they would be torn down against a
+// device the game destroyed long before.
+//
+// dev is cleared LAST, and deliberately: every release above is gated on it, so a
+// second call becomes a no-op rather than a use-after-free.
+static void SynthVkShutdownForDevice()
+{
+    if (g_svk.dev == nullptr) return;
+
+    // A breadcrumb per step. The first crash on this path was reported under one set
+    // three seconds earlier, on a completely different function, because nothing here
+    // updated it -- and a fault attributed to the wrong place is worse than one
+    // attributed to nowhere.
+    Breadcrumb("shutdown: waiting the game's Vulkan queue idle");
+    if (g_svk.DeviceWaitIdle != nullptr) g_svk.DeviceWaitIdle(g_svk.dev);
+
+    Breadcrumb("shutdown: closing the optical flow session");
+    SynthOfaVkClose();
+    Breadcrumb("shutdown: releasing the depth compute");
+    SynthDepthCsRelease();
+    Breadcrumb("shutdown: destroying the imported Vulkan images");
+    SynthVkReleaseImages();
+    Breadcrumb("shutdown: releasing the private D3D12 textures and feature");
+    Synth12ReleaseTextures();
+    Breadcrumb("shutdown: done");
+
+    g_svk.ready = false;
+    g_svk.dev   = nullptr;
+    // The one-shot guard at the top of SynthVkOpen goes with the device it was
+    // set for. Left standing, it made every reopen return false without a word:
+    // ReShade destroys and recreates its effect runtime on any swapchain change,
+    // so the first resize or mode toggle in a Vulkan game retired the transport
+    // for the session -- silently, because tried short-circuits before any log
+    // line. Measured in ngxGym on 2026-09-01.
+    //
+    // It stays one-way WITHIN a device: a transport that refused once is not
+    // retried every frame. This only says a new device gets a new attempt.
+    g_svk.tried = false;
 }
 
 // Torn down and allowed to open again, which is what a resolution change needs:
@@ -5163,7 +5736,15 @@ static bool SynthOfaVkOpen(UINT w, UINT h, DXGI_FORMAT back_fmt)
 
     // Loaded, never linked, for the same reason vulkan-1.dll and d3d12.dll are:
     // this add-on must still load in a process with none of them.
-    g_ovk.lib = LoadLibraryW(L"d3d11.dll");
+    //
+    // ONCE. This ran on every open, and SynthOfaVkClose frees no library, so the
+    // module's reference count grew by one per rebuild -- and the engine rebuilds
+    // on a resolution change, a grid change and a display-mode change, which is
+    // several times in an ordinary session. It is never freed on purpose: the
+    // private D3D11 device created from it may still be alive when the last
+    // session closes, and unloading d3d11.dll under a live device is worse than
+    // holding one reference for the life of the process.
+    if (g_ovk.lib == nullptr) g_ovk.lib = LoadLibraryW(L"d3d11.dll");
     auto create = g_ovk.lib != nullptr
         ? reinterpret_cast<PFN_D3D11CreateDevice_>(GetProcAddress(g_ovk.lib, "D3D11CreateDevice"))
         : nullptr;
@@ -5299,10 +5880,8 @@ static bool SynthOfaVkFrame()
         g_s12.list->ResourceBarrier(2, rb);
 
         const UINT64 v = Synth12End();
-        if (g_s12.fence->GetCompletedValue() < v)
         {
-            g_s12.fence->SetEventOnCompletion(v, g_s12.event);
-            if (WaitForSingleObject(g_s12.event, 4000) != WAIT_OBJECT_0)
+            if (!Synth12WaitFence(v, 4000))
             {
                 Log("[synth] optical flow: the colour copy into the engine's texture did "
                     "not complete within 4 s, so the engine is not run on it. Nothing is "
@@ -5381,12 +5960,12 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     // The config, on every synthetic transport rather than only on D3D11, and
     // ABOVE every test that reads it. BridgeFrameInner's call is reached from
     // the mirror detour and from the D3D11 arm at the bottom of this function,
-    // so a D3D12 or Vulkan session -- and any session that has not armed yet,
-    // which with the shipped synth_after=0 is every session -- read this file
-    // once at attach and never again. Below SynthArmRefusal this call could
-    // never lift the refusal that was keeping it from being reached: ticking
-    // the panel's own "add DLAA" box wrote synth_after=10 into a file nothing
-    // would then read, for the rest of the session. Rate limited inside; on the
+    // so a D3D12 or Vulkan session -- and any session that has not armed yet --
+    // read this file once at attach and never again. Below SynthArmRefusal this
+    // call could
+    // never lift the refusal that was keeping it from being reached: a source
+    // set to auto in a file nothing would then read stayed unread for the rest
+    // of the session. Rate limited inside; on the
     // D3D11 transport BridgeFrameInner's own call finds the gate closed and
     // does nothing.
     //
@@ -5414,6 +5993,18 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
         why = "the motion vector binding did not resolve to a texture";
     if (why != nullptr)
     {
+        // The synthetic claim is given back HERE, and only for this one reason, on
+        // the present thread -- which is the only writer of SRC_SYNTH and SRC_NONE.
+        // Keyed on the POINTER and not on "any refusal": the depth binding really
+        // does flap as generic_depth swaps its backup, and dropping the latch on
+        // that would re-arm the delay test above -- the Skyrim Special Edition bug
+        // its own comment describes. Compare-and-swap, so this can only ever
+        // release the claim and never take it.
+        if (why == kSynthContractDead)
+        {
+            InterlockedCompareExchange(&g_source, SRC_NONE, SRC_SYNTH);
+            g_synth_delivering = false;
+        }
         // SynthArmRefusal derives this sentence and nothing was saying it, so a
         // user who set synth_after and got nothing had every test in
         // SynthArmRefusal to guess between -- and a report whose verdict can
@@ -5421,16 +6012,16 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
         // while a different test -- the delay, or the game's own DLSS -- is what
         // is holding it.
         //
-        // Only once the user has opted in: synth_after=0 is the shipped default
-        // and its refusal is the file saying it is switched off, which is not
-        // news in the nine titles that will never turn it on.
+        // Said in every session. It used to be withheld unless the user had set
+        // synth_after, which made the one configuration that most needed to
+        // explain itself -- the default one -- the only silent one.
         //
         // On change rather than once, because the reason moves as the session
         // does. The compare is on the pointer: every string here is a literal
         // returned from that one function, so identity is the reason and the
         // text is only how it reads.
         static const char *said;
-        if (g_cfg.synth_after > 0 && why != said)
+        if (why != said)
         {
             said = why;
             Log("[synth] not delivering: %s.", why);
@@ -5505,6 +6096,17 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     if (!g_synth_armed_said)
     {
         g_synth_armed_said = true;
+        // What it is, before what it does. A user who reaches this has switched on
+        // a substitute and is entitled to know it is a substitute -- two titles
+        // were reported looking wrong under it before the key existed, and both
+        // reports were of the technique working as well as it can.
+        Log("[synth] NOTE: this is a SUBSTITUTE DLSS contract, not the game's own. Its "
+            "motion vectors come from the NVIDIA driver's optical flow and its depth "
+            "from ReShade, so it is measurably worse than real DLSS: optical flow does "
+            "not know what a glyph or a leaf is, so text goes soft and dense foliage "
+            "smears. Red Dead Redemption 2 looks like it is melting under it; Baldur's "
+            "Gate 3 holds its geometry and loses its text. That is the technique rather "
+            "than a fault. Set synth=0 in dlss5-bridge.cfg to switch it off.");
         // "since this add-on started" is not always the window, and the counter is
         // not D3D11's alone -- the Vulkan create increments it too. After a source
         // latch release the question is what the game has done SINCE the release,
@@ -5512,7 +6114,7 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
         Log("[synth] arming. The configured %d s delay has passed, no NGX create and no "
             "evaluate has come from the game since %s, source=%s allows it, and every "
             "precondition in the report above holds.",
-            g_cfg.synth_after,
+            SynthAfterSec(),
             InterlockedCompareExchange(&g_release_n, 0, 0) != 0
                 ? "the source latch was released" : "this add-on started",
             kCfgSourceName[g_cfg.source]);
@@ -5686,7 +6288,7 @@ static ULONGLONG g_synth_last_print;
 // This was SynthArmRefusal's return pointer, which was wrong twice over and is
 // recorded here because the mistake is an easy one to make again. That function
 // short-circuits on configuration before it looks at a single measured fact, so
-// under the shipped synth_after=0 it returns the same literal all session and
+// under a configuration that refuses it returns the same literal all session and
 // the comparison was constant-true -- an unconditional thirty-second gag on a
 // report that is supposed to speak the moment the story changes. And it is not
 // the verdict anyway: SynthReport computes its own from depth_ok/mv_ok/aside and
@@ -5912,13 +6514,25 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
         // bounded window (kVkmIdleMs), so by construction the worker is parked on
         // its wake event before anything here writes.
         //
-        // The config pair repeats the first two tests of SynthArmRefusal on
-        // purpose: without it a mirror-only session -- the shipped synth_after=0
-        // -- would release, gain nothing, and pay a rebuild hitch after every
-        // loading screen. If those tests ever move, this is the other copy.
+        // Two tests repeat SynthArmRefusal's on purpose. Without the source one a
+        // session pinned to the mirror would release, gain nothing, and pay a
+        // rebuild hitch after every loading screen. If either moves, this is the
+        // other copy.
+        //
+        // SynthOptedIn is the second, and it was deliberately absent here until
+        // 2026-09-01: by the time this runs the game has demonstrably had DLSS and
+        // stopped calling it, so nothing is being taken from anybody and the delay
+        // that exists to decide whether a game has DLSS is already answered. That
+        // reasoning is about safety and it is still correct. It is the wrong
+        // question. Measured in two titles: Red Dead Redemption 2 melts under the
+        // substitute contract and Baldur's Gate 3 keeps its geometry and loses its
+        // text. A user who switches DLSS off in a menu has not asked to be handed
+        // that instead, so now they have to.
+        //
+        // synth_after is still NOT repeated here: it is the delay for a game that
+        // has never asked, and this path has watched one ask and stop.
         if (InterlockedCompareExchange(&g_source, 0, 0) == SRC_MIRROR &&
-            now - quiet_since >= 5000 && quiet_ticks >= 30 &&
-            g_cfg.synth_after > 0 &&
+            now - quiet_since >= 5000 && quiet_ticks >= 30 && SynthOptedIn() &&
             (g_cfg.source == CFG_SRC_SYNTH || g_cfg.source == CFG_SRC_AUTO) &&
             g_reshade_api >= kSynthApiFloor)
         {
@@ -5926,9 +6540,7 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
             // and the first D3D11 user to switch DLSS off in a settings menu found
             // what that meant: the panel kept saying Mirror and nothing was
             // delivered, because arming needs SRC_NONE and nothing put it back.
-            // The undo is the same two fields on either transport, and the nine
-            // shipped titles cannot reach this at all -- it needs synth_after
-            // above 0, and 0 is the shipped default.
+            // The undo is the same two fields on either transport.
             reshade::api::device *d = rt->get_device();
             const bool releasable =
                 d != nullptr &&
@@ -6378,13 +6990,10 @@ static void PanelLine(_Printf_format_string_ const char *fmt, ...)
 // to be unique across the whole window -- "auto" appears in three groups. The
 // ## suffix is ImGui's own way to say that: everything after it is identity and
 // is not displayed.
-static const char *kPanelSrcNames[]  = { "auto##src", "mirror only##src",
-                                         "synthetic only##src" };
-static const int   kPanelSrcValues[] = { CFG_SRC_AUTO, CFG_SRC_MIRROR, CFG_SRC_SYNTH };
-static const char *kPanelGridNames[] = { "off (worse)##grid", "1 finest##grid",
-                                         "2 recommended##grid", "4 cheapest##grid" };
+static const char *kPanelGridNames[] = { "off##grid", "fine##grid",
+                                         "normal##grid", "low##grid" };
 static const int   kPanelGridValues[]= { 0, 1, 2, 4 };
-static const char *kPanelPerfNames[] = { "SLOW##perf", "MEDIUM##perf", "FAST##perf" };
+static const char *kPanelPerfNames[] = { "careful##perf", "normal##perf", "fast##perf" };
 static const int   kPanelPerfValues[]= { 5, 10, 20 };
 static const char *kPanelMvxNames[]  = { "auto##mvx", "+1##mvx", "-1##mvx" };
 static const char *kPanelMvyNames[]  = { "auto##mvy", "+1##mvy", "-1##mvy" };
@@ -6498,6 +7107,11 @@ static void PanelNonDefault(char *out, size_t n)
         { "dred",        g_cfg.dred,        1 },
         { "skip_exe",    g_cfg.skip_exe,    1 },
         { "unwrap",      g_cfg.unwrap,      1 },
+        // Both halves of the substitute opt-in. It changes what is on screen more
+        // than anything else in this table, so a report that omitted it was
+        // omitting the first thing to ask about.
+        { "synth",       g_cfg.synth,       0 },
+        { "synth_after", g_cfg.synth_after, 0 },
     };
     out[0] = 0;
     for (size_t i = 0; i < _countof(t); ++i)
@@ -6524,6 +7138,11 @@ static void PanelNonDefault(char *out, size_t n)
 // present on either would turn a diagnostic into a stall -- and no resource
 // pointer is dereferenced. The two pointers read at all, g_bridge.feature and
 // g_s12.feature, are compared against null and never followed.
+// Defined in vkmirror.inc, which is included after this file. The panel is the
+// one place that has to know: g_source stays SRC_MIRROR after a stand-down, so
+// without this the overlay reports a live mirror over a dead one.
+bool VkmStoodDown();
+
 static void OnPanelDraw(reshade::api::effect_runtime *rt)
 {
     const PanelImGui *ui = g_panel_gui;
@@ -6531,7 +7150,6 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
 
     const LONG src     = InterlockedCompareExchange(&g_source, 0, 0);
     const LONG releases = InterlockedCompareExchange(&g_release_n, 0, 0);
-    const LONG creates = InterlockedCompareExchange(&g_create_count, 0, 0);
     const LONG evals   = InterlockedCompareExchange(&g_eval_count, 0, 0);
     const LONG out     = InterlockedCompareExchange(&g_frames_delivered, 0, 0);
     const LONG flags   = InterlockedCompareExchange(&g_panel_flags, 0, 0);
@@ -6567,11 +7185,10 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     // The two are deliberately separate -- g_cfg is the file, g_ofa is the
     // engine, and a setting written this frame is in the first and not yet in
     // the second, which is a state the panel has to be able to show.
-    const int  c_source = g_cfg.source, c_after = g_cfg.synth_after;
+    const int  c_synth  = g_cfg.synth;
     const int  c_grid   = g_cfg.ofa_grid, c_perf = g_cfg.ofa_perf;
     const int  c_mvx    = g_cfg.mv_sign_x, c_mvy = g_cfg.mv_sign_y;
     const UINT o_w = g_ofa.w, o_h = g_ofa.h, o_grid = g_ofa.grid;
-    const int  o_perf   = g_ofa.perf;
     // The frequency is asked of the OS rather than read from g_bridge, which sets
     // it only inside TimingTick -- the D3D11 bridge's per-frame timing, which
     // never runs on a Vulkan session. The ticks and the frame count ARE written
@@ -6587,9 +7204,8 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
     // What the widgets are bound to. Never &g_cfg.anything: RadioButton2 and
     // Checkbox write through the pointer they are given, and the panel writes
     // the file, not the struct.
-    int  w_source = c_source, w_grid = c_grid, w_perf = c_perf;
+    int  w_grid = c_grid, w_perf = c_perf;
     int  w_mvx = c_mvx, w_mvy = c_mvy;
-    bool w_after = c_after > 0;
 
     // Whether there is a file to write at all. When the folder was never
     // writable CfgWriteDefault failed at attach, CfgReload has been returning on
@@ -6660,291 +7276,202 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
                           (dev_api == static_cast<uint32_t>(reshade::api::device_api::d3d11) ||
                            dev_api == static_cast<uint32_t>(reshade::api::device_api::vulkan));
 
-    ui->SeparatorText("source");
+    ui->SeparatorText("DLSS");
     if (src == SRC_MIRROR)
     {
-        // Which of the two it is, from the predicate the delivery path itself uses.
-        // This said "forwarded untouched" unconditionally, which is false under the
-        // shipped skip_game=1: there the game's own evaluate is suppressed because
-        // this add-on's result replaces it.
-        if (BridgeWillDeliver())
-            PanelLine("Mirror. The game's own DLSS is suppressed, because this add-on's "
-                      "result replaces it (skip_game=1). %ld creates, %ld evaluates.",
-                      creates, evals);
+        // g_source stays SRC_MIRROR after a stand-down and g_eval_count keeps
+        // rising on the game's own evaluates, so a dead mirror must be named as
+        // dead rather than reported as a live one with a growing count.
+        if (VkmStoodDown())
+            PanelLine("Stopped. The game's own DLSS is on screen and correct; nothing "
+                      "is added any more. The log says why.");
         else
-            PanelLine("Mirror. The game's own DLSS, forwarded untouched. %ld creates, "
-                      "%ld evaluates.", creates, evals);
-        PanelLine("Full quality: the engine's own jitter, motion vectors and upscaling "
-                  "ratio.");
+            PanelLine("Using the game's own DLSS. Full quality.");
+        PanelLine("%ld frames from the game so far.", evals);
     }
     else if (src == SRC_SYNTH)
     {
-        // "has no DLSS" and "its DLSS is switched off" are different sentences
-        // and the user can tell them apart; after a release only the second one
-        // is true.
         PanelLine(releases > 0
-            ? "Synthetic. The game's own DLSS is switched off, so this add-on builds one."
-            : "Synthetic. The game has no DLSS, so this add-on builds one.");
-        PanelLine("Reconstructed from the finished frame, so below what a game's own DLSS "
-                  "gives.");
-        PanelLine("DLAA: same resolution in and out. It stabilises, it does not upscale.");
+            ? "Using the built-in replacement: the game switched its own DLSS off."
+            : "Using the built-in replacement: the game has no DLSS of its own.");
+        PanelLine("Lower quality than a game's own DLSS. Same resolution in and out.");
     }
     else
     {
-        // The one sentence the delivery path itself refuses on, asked here of a
-        // copy of the same measurement. Restating those tests in this file is
-        // exactly the drift the panel exists to remove.
-        // It returns null when every precondition holds and the delivery still
-        // bailed later -- a render target of a size nothing was measured against,
-        // or a Vulkan image that cannot be copied. Those are logged and they
-        // persist, so the panel must not print "(null)" for the rest of the
-        // session.
-        const char *why = SynthArmRefusal(&facts, false);
-        // Without this the panel says "not running" and leaves the reason to a
-        // log the user is not reading: the game's own DLSS is off, and turning
-        // it back on is the whole fix.
         if (releases > 0)
-            PanelLine("The game's own DLSS is switched off right now; it was on earlier "
-                      "this session. Turning it back on takes the mirror back immediately.");
-        PanelLine("Not running: %s.",
-                  why != nullptr ? why : "the frame was refused later; the log says why");
+            PanelLine("Waiting: the game switched its DLSS off. Turning it back on "
+                      "resumes at once.");
+        else
+            PanelLine("Waiting for the game to use DLSS.");
+        // The reason, only when a replacement was asked for and is not coming.
+        // With the box off the reason IS the box, and this panel used to say it
+        // twice, three lines each.
+        if (SynthOptedIn())
+        {
+            const char *why = SynthArmRefusal(&facts, false);
+            const char *w = why != nullptr ? why : "refused later; the log says why";
+            char brief[120];
+            size_t n = 0;
+            while (w[n] != 0 && w[n] != '.' && n < sizeof(brief) - 1) ++n;
+            memcpy(brief, w, n);
+            brief[n] = 0;
+            PanelLine("No replacement yet: %s.", brief);
+        }
     }
 
-    // The two launch settings, next to the line that reports what they decided.
-    // Live whenever no source holds the session -- before the first DLSS call, and
-    // again after SynthReleaseLatch hands it back. While one holds it, a source
-    // change can only be a request for the next launch. off is not offered --
-    // SynthRegisterEvents refuses outright on source=off, so the click could not
-    // be undone without restarting the game, and the line below names the file.
-    //
-    // With no writable file there is no control to draw at all, so the reason
-    // stands in their place rather than being buried in diagnostics.
+    // One switch. It used to be a three-way radio and two checkboxes that
+    // described one decision three ways, and a reader could not tell what
+    // happened with none of them ticked. Drawn whenever the file is writable:
+    // the game's own DLSS wins from any state, so turning this on while the
+    // mirror holds the session changes nothing until the game stops asking.
     if (!cfg_writable)
     {
-        PanelLine("No dlss5-bridge.cfg beside this add-on: nothing here can be saved.");
-    }
-    else if (src == SRC_NONE)
-    {
-        if (PanelRadioRow("Source", &w_source, kPanelSrcNames, kPanelSrcValues, 3))
-            PanelSet("source", w_source, kCfgSourceName[w_source]);
-        PanelLine("auto: the game's own DLSS first, synthetic only if it never asks.");
-        PanelLine("Switch off entirely with source=off in dlss5-bridge.cfg.");
-        PanelReceipt("source", c_source);
-
-        // A checkbox, not a seconds spinner: the number's only job is "long
-        // enough to be sure the game has no DLSS of its own". The seconds stay a
-        // file edit, and the line below prints whatever the file holds.
-        if (ui->Checkbox("Add DLAA to a game that has no DLSS of its own", &w_after))
-            PanelSet("synth_after", w_after ? 10 : 0, nullptr);
-        if (c_after > 0)
-            PanelLine("Waits %d s for the game's own DLSS, then builds one.", c_after);
-        PanelReceipt("synth_after", c_after);
+        PanelLine("Settings cannot be saved: no dlss5-bridge.cfg beside this add-on.");
     }
     else
     {
-        PanelLine("dlss5-bridge.cfg: source=%s, synth_after=%d. Change it there, "
-                  "before launch.", kCfgSourceName[c_source], c_after);
+        bool w_synth = SynthOptedIn();
+        if (ui->Checkbox("Replace DLSS when the game isn't using its own", &w_synth))
+            PanelSet("synth", w_synth ? 1 : 0, nullptr);
+        PanelLine(w_synth
+            ? "On. Lower quality than the game's own DLSS: text softens, foliage smears."
+            : "Off. Only the game's own DLSS is used; nothing is added.");
+        PanelReceipt("synth", c_synth);
     }
 
-    // Never on the mirror: optical flow does not run there. Drawn before the
-    // source has latched too, because that is the state a first-time user is in
-    // and the settings still apply to it.
-    if (src == SRC_SYNTH || src == SRC_NONE)
+    // Never on the mirror: the game supplies its own motion. Drawn before the
+    // source has latched too, because that is where a first-time user is.
+    if (src != SRC_MIRROR)
     {
-        ui->SeparatorText("motion vectors");
+        ui->SeparatorText("Motion (replacement only)");
 
-        // Which of the two providers is running is the largest single
-        // determinant of image quality on this path, so it is stated with its
-        // quality rather than as a neutral name. The drift line is drawn only on
-        // the engine: the shader path has its own, worse symptom named above it.
         if (src == SRC_SYNTH)
         {
             if (facts.mv_which == 0)
-            {
-                PanelLine("Motion vectors: the driver's optical flow engine. Sub-pixel "
-                          "accurate.");
-                PanelLine("Fine detail still drifts slightly under very slow motion. No "
-                          "setting removes it.");
-            }
+                PanelLine("NVIDIA optical flow. Sharp; a slight drift when almost still.");
             else if (facts.mv_which > 0 &&
                      facts.mv_which < static_cast<int>(_countof(kSynthMv)))
-            {
-                PanelLine("Motion vectors: the ReShade shader %s -- the lower-quality "
-                          "source.", kSynthMv[facts.mv_which].name);
-                // The half-resolution, no-sub-pixel mechanism was measured of
-                // vort_Motion.fx and of nothing else; kSynthMv[2] and [3] are a
-                // texture name each, with no estimator behind them this add-on
-                // has measured. So the symptom is said for all three and the
-                // mechanism only where it was seen.
-                if (facts.mv_which == 1)
-                    PanelLine("Half resolution, no sub-pixel: fine detail smears under "
-                              "slow camera motion.");
-                else
-                    PanelLine("Fine detail smears under slow camera motion.");
-            }
+                PanelLine("ReShade shader %s. Fine detail smears in slow motion.",
+                          kSynthMv[facts.mv_which].name);
             else
-                PanelLine("No motion-vector source found.");
+                PanelLine("No motion source found.");
         }
 
-        // The engine, not the file. A setting written this frame is in g_cfg and
-        // not yet here, and this line is what makes that two-stage adoption
-        // visible without any machinery for it.
+        // The engine as it is running, not the file: a setting written this
+        // frame is in g_cfg and not yet here, and this line is what shows that.
         if (!ofa_here)
         {
             if (dev_api_known)
-                PanelLine("The driver's optical flow engine is not wired on a D3D12 "
-                          "runtime, so it cannot run here.");
+                PanelLine("Optical flow is not available on D3D12.");
         }
         else if (o_ready)
-            PanelLine("Optical flow: grid %u, %s, %ux%u vectors.",
-                      o_grid, SynthPerfName(o_perf),
-                      o_grid != 0 ? (o_w + o_grid - 1) / o_grid : 0,
-                      o_grid != 0 ? (o_h + o_grid - 1) / o_grid : 0);
-        else if (c_grid == 0)
-            PanelLine("Optical flow off: ofa_grid=0. Set detail to 2 to use the driver's "
-                      "engine.");
-        else if (o_stopped || o_tried)
-            PanelLine("Optical flow did not run this session; the log says why.");
-        else
-            PanelLine("Optical flow opens on the first synthetic frame.");
-
-        // TimingTick zeroes both counters every 600 frames, so this is a rolling
-        // window and the line says so rather than implying a lifetime average.
-        if (ofa_here && o_ready)
         {
+            const UINT vx = o_grid != 0 ? (o_w + o_grid - 1) / o_grid : 0;
+            const UINT vy = o_grid != 0 ? (o_h + o_grid - 1) / o_grid : 0;
             if (f_frames != 0 && f_qpf != 0)
-                PanelLine("Cost: %.2f ms per frame, over the last %llu frames.",
-                          1000.0 * double(f_ticks) / double(f_qpf) / double(f_frames),
-                          f_frames);
+                PanelLine("Optical flow: %ux%u vectors, %.2f ms per frame.", vx, vy,
+                          1000.0 * double(f_ticks) / double(f_qpf) / double(f_frames));
             else
-                PanelLine("Cost: not measured yet.");
+                PanelLine("Optical flow: %ux%u vectors.", vx, vy);
         }
+        else if (c_grid == 0)
+            PanelLine("Optical flow is off. Set Detail to normal to use it.");
+        else if (o_stopped || o_tried)
+            PanelLine("Optical flow did not start; the log says why.");
+        else
+            PanelLine("Optical flow starts with the first replaced frame.");
 
-        // Radios rather than a slider: every legal value is whitelisted in
-        // CfgReload, and a slider would let a user select ofa_grid=3, which the
-        // validator silently rejects -- the panel would then show a value the
-        // add-on is not using.
+        // Radios, not sliders: every legal value is whitelisted in CfgReload and
+        // a slider could select one the validator silently rejects.
         if (ofa_here && cfg_writable)
         {
             if (PanelRadioRow("Detail", &w_grid, kPanelGridNames, kPanelGridValues, 4))
                 PanelSet("ofa_grid", w_grid, nullptr);
-            if (PanelRadioRow("Effort", &w_perf, kPanelPerfNames, kPanelPerfValues, 3))
+            if (PanelRadioRow("Speed ", &w_perf, kPanelPerfNames, kPanelPerfValues, 3))
                 PanelSet("ofa_perf", w_perf, nullptr);
-            // The two settings multiply, so neither can be judged alone and one
-            // help line is shared. Nothing measured in a real session says a user
-            // should move either: FAST and MEDIUM were indistinguishable, and the
-            // drift they would be reached for is structural.
-            PanelLine("Defaults are right for almost everyone. Changing either reopens the "
-                      "flow session.");
+            PanelLine("The defaults suit almost everyone.");
             PanelReceipt("ofa_grid", c_grid);
             PanelReceipt("ofa_perf", c_perf);
         }
-        else if (ofa_here)
-        {
-            // Only reachable with no writable file, which is also the only way
-            // g_cfg can be anything but the built-in defaults -- so naming the
-            // file here would contradict the line in the source section that
-            // says there is none.
-            PanelLine("Built-in defaults: ofa_grid=%d, ofa_perf=%s.",
-                      c_grid, SynthPerfName(c_perf));
-        }
 
-        // The forced sign is applied whatever the provider is, index 0 included,
-        // and the engine's direction is a measurement rather than a convention --
-        // so while it is running there is no control, only the pair it resolved
-        // to and which of the two it is.
+        // While the engine runs there is no control, only what it resolved to.
         if (o_ready)
-        {
-            PanelLine("Motion vector direction: %+d,%+d, %s.",
+            PanelLine("Direction %+d,%+d, %s.",
                       c_mvx != 0 ? c_mvx : kSynthMv[0].sign_x,
                       c_mvy != 0 ? c_mvy : kSynthMv[0].sign_y,
-                      (c_mvx != 0 || c_mvy != 0)
-                          ? "forced by mv_sign_x/mv_sign_y in dlss5-bridge.cfg"
-                          : "measured");
-        }
+                      (c_mvx != 0 || c_mvy != 0) ? "set by hand" : "measured");
         else if (cfg_writable)
         {
-            if (PanelRadioRow("Flip X", &w_mvx, kPanelMvxNames, kPanelMvValues, 3))
+            if (PanelRadioRow("Direction X", &w_mvx, kPanelMvxNames, kPanelMvValues, 3))
                 PanelSet("mv_sign_x", w_mvx, nullptr);
-            if (PanelRadioRow("Flip Y", &w_mvy, kPanelMvyNames, kPanelMvValues, 3))
+            if (PanelRadioRow("Direction Y", &w_mvy, kPanelMvyNames, kPanelMvValues, 3))
                 PanelSet("mv_sign_y", w_mvy, nullptr);
-            PanelLine("Leave on auto. Flip an axis if the picture smears that way.");
+            PanelLine("Leave on auto. Flip an axis only if the picture smears that way.");
             PanelReceipt("mv_sign_x", c_mvx);
             PanelReceipt("mv_sign_y", c_mvy);
         }
-        else
-        {
-            PanelLine("Built-in defaults: mv_sign_x=%d, mv_sign_y=%d.", c_mvx, c_mvy);
-        }
     }
 
-    ui->SeparatorText("session");
-    // Asked of the runtime rather than taken off the last measurement, because
-    // the measurement only happens when synthesis is switched on. Before the
-    // latch there is no transport to name, so that half is not printed.
+    ui->SeparatorText("Session");
+    // Which block holds this session's numbers is decided by the TRANSPORT: the
+    // Vulkan mirror runs through the shared D3D12 path and never writes g_bridge.
     if (!dev_api_known)
-        PanelLine("Runtime: unknown (add-on API %u).", g_reshade_api);
-    else if (src == SRC_NONE)
-        PanelLine("Runtime: %s.", SynthApiName(dev_api));
-    else
-        PanelLine("Runtime: %s. Transport: %s.", SynthApiName(dev_api),
-                  dev_api == static_cast<uint32_t>(reshade::api::device_api::d3d11)
-                      ? "D3D11 to this add-on's D3D12 device"
-                      : dev_api == static_cast<uint32_t>(reshade::api::device_api::vulkan)
-                          ? "Vulkan, imported D3D12 textures"
-                          : "D3D12, no copy");
-
-    if (on_s12 && s_w != 0)
-        PanelLine("%ux%u in, %ux%u out.%s", s_w, s_h,
+        PanelLine("Runtime unknown (add-on API %u).", g_reshade_api);
+    else if (on_s12 && s_w != 0)
+        PanelLine("%s. %ux%u in, %ux%u out%s.", SynthApiName(dev_api), s_w, s_h,
                   s_ow != 0 ? s_ow : s_w, s_oh != 0 ? s_oh : s_h,
-                  (s_ow == s_w && s_oh == s_h) ? " No upscale: DLAA." : "");
+                  (s_ow == s_w && s_oh == s_h) ? " (no upscale)" : "");
     else if (!on_s12 && b_frame)
-        PanelLine("%ux%u in, %ux%u out; %ux%u rendered into %ux%u.",
-                  b_w, b_h, b_ow, b_oh, b_rw, b_rh, b_nw, b_nh);
+        PanelLine("%s. %ux%u in, %ux%u out.", SynthApiName(dev_api), b_rw, b_rh, b_nw, b_nh);
     else
-        PanelLine("No contract yet.");
-
-    if (on_s12)
-        PanelLine("D3D12 session: %s, feature %s.",
-                  s_ready ? (s_shared ? "open on this add-on's own device"
-                                      : "open on the game's own device")
-                          : s_tried ? "failed, not retried" : "not opened yet",
-                  s_feature ? "created" : "none");
-    else
-        PanelLine("D3D12 session: %s, feature %s.",
-                  b_disabled ? "failed, not retried"
-                             : b_session ? "open on this add-on's own device"
-                                         : "not opened yet",
-                  b_feature ? "created" : "none");
+        PanelLine("%s. No DLSS yet.", SynthApiName(dev_api));
 
     {
-        // Whether frames are still arriving, not only how many have. Two
-        // file-statics, updated here and read nowhere else.
+        // Whether frames are still arriving, not only how many have.
         const ULONGLONG now_t = GetTickCount64();
         if (out != g_panel_last_out) { g_panel_last_out = out; g_panel_last_out_tick = now_t; }
         if (out == 0)
             PanelLine("No frames delivered yet.");
         else if (now_t - g_panel_last_out_tick <= 2000)
-            PanelLine("%ld frames delivered, still arriving.", out);
+            PanelLine("%ld frames delivered, live.", out);
         else
-            PanelLine("%ld delivered, none for %llu s.",
+            PanelLine("%ld frames delivered; none for %llu s.",
                       out, (now_t - g_panel_last_out_tick) / 1000);
     }
 
-    // Not gated: this one describes the picture the user is looking at right
-    // now, and it is silent when nothing is off its default.
+    // Silent when nothing is off its default.
     char nondefault[384];
     PanelNonDefault(nondefault, sizeof(nondefault));
     if (nondefault[0] != 0)
-        PanelLine("Non-default keys: %s. Image problems may be these.", nondefault);
+        PanelLine("Changed settings: %s. Picture problems may be these.", nondefault);
 
-    // Everything a bug report needs and a running session does not. A checkbox
-    // rather than a header, because Checkbox is already one of the six ordinals.
-    ui->Checkbox("Diagnostics", &g_panel_diag);
+    // Everything a bug report needs and a running session does not.
+    ui->Checkbox("Details", &g_panel_diag);
     if (g_panel_diag)
     {
         PanelLine("dlss5-bridge %s, built %s, add-on API %u.",
                   BRIDGE_VERSION, __DATE__, g_reshade_api);
+        if (dev_api_known && (src == SRC_SYNTH || src == SRC_MIRROR))
+            PanelLine("Transport: %s.",
+                      dev_api == static_cast<uint32_t>(reshade::api::device_api::d3d11)
+                          ? "D3D11 to this add-on's D3D12 device"
+                          : dev_api == static_cast<uint32_t>(reshade::api::device_api::vulkan)
+                              ? "Vulkan, imported D3D12 textures"
+                              : "D3D12, no copy");
+        if (on_s12)
+            PanelLine("D3D12 session: %s, feature %s.",
+                      s_ready ? (s_shared ? "open on this add-on's own device"
+                                          : "open on the game's own device")
+                              : s_tried ? "failed, not retried" : "not opened yet",
+                      s_feature ? "created" : "none");
+        else
+            PanelLine("D3D12 session: %s, feature %s.",
+                      b_disabled ? "failed, not retried"
+                                 : b_session ? "open on this add-on's own device"
+                                             : "not opened yet",
+                      b_feature ? "created" : "none");
+        if (!on_s12 && b_frame)
+            PanelLine("Textures %ux%u in, %ux%u out.", b_w, b_h, b_ow, b_oh);
         if (flags >= 0)
         {
             char names[192];
@@ -6956,11 +7483,6 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
             PanelLine("Config: %s", cfg_path);
         if (g_panel_addons[0] != 0)
         {
-            // Straight through: TextUnformatted takes the embedded newlines, so
-            // there is nothing to split and no per-line loop to get wrong. This
-            // add-on matches its own *.addon* scan, so the list always holds at
-            // least itself and this is where a user sees whether the DLSS 5
-            // add-on is present beside it.
             PanelLine("Add-ons in this folder:");
             ui->TextUnformatted(g_panel_addons, nullptr);
         }

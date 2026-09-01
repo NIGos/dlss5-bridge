@@ -3,8 +3,8 @@
 // ReShade reads the add-on's version from here and shows it in its overlay, so
 // a bug report can name the exact build instead of describing it.
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    1,3,0,0
- PRODUCTVERSION 1,3,0,0
+ FILEVERSION    1,4,0,0
+ PRODUCTVERSION 1,4,0,0
  FILEOS         VOS_NT_WINDOWS32
  FILETYPE       VFT_DLL
 BEGIN
@@ -13,11 +13,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription",  "DLSS 5 Bridge"
-            VALUE "FileVersion",      "1.3.0.0"
+            VALUE "FileVersion",      "1.4.0.0"
             VALUE "InternalName",     "dlss5-bridge"
             VALUE "OriginalFilename", "dlss5-bridge.addon64"
             VALUE "ProductName",      "DLSS 5 Bridge"
-            VALUE "ProductVersion",   "1.3.0.0"
+            VALUE "ProductVersion",   "1.4.0.0"
         END
     END
     BLOCK "VarFileInfo"
