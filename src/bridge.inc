@@ -1004,12 +1004,30 @@ static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
 {
     *code = 0;
     HRESULT hr = E_FAIL;
-    __try { hr = fn(ad, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-                    reinterpret_cast<void **>(out)); }
-    __except (CaptureFault(GetExceptionInformation()))
-    { *code = GetExceptionCode(); return E_FAIL; }
+    // The highest feature level the adapter grants, 12_1 down to 11_0. The
+    // device used to ask for 11_0 outright, which every NVIDIA driver serves
+    // identically -- the level is a floor, not a mode -- but a D3D12 runtime
+    // that is not NVIDIA's can gate capabilities on it: vkd3d-proton under
+    // Proton faulted inside the neural add-on's evaluate on this device while
+    // the same add-on ran for hours on a game's own 12_x device (#22). Which
+    // level was granted is logged, so a report carries it.
+    static const D3D_FEATURE_LEVEL kLevels[] = { D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_0 };
+    D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_0;
+    for (size_t i = 0; i < _countof(kLevels) && (FAILED(hr) || *out == nullptr); ++i)
+    {
+        got = kLevels[i];
+        __try { hr = fn(ad, kLevels[i], __uuidof(ID3D12Device),
+                        reinterpret_cast<void **>(out)); }
+        __except (CaptureFault(GetExceptionInformation()))
+        { *code = GetExceptionCode(); return E_FAIL; }
+    }
 
-    if (SUCCEEDED(hr) && *out != nullptr) { MaybeUnwrap(out); LogAddonBases(); }
+    if (SUCCEEDED(hr) && *out != nullptr)
+    {
+        Log("[bridge] D3D12 device created at feature level %d_%d.", (got >> 12) & 0xF, (got >> 8) & 0xF);
+        MaybeUnwrap(out);
+        LogAddonBases();
+    }
     return hr;
 }
 
