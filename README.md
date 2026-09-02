@@ -1,10 +1,13 @@
 # DLSS 5 Bridge
 
-A ReShade add-on that lets a DLSS 5 Neural Rendering add-on run in games it
-cannot reach on its own: DirectX 11 games, Vulkan games, and games with no DLSS
-at all. The neural add-on hooks the DirectX 12 NGX entry points; this bridge
-gives it a DirectX 12 session to hook, fed from the game's own DLSS contract or
-from a substitute one.
+**DLSS 5 Neural Rendering for DirectX 11 games, Vulkan games, and games that
+have no DLSS at all.**
+
+A ReShade add-on. The DLSS 5 neural rendering add-on only works where a game
+runs DLSS on DirectX 12. This bridge gives it that: it mirrors a DirectX 11 or
+Vulkan game's own DLSS onto a private DirectX 12 session, and for a game
+without DLSS it can build a substitute one from ReShade's depth and the
+driver's motion vectors. Nothing in the game is modified.
 
 If it is useful to you, you can help cover the AI tooling used in its
 development:
