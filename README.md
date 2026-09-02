@@ -230,6 +230,10 @@ own. It never leaves a broken frame on screen deliberately.
   change on their own, as IsHDR does when a game switches HDR on. On Vulkan a
   display change also recreates ReShade's runtime; the mirror and the
   substitute both follow it.
+- **A result smaller than the texture holding it** is written at 0,0 and the
+  rest of the texture is left alone, which is what the game's own DLSS does
+  with the same block. Games padded for dynamic resolution allocate this way;
+  the game's own evaluate is not skipped on those frames.
 - Verbose logging is always on.
 
 ## Related

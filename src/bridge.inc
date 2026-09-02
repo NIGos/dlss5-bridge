@@ -3507,23 +3507,40 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // halves people see. The subrect origins this bridge copies all read zero,
     // so there is nothing to place the region by. Stand aside and let the game
     // render that screen itself.
+    // A result smaller than the texture holding it. The bridge used to stand
+    // aside here, because its copy back was a whole-texture copy: the region
+    // came back right and the rest of the game's texture came back as whatever
+    // the bridge's own output held, which on Gallipoli's map screen was the
+    // "two halves" people saw. The copy back is now the region alone, at 0,0,
+    // which is exactly what the game's own DLSS writes for the same block -- the
+    // subrect origins in every block seen so far read zero, and a game whose
+    // region sat elsewhere would have its own DLSS writing to the wrong place
+    // too. Delivering is therefore no worse than the game, and the stand-aside
+    // was what left House Party (#8, pull request #9) with no neural rendering
+    // in any gameplay scene: its allocations are padded for dynamic resolution,
+    // 5120x2048 for a 5120x1440 display, so every frame was "partial".
     const bool partial = (gow != d[SLOT_OUTPUT].Width) || (goh != d[SLOT_OUTPUT].Height);
     g_bridge.partial_output = partial;
-    if (partial)
+    // Only for the game's own contract. The substitute's block is written by
+    // this add-on from the back buffer it saw last, so a mismatch there is one
+    // stale frame across a resize, not a region: delivering it built a
+    // 1920x1080 feature over 3072x1728 textures and NGX refused three times in
+    // a row, which is the disable threshold. Measured in ngxGym, synth-modes.
+    if (partial && InterlockedCompareExchange(&g_source, 0, 0) == SRC_SYNTH)
     {
-        if (!g_bridge.partial_reported)
-        {
-            g_bridge.partial_reported = true;
-            Log("[bridge] the game asks for a %ux%u result inside a %ux%u texture, so "
-                "it is drawing into part of it. Filling only that part would leave "
-                "the rest of the frame stale, and where the region sits is not in "
-                "the parameters. The game renders these frames itself.",
-                gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
-        }
         g_bridge.frame_ready = false;
         for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
         dev11->Release();
         return;
+    }
+    if (partial && !g_bridge.partial_reported)
+    {
+        g_bridge.partial_reported = true;
+        Log("[bridge] the game asks for a %ux%u result inside a %ux%u texture. The "
+            "region at 0,0 is written and the rest of the texture left as it is, "
+            "which is what the game's own DLSS does with the same block. The game's "
+            "own evaluate is not skipped on these frames.",
+            gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
     }
 
     bool shape_changed = (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
@@ -3861,7 +3878,20 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             g_bridge.frame_ready = false;
         }
 
-        if (mode == 2)      ctx->CopyResource(g[SLOT_OUTPUT], g_bridge.tex11[SLOT_OUTPUT]);
+        if (mode == 2)
+        {
+            if (g_bridge.partial_output)
+            {
+                // The region only. See the note above the partial test.
+                D3D11_BOX box = { 0, 0, 0,
+                                  g_bridge.ngx_out_w < d[SLOT_OUTPUT].Width  ? g_bridge.ngx_out_w : d[SLOT_OUTPUT].Width,
+                                  g_bridge.ngx_out_h < d[SLOT_OUTPUT].Height ? g_bridge.ngx_out_h : d[SLOT_OUTPUT].Height,
+                                  1 };
+                ctx->CopySubresourceRegion(g[SLOT_OUTPUT], 0, 0, 0, 0, g_bridge.tex11[SLOT_OUTPUT], 0, &box);
+            }
+            else
+                ctx->CopyResource(g[SLOT_OUTPUT], g_bridge.tex11[SLOT_OUTPUT]);
+        }
         else if (mode == 1) ctx->CopyResource(g[SLOT_OUTPUT], g_bridge.tex11[SLOT_COLOR]);
         // mode 0 writes nothing back
 
