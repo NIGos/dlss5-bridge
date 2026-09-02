@@ -589,9 +589,28 @@ static bool WriteCode(void *dst, const void *src, size_t len)
     return true;
 }
 
+static const void *DetourTargetOf(const BYTE *p);
+static bool        JumpsInsideOwnModule(const BYTE *p);
+
 static bool HookInstall(Hook &h, void *target, void *detour)
 {
-    h.target = static_cast<BYTE *>(target);
+    // An export that is a 5-byte jmp into its own module is one entry of a
+    // thunk table, and the entries beside it are the module's own internal
+    // calls. The 14-byte patch below overwrote the two after it: Pathologic 3's
+    // NVUnityPlugin.DLL then faulted at +0x43C2, the thunk right after
+    // NVSDK_NGX_VULKAN_EvaluateFeature at +0x43BD, the first time the game's
+    // own code went through it (#15, 2026-09-02). The hook goes where the thunk
+    // goes instead: an ordinary function with an ordinary prologue.
+    BYTE *at = static_cast<BYTE *>(target);
+    for (int hop = 0; hop < 4 && at[0] == 0xE9 && JumpsInsideOwnModule(at); ++hop)
+    {
+        const void *next = DetourTargetOf(at);
+        if (next == nullptr) break;
+        Log("    %p is a thunk table entry; the hook goes to its destination %p so the "
+            "patch does not overwrite the entries beside it.", at, next);
+        at = static_cast<BYTE *>(const_cast<void *>(next));
+    }
+    h.target = at;
     memcpy(h.saved, h.target, sizeof(h.saved));
 
     // jmp qword ptr [rip+0]; <8-byte absolute address>
