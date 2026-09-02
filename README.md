@@ -7,7 +7,6 @@ gives it a DirectX 12 session to hook, fed from the game's own DLSS contract or
 from a substitute one.
 
 If it is useful to you, you can help cover the AI tooling used in its
-If it is useful to you, you can help cover the AI tooling used in its
 development:
 
 [![Support on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/nigos)
