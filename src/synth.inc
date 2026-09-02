@@ -2456,6 +2456,13 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
             "frames; the private device's removed reason is 0x%08X. This backend stops "
             "here. The game keeps rendering on its own.",
             code, InterlockedCompareExchange(&g_frames_delivered, 0, 0), removed);
+        {
+            // The module and offset, as the create path has printed since 1.3.0.
+            // An evaluate fault swallowed here never reached the crash filter,
+            // so a report carried the code and nothing else (#22).
+            wchar_t who[MAX_PATH + 64] = {};
+            if (NameFaultOwner(who, _countof(who))) Log("[bridge]   it faulted in %ls", who);
+        }
         // Named for the create failure already and never for this one, which is
         // the gap: "inside a snippet" and "inside the D3D12 runtime" are different
         // reports, and the faulting address tells them apart for free.
@@ -2586,6 +2593,13 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
             "frames; the private device's removed reason is 0x%08X. This backend stops "
             "here. The game keeps rendering on its own.",
             code, InterlockedCompareExchange(&g_frames_delivered, 0, 0), removed);
+        {
+            // The module and offset, as the create path has printed since 1.3.0.
+            // An evaluate fault swallowed here never reached the crash filter,
+            // so a report carried the code and nothing else (#22).
+            wchar_t who[MAX_PATH + 64] = {};
+            if (NameFaultOwner(who, _countof(who))) Log("[bridge]   it faulted in %ls", who);
+        }
         {
             wchar_t who[MAX_PATH + 64] = {};
             if (NameFaultOwner(who, _countof(who)))

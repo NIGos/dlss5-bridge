@@ -1302,6 +1302,33 @@ static const char *NgxResultName(NVSDK_NGX_Result r);
 // Defined below the include; bridge.inc calls it when the D3D12 session opens.
 static void WarnIfOldCopyLoaded();
 
+// Every add-on beside this one that is loaded right now, with its base. The
+// inventory at attach prints a base only for add-ons ReShade had already
+// loaded, and it loads them in name order, so anything after "dlss5" has none
+// there. A game's own crash log names addresses inside those modules (#22),
+// and without a base nobody can turn them into offsets. Printed when the
+// private D3D12 device is created, by which time every add-on is in.
+static void LogAddonBases()
+{
+    wchar_t dir[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, dir, MAX_PATH);
+    wchar_t *sl = wcsrchr(dir, L'\\');
+    if (sl == nullptr) return;
+    *(sl + 1) = 0;
+    wchar_t pattern[MAX_PATH];
+    _snwprintf_s(pattern, _TRUNCATE, L"%ls*.addon*", dir);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    Log("[bridge] add-ons loaded at this point, with their bases:");
+    do
+    {
+        HMODULE m = GetModuleHandleW(fd.cFileName);
+        if (m != nullptr) Log("[bridge]   %ls at %p", fd.cFileName, static_cast<void *>(m));
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
 // Set by the add-on inventory at attach, read where the private D3D12 device is
 // created. True when the DLSS 5 add-on beside us is a build measured to need
 // ReShade's proxy around that device -- see kKnownConsumers.

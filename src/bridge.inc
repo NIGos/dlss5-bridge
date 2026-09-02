@@ -1009,7 +1009,7 @@ static HRESULT SafeCreateDevice(PFN_D3D12CreateDevice_ fn, IDXGIAdapter *ad,
     __except (CaptureFault(GetExceptionInformation()))
     { *code = GetExceptionCode(); return E_FAIL; }
 
-    if (SUCCEEDED(hr) && *out != nullptr) MaybeUnwrap(out);
+    if (SUCCEEDED(hr) && *out != nullptr) { MaybeUnwrap(out); LogAddonBases(); }
     return hr;
 }
 
@@ -3705,6 +3705,13 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         // trustworthy. Retrying would likely take the game down, so stop here
         // and let it render on its own.
         Log("[bridge] evaluate raised exception 0x%08X -- disabling to protect the game", code);
+        {
+            // The module and offset, as the create path has printed since 1.3.0.
+            // An evaluate fault swallowed here never reached the crash filter,
+            // so a report carried the code and nothing else (#22).
+            wchar_t who[MAX_PATH + 64] = {};
+            if (NameFaultOwner(who, _countof(who))) Log("[bridge]   it faulted in %ls", who);
+        }
         BridgeDisable("NGX raised an exception inside the D3D12 evaluate");
     }
     else if (re != NGX_SUCCESS)
