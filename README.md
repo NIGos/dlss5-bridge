@@ -80,6 +80,14 @@ replaces the file with its own defaults on first run and says so in the log;
 the same version never touches it. `# dlss5-bridge keep` as the first line
 keeps a file across versions.
 
+**Games without DLSS.** The substitute contract needs three files beside the
+game's executable that such a game does not bring: the DLSS 5 add-on and its
+`nvngx_dlssnr.dll`, and a **`nvngx_dlss.dll` of version 3.1.13 or newer**,
+copied by hand from any game that has DLSS. The NVIDIA driver does not supply
+that file, and NGX looks for it only in the executable's folder. Then turn on
+the panel switch, or set `synth=1`. If the file is missing, the panel and the
+log say so and name it.
+
 **Upgrading from 1.1.0 or earlier:** the files were called
 `dlss5-dx11-bridge.addon64` and `dlss5-dx11-bridge.cfg`. Delete the old
 `.addon64` — ReShade loads both, and the older one ends up on screen. The old

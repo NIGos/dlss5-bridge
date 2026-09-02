@@ -4242,6 +4242,28 @@ static const char *SynthArmRefusal(const SynthFacts *f, bool ignore_mv)
                         "usable here; the game's own DLSS is unaffected either way", ver);
             return why;
         }
+        // No snippet loaded yet, which is every game without DLSS before the
+        // first create. NGX loads nvngx_dlss.dll from the executable's folder
+        // and the driver store carries none (measured 2026-09-01: nvngx_dlssg
+        // for frame generation, nothing for super resolution), so a folder
+        // without the file cannot build the contract at all. Said here, before
+        // the create, so the panel and the log name the file to copy rather
+        // than reporting FeatureNotFound after the fact. The first sentence
+        // stands alone: the panel prints up to the first full stop.
+        if (major == 0)
+        {
+            static wchar_t snippet[MAX_PATH] = {};
+            if (snippet[0] == 0)
+            {
+                GetModuleFileNameW(nullptr, snippet, MAX_PATH);
+                wchar_t *sl = wcsrchr(snippet, L'\\');
+                if (sl != nullptr) wcscpy_s(sl + 1, MAX_PATH - (sl + 1 - snippet), L"nvngx_dlss.dll");
+            }
+            if (GetFileAttributesW(snippet) == INVALID_FILE_ATTRIBUTES)
+                return "no nvngx_dlss.dll beside the game's executable, so the replacement "
+                       "cannot be built. Copy one, 3.1.13 or newer, from any game that has "
+                       "DLSS into that folder; the NVIDIA driver does not carry it";
+        }
     }
     if (g_cfg.stage < 3)
         return "stage is below 3, so no evaluate is run at all";
