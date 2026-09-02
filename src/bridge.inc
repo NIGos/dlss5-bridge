@@ -1544,6 +1544,78 @@ static void BridgeHashOutput(UINT64 fence_value)
         for (UINT64 i = 0; i < row_bytes; ++i)
         { hash ^= row[i]; hash *= 1099511628211ull; }
     }
+
+    // The mean of each channel, decoded per format, and the luma of the means.
+    // The hash answers "did anything change"; this answers "by how much, in
+    // brightness" -- a neural pass that overexposes an HDR frame moves this by
+    // a factor while the hash only says it moved (#10). Decoded for the four
+    // formats a swapchain is likely to be; anything else prints no mean.
+    {
+        double sum[3] = { 0, 0, 0 };
+        UINT64 n = 0;
+        const DXGI_FORMAT f = rd.Format;
+        auto half = [](unsigned short v) -> float {
+            const unsigned s = (v >> 15) & 1, e = (v >> 10) & 0x1F, m = v & 0x3FF;
+            float out;
+            if (e == 0)       out = static_cast<float>(m) / 1024.0f / 16384.0f;
+            else if (e == 31) out = m ? 0.0f : 65504.0f;
+            else              out = (1.0f + static_cast<float>(m) / 1024.0f) *
+                                    static_cast<float>(pow(2.0, static_cast<int>(e) - 15));
+            return s ? -out : out;
+        };
+        const bool fp16   = f == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        const bool rgb10  = f == DXGI_FORMAT_R10G10B10A2_UNORM;
+        const bool rgba8  = f == DXGI_FORMAT_R8G8B8A8_UNORM || f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                            f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool bgr    = f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        const bool rg11   = f == DXGI_FORMAT_R11G11B10_FLOAT;
+        if (fp16 || rgb10 || rgba8 || rg11)
+        {
+            for (UINT r = 0; r < rows; ++r)
+            {
+                const BYTE *row = base + static_cast<size_t>(r) * fp.Footprint.RowPitch;
+                for (UINT x = 0; x < rd.Width; ++x)
+                {
+                    float c[3];
+                    if (fp16)
+                    {
+                        const unsigned short *px = reinterpret_cast<const unsigned short *>(row) + x * 4;
+                        c[0] = half(px[0]); c[1] = half(px[1]); c[2] = half(px[2]);
+                    }
+                    else if (rgb10)
+                    {
+                        const unsigned px32 = reinterpret_cast<const unsigned *>(row)[x];
+                        c[0] = (px32 & 0x3FF) / 1023.0f; c[1] = ((px32 >> 10) & 0x3FF) / 1023.0f; c[2] = ((px32 >> 20) & 0x3FF) / 1023.0f;
+                    }
+                    else if (rg11)
+                    {
+                        // 11-bit and 10-bit floats: 5-bit exponent, bias 15, no sign.
+                        const unsigned px32 = reinterpret_cast<const unsigned *>(row)[x];
+                        auto f11 = [](unsigned b, unsigned mbits) -> float {
+                            const unsigned e = (b >> mbits) & 0x1F, m = b & ((1u << mbits) - 1);
+                            if (e == 0) return static_cast<float>(m) / (1u << mbits) / 16384.0f;
+                            if (e == 31) return 65504.0f;
+                            return (1.0f + static_cast<float>(m) / (1u << mbits)) * static_cast<float>(pow(2.0, static_cast<int>(e) - 15));
+                        };
+                        c[0] = f11(px32 & 0x7FF, 6); c[1] = f11((px32 >> 11) & 0x7FF, 6); c[2] = f11((px32 >> 22) & 0x3FF, 5);
+                    }
+                    else
+                    {
+                        const BYTE *px = row + x * 4;
+                        c[0] = px[bgr ? 2 : 0] / 255.0f; c[1] = px[1] / 255.0f; c[2] = px[bgr ? 0 : 2] / 255.0f;
+                    }
+                    sum[0] += c[0]; sum[1] += c[1]; sum[2] += c[2]; ++n;
+                }
+            }
+            if (n != 0)
+            {
+                const double mr = sum[0] / n, mg = sum[1] / n, mb = sum[2] / n;
+                Log("[bridge] output mean after evaluate %llu: R=%.5f G=%.5f B=%.5f luma=%.5f (%s)",
+                    g_bridge.frames_done, mr, mg, mb, 0.2126 * mr + 0.7152 * mg + 0.0722 * mb,
+                    FormatName(f));
+            }
+        }
+    }
     D3D12_RANGE none = { 0, 0 };
     rb->Unmap(0, &none);
     rb->Release();
@@ -2637,6 +2709,10 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     Log("[bridge] feature ready: render %ux%u -> output %ux%u  (textures in %ux%u out %ux%u) handle=%p",
         g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h,
         w, h, g_bridge.out_width, g_bridge.out_height, static_cast<void *>(g_bridge.feature));
+    // One readback per feature, 60 frames in, so a scenario that changes the
+    // swapchain format three times measures each of them.
+    g_bridge.hashed     = false;
+    g_bridge.hash_after = g_bridge.frames_done + 60;
 
     // A DLSS 5 add-on captures its contract by detouring
     // NVSDK_NGX_D3D12_CreateFeature and reading the create it sees. It arms when
@@ -3692,7 +3768,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // The 60th delivered frame rather than the first: DLSS has temporal history
     // and a neighbour may attach a frame or two in, so the first frame is the one
     // most likely to be identical whatever happens afterwards.
-    if (g_cfg.hash_out != 0 && !g_bridge.hashed && g_bridge.frames_done >= 60 &&
+    if (g_cfg.hash_out != 0 && !g_bridge.hashed && g_bridge.frames_done >= g_bridge.hash_after &&
         code == 0 && re == NGX_SUCCESS)
     {
         g_bridge.hashed = true;
