@@ -7,7 +7,7 @@ gives it a DirectX 12 session to hook, fed from the game's own DLSS contract or
 from a substitute one.
 
 If it is useful to you, you can help cover the AI tooling used in its
-development: **[ko-fi.com/giovanninigro](https://ko-fi.com/giovanninigro)**. <img width="50" height="43" alt="image" src="https://github.com/user-attachments/assets/926f4595-c641-45d9-8dec-a7ca4c2bc210" />
+development: **[ko-fi.com/giovanninigro](https://ko-fi.com/nigos)**. <img width="50" height="43" alt="image" src="https://github.com/user-attachments/assets/926f4595-c641-45d9-8dec-a7ca4c2bc210" />
 
 
 Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://github.com/NIGos/dlss5-bridge/releases).
