@@ -982,6 +982,29 @@ static void UnwrapReShadeProxy(ID3D12Device **dev)
 static void MaybeUnwrap(ID3D12Device **dev)
 {
     if (g_cfg.unwrap == 0) return;
+    // ReShade loaded under the name d3d12.dll IS the D3D12 runtime this device
+    // was created through, not a wrapper it acquired along the way. Stripped
+    // there, the device NGX gets is one ReShade never saw, and the create
+    // faulted inside D3D12Core on every attempt: Arknights: Endfield (#17),
+    // where unwrap=0 was the difference between working and not, with either
+    // add-on build. A D3D11 game with ReShade as d3d12.dll is unusual, and
+    // the one measured needs the proxy kept.
+    {
+        const wchar_t *leaf = wcsrchr(g_reshade_path, L'\\');
+        leaf = leaf != nullptr ? leaf + 1 : g_reshade_path;
+        if (_wcsicmp(leaf, L"d3d12.dll") == 0)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                Log("[bridge] keeping ReShade's proxy on the D3D12 device: ReShade is loaded "
+                    "as d3d12.dll, so it is the runtime this device came from. unwrap=1 in "
+                    "the file is overridden here.");
+            }
+            return;
+        }
+    }
     if (g_consumer_needs_proxy)
     {
         static bool said = false;
