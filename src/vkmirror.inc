@@ -188,6 +188,11 @@ static const uint32_t kVkmAspectStencil = 4;
 // starts recording it.
 static uint32_t VkmDepthAspect(uint32_t vkfmt)
 {
+    // RTX Remix hands NGX its depth as a COLOUR image in R32_SFLOAT (VkFormat 100,
+    // aspect COLOR). A barrier naming DEPTH on a colour image is invalid, so the
+    // barrier for that slot must name COLOR instead.
+    if (vkfmt == kVkFmtR32Sfloat)
+        return kSVkAspectColor;
     return (vkfmt == kVkFmtD16UnormS8Uint || vkfmt == kVkFmtD24UnormS8Uint ||
             vkfmt == kVkFmtD32SfloatS8Uint)
                ? (kSVkAspectDepth | kVkmAspectStencil)
@@ -1304,8 +1309,12 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     // the 32-bit staging texture are both wrong for; that is an R16_UNORM slot
     // and a different change, and no measured title needs it.
     const bool depth_packed = res[SLOT_DEPTH].fmt == kVkFmtD24UnormS8Uint;
+    // VkFormat 100 (R32_SFLOAT): RTX Remix's depth is a colour image whose bytes are
+    // already the R32_FLOAT the feature reads -- same shared-texture path as 126/130,
+    // no unpack. Its copy/barrier take the COLOUR aspect (see VkmDepthAspect and the
+    // copy below), everything else is identical to the D32_SFLOAT case.
     if (res[SLOT_DEPTH].fmt != kVkFmtD32Sfloat && res[SLOT_DEPTH].fmt != kVkFmtD32SfloatS8Uint &&
-        !depth_packed)
+        res[SLOT_DEPTH].fmt != kVkFmtR32Sfloat && !depth_packed)
     {
         char msg[224];
         _snprintf_s(msg, sizeof(msg), _TRUNCATE,
@@ -1493,7 +1502,10 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         const UINT dh = res[SLOT_DEPTH].h < rh ? res[SLOT_DEPTH].h : rh;
 
         SVkBufferImageCopy c = {};
-        c.imageSubresource.aspectMask = kSVkAspectDepth;
+        // R32_SFLOAT depth (Remix) is a colour image: copy its COLOUR aspect. True
+        // depth formats copy their DEPTH aspect (depth only, even when combined).
+        c.imageSubresource.aspectMask =
+            (res[SLOT_DEPTH].fmt == kVkFmtR32Sfloat) ? kSVkAspectColor : kSVkAspectDepth;
         c.imageSubresource.layerCount = 1;
         c.imageExtent.width  = dw;
         c.imageExtent.height = dh;
