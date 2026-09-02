@@ -225,9 +225,11 @@ own. It never leaves a broken frame on screen deliberately.
   Khronos validation messages per frame by construction
   (`VUID-vkSetEvent-event-09543`, `VUID-vkCmdWaitEvents-srcStageMask-01158`);
   every NVIDIA driver measured accepts it.
-- Resolution, preset and display-mode changes rebuild. On Vulkan a display
-  change also recreates ReShade's runtime; the mirror and the substitute both
-  follow it.
+- Resolution, preset and display-mode changes rebuild, and so does the game
+  creating its DLSS feature again, whatever the shape: the create flags can
+  change on their own, as IsHDR does when a game switches HDR on. On Vulkan a
+  display change also recreates ReShade's runtime; the mirror and the
+  substitute both follow it.
 - Verbose logging is always on.
 
 ## Related

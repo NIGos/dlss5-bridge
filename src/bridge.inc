@@ -1610,9 +1610,14 @@ static void BridgeHashOutput(UINT64 fence_value)
             if (n != 0)
             {
                 const double mr = sum[0] / n, mg = sum[1] / n, mb = sum[2] / n;
-                Log("[bridge] output mean after evaluate %llu: R=%.5f G=%.5f B=%.5f luma=%.5f (%s)",
+                // The create flags this feature was built with, from the block
+                // that built it, so two builds on the same format -- float with
+                // and without IsHDR -- read as two different presentations.
+                int flags = -1;
+                if (g_bridge.params != nullptr) g_bridge.params->Get("DLSS.Feature.Create.Flags", &flags);
+                Log("[bridge] output mean after evaluate %llu: R=%.5f G=%.5f B=%.5f luma=%.5f (%s flags %d)",
                     g_bridge.frames_done, mr, mg, mb, 0.2126 * mr + 0.7152 * mg + 0.0722 * mb,
-                    FormatName(f));
+                    FormatName(f), flags);
             }
         }
     }
@@ -3237,6 +3242,18 @@ static void BridgeNoteCreate(const NVSDK_NGX_Handle *handle, const NVSDK_NGX_Par
         if (g_create_shape[i].handle == handle) slot = i;
     if (slot < 0) slot = g_create_shape_next++ % static_cast<int>(_countof(g_create_shape));
     g_create_shape[slot] = { handle, w, h, ow, oh };
+    // The game replacing its feature invalidates the mirror's, whatever the
+    // shape: the create flags can change with nothing else -- IsHDR when a game
+    // switches its HDR on -- and until now only a size or format change
+    // rebuilt here, so the mirror ran the game's HDR frames through a feature
+    // built for SDR. The Vulkan mirror has followed the game's create since
+    // 1.3.0. Measured in ngxGym's brightness scenario, 2026-09-02.
+    if (g_bridge.frame_ready)
+    {
+        g_bridge.frame_ready = false;
+        g_bridge.need_reset  = true;
+        Log("[bridge] the game created its feature again; the mirror rebuilds on the next frame.");
+    }
     LeaveCriticalSection(&g_bridge_cs);
     Log("[bridge] the game's create states %ux%u -> %ux%u for handle %p. That is the shape "
         "its evaluates mean, in preference to the four scalars they carry.",
