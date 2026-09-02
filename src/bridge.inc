@@ -3477,6 +3477,13 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // not always seen -- this add-on can attach after the game's create, and
     // skip_exe holds the hooks back a minute -- and then the evaluate's scalars
     // stand as before.
+    // The game's contract only. The substitute's block is this add-on's own and
+    // names its shape exactly; g_eval_handle still holds the game's last handle
+    // when the substitute takes over, and its create shape -- Quality 2227x928
+    // -> 3840x1600 in Baldur's Gate 3 -- was applied to a DLAA 3840x1600 ->
+    // 3840x1600 contract: NGX refused three times and the bridge switched itself
+    // off for the session. Measured 2026-09-02, D3D11.
+    if (InterlockedCompareExchange(&g_source, 0, 0) == SRC_MIRROR)
     {
         unsigned int cw = 0, ch = 0, cow = 0, coh = 0;
         if (BridgeCreateShapeOf(g_eval_handle, &cw, &ch, &cow, &coh))

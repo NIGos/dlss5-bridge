@@ -6540,6 +6540,14 @@ static void OnSynthBeginEffects(reshade::api::effect_runtime *rt,
     // process where every add-on has certainly finished loading. See the note on
     // the function: it warns, it does not prevent.
     WarnIfOldCopyLoaded();
+    // The file, from here, whatever holds the session. With the game's DLSS off
+    // nothing else runs the D3D11 frame path, so a key the panel wrote --
+    // synth=1 from the switch -- stayed unread until the game's DLSS came back,
+    // and the switch read as unticked one frame after every click. Rate
+    // limited inside; under g_bridge_cs like the other call sites.
+    EnterCriticalSection(&g_bridge_cs);
+    CfgReload();
+    LeaveCriticalSection(&g_bridge_cs);
 
     if (!SynthEnabled() || rt == nullptr || cmd == nullptr) return;
 

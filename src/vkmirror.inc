@@ -360,7 +360,7 @@ static void OnVkmInitRuntime(reshade::api::effect_runtime *rt)
     // Every runtime, named once each, taken or not. Without this the log could say
     // the runtime was wrong and never that there were two.
     static int seen = 0;
-    if (seen < 8)
+    if (seen < 64)
     {
         ++seen;
         const char *api =
