@@ -10,6 +10,12 @@ Vulkan game's own DLSS onto a private DirectX 12 session, and for a game
 without DLSS it can build a substitute one from ReShade's depth and the
 driver's motion vectors. Nothing in the game is modified.
 
+This bridge does not do neural rendering itself. It needs the separate **DLSS 5
+Neural Rendering add-on** (RenoDX's `renodx-dlss5.addon64`), distributed in
+[its Discord channel](https://discord.com/channels/1408098019194310818/1542647972695904317),
+together with its `nvngx_dlssnr.dll`. The bridge only gives that add-on a
+place to work.
+
 If it is useful to you, you can help cover the AI tooling used in its
 development:
 
@@ -49,7 +55,7 @@ executable:
 | File | From |
 | --- | --- |
 | `dxgi.dll` — ReShade 6.0 or newer **with add-on support** | reshade.me, full version |
-| A DLSS 5 Neural Rendering add-on (`renodx-dlss5.addon64`) | its author. Any add-on that hooks the NGX D3D12 entry points is driven the same way |
+| A DLSS 5 Neural Rendering add-on (`renodx-dlss5.addon64`) | [its Discord channel](https://discord.com/channels/1408098019194310818/1542647972695904317). Any add-on that hooks the NGX D3D12 entry points is driven the same way |
 | `nvngx_dlssnr.dll` | shipped with that add-on |
 | `dlss5-bridge.addon64` | this project |
 | `nvngx_dlss.dll` 3.1.13 or newer | the game, if it has DLSS. **Required only with `synth=1`**, and then also in a game without DLSS: the driver store carries no super-resolution snippet, and the substitute is DLAA, which older snippets accept and degrade. Below 3.x the bridge refuses and names the version. |
