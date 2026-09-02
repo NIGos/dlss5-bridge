@@ -13,10 +13,11 @@ development:
 
 Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://github.com/NIGos/dlss5-bridge/releases).
 
-**Maintenance mode.** The DLSS 5 add-on now supports DirectX 11 and DirectX 9
-directly; for those games, use it on its own. This repository stays up under
-MIT, builds from a clean copy, and issues are read. Assume nothing is fixed
-unless someone picks it up.
+**Status.** Newer builds of the DLSS 5 add-on reach DirectX 11 and DirectX 9
+on their own; the builds that do not still need this bridge, and it is kept
+working for them. Issues are read and fixed, and releases continue. Every
+release is run through [ngxGym](https://github.com/NIGos/ngxGym) on D3D11 and
+Vulkan before it is published.
 
 ## What it does
 
