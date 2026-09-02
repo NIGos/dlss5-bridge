@@ -123,6 +123,7 @@ not re-read until the game's DLSS goes quiet.
 | `skip_exe` | 1 | `1` hooks the executable's own NGX exports only if no library exports them within a minute, so a game's image is not patched at startup. `0` hooks at once, `2` never. |
 | `unwrap` | 1 | Hand NGX the D3D12 device underneath ReShade's proxy. `0` keeps the proxy. A neural add-on build measured to need the proxy overrides `1` automatically. If an unmeasured build reports active and changes nothing, try `0`. |
 | `probe` | 0 | `1` runs a standalone NGX D3D12 probe at attach and logs the result. Diagnostic. |
+| `hash_out` | 1 | Once per feature build, 60 frames in, read the input and the output back and log a hash of the output, the mean of each channel of both, and the brightness ratio out/in. One readback per build; `0` disables. D3D11 bridge only. |
 
 ## Status panel
 
@@ -146,8 +147,10 @@ is affected.
 
 `dlss5-bridge.log` beside the add-on records the environment, every add-on and
 NVIDIA model file in the folder with its SHA-256, the contract read from the
-game, every NGX result, a cumulative delivered-frame count every 600 frames,
-and on the D3D11 bridge a timing line:
+game, the presentation (output format, colour space, HDR or SDR contract, the
+exposure texture's value), every NGX result, a cumulative delivered-frame count
+every 600 frames, on the D3D11 bridge the brightness the output came back at
+relative to the input, and a timing line:
 
 ```
 [bridge] 600 frames: bridge CPU 0.84 ms/frame | frame interval 16.00 ms (62.5 fps) | spread 5.74-29.93 ms | bridge is 5% of the frame | d3d12 43200/43202 (2 behind)

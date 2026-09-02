@@ -1302,6 +1302,29 @@ static const char *NgxResultName(NVSDK_NGX_Result r);
 // Defined below the include; bridge.inc calls it when the D3D12 session opens.
 static void WarnIfOldCopyLoaded();
 
+// What the game presents, as ReShade sees it, and what the bridge measured of
+// its own output. Written by the effect-runtime path and the readback, read by
+// the log at feature build and by the panel. A screenshot of the panel then
+// says HDR or SDR, which colour space, the exposure the game supplies and how
+// bright the output came back relative to the input -- the four facts the
+// Odyssey report (#10) took three rounds to establish.
+static volatile LONG g_present_space  = 0;     // reshade::api::color_space, 0 unknown
+static volatile LONG g_present_flags  = -1;    // create flags of the last feature built
+static float         g_present_expo   = 0.0f;  // the game's 1x1 exposure texture, 0 = none
+static float         g_bright_in      = 0.0f;  // luma of the input colour at the last readback
+static float         g_bright_out     = 0.0f;  // luma of the output at the last readback
+static const char *ColorSpaceName(LONG cs)
+{
+    switch (cs)
+    {
+    case 1:  return "sRGB (gamma)";
+    case 2:  return "scRGB (linear)";
+    case 3:  return "HDR10 (PQ)";
+    case 4:  return "HLG";
+    default: return "unknown";
+    }
+}
+
 // Every add-on beside this one that is loaded right now, with its base. The
 // inventory at attach prints a base only for add-ons ReShade had already
 // loaded, and it loads them in name order, so anything after "dlss5" has none

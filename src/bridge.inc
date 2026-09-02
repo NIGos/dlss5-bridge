@@ -180,7 +180,7 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 0, 0, 0, 0, 2, 20 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20 };
 
 // synth_after answers one question and used to answer two. It is still the
 // opt-in for synthesising a contract in a game that has never called DLSS --
@@ -1499,11 +1499,11 @@ static void BridgeDrainGpu()
 // "identical", and two runs of a deterministic host produce byte-identical
 // output when nothing in between did anything. A neighbour add-on that ran
 // changes it; one that attached and wrote nothing does not.
-static void BridgeHashOutput(UINT64 fence_value)
+static void BridgeReadbackStats(int slot, UINT64 fence_value)
 {
-    if (g_bridge.dev12 == nullptr || g_bridge.tex12[SLOT_OUTPUT] == nullptr) return;
+    if (g_bridge.dev12 == nullptr || g_bridge.tex12[slot] == nullptr) return;
 
-    const D3D12_RESOURCE_DESC rd = g_bridge.tex12[SLOT_OUTPUT]->GetDesc();
+    const D3D12_RESOURCE_DESC rd = g_bridge.tex12[slot]->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
     UINT   rows = 0;
     UINT64 row_bytes = 0, total = 0;
@@ -1525,17 +1525,17 @@ static void BridgeHashOutput(UINT64 fence_value)
         return;
 
     if (!BeginCommands()) { rb->Release(); return; }
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
+    Barrier(g_bridge.list, g_bridge.tex12[slot],
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
     dst.pResource = rb;
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint = fp;
-    src.pResource = g_bridge.tex12[SLOT_OUTPUT];
+    src.pResource = g_bridge.tex12[slot];
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
     g_bridge.list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
+    Barrier(g_bridge.list, g_bridge.tex12[slot],
             D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     const UINT64 v = EndCommands();
     (void)fence_value;
@@ -1633,9 +1633,12 @@ static void BridgeHashOutput(UINT64 fence_value)
                 // and without IsHDR -- read as two different presentations.
                 int flags = -1;
                 if (g_bridge.params != nullptr) g_bridge.params->Get("DLSS.Feature.Create.Flags", &flags);
-                Log("[bridge] output mean after evaluate %llu: R=%.5f G=%.5f B=%.5f luma=%.5f (%s flags %d)",
-                    g_bridge.frames_done, mr, mg, mb, 0.2126 * mr + 0.7152 * mg + 0.0722 * mb,
+                const double luma = 0.2126 * mr + 0.7152 * mg + 0.0722 * mb;
+                Log("[bridge] %s mean after evaluate %llu: R=%.5f G=%.5f B=%.5f luma=%.5f (%s flags %d)",
+                    slot == SLOT_OUTPUT ? "output" : "input", g_bridge.frames_done, mr, mg, mb, luma,
                     FormatName(f), flags);
+                if (slot == SLOT_OUTPUT) g_bright_out = static_cast<float>(luma);
+                else                     g_bright_in  = static_cast<float>(luma);
             }
         }
     }
@@ -1643,12 +1646,27 @@ static void BridgeHashOutput(UINT64 fence_value)
     rb->Unmap(0, &none);
     rb->Release();
 
-    Log("[bridge] output hash after evaluate %llu: %016llX  (%ux%u %s, %llu rows of %llu "
-        "bytes). Two runs that differ only in which neighbour add-ons were present "
-        "must not produce the same number.",
-        g_bridge.frames_done, hash, static_cast<unsigned>(rd.Width),
-        static_cast<unsigned>(rd.Height), FormatName(rd.Format),
-        static_cast<unsigned long long>(rows), row_bytes);
+    if (slot == SLOT_OUTPUT)
+        Log("[bridge] output hash after evaluate %llu: %016llX  (%ux%u %s, %llu rows of %llu "
+            "bytes). Two runs that differ only in which neighbour add-ons were present "
+            "must not produce the same number.",
+            g_bridge.frames_done, hash, static_cast<unsigned>(rd.Width),
+            static_cast<unsigned>(rd.Height), FormatName(rd.Format),
+            static_cast<unsigned long long>(rows), row_bytes);
+}
+
+// Input and output, once per feature build, and the one number a brightness
+// report needs: how much brighter or darker the output came back. DLSS keeps
+// luminance to within a few percent; a neural pass that does not shows here
+// without a second run with it switched off.
+static void BridgeReadback(UINT64 fence_value)
+{
+    g_bright_in = g_bright_out = 0.0f;
+    BridgeReadbackStats(SLOT_COLOR,  fence_value);
+    BridgeReadbackStats(SLOT_OUTPUT, fence_value);
+    if (g_bright_in > 0.0f && g_bright_out > 0.0f)
+        Log("[bridge] brightness out/in after evaluate %llu: %.2f", g_bridge.frames_done,
+            g_bright_out / g_bright_in);
 }
 
 static void BridgeReleaseTextures()
@@ -2736,6 +2754,16 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // swapchain format three times measures each of them.
     g_bridge.hashed     = false;
     g_bridge.hash_after = g_bridge.frames_done + 60;
+    {
+        int fl = -1;
+        if (g_bridge.params != nullptr) g_bridge.params->Get("DLSS.Feature.Create.Flags", &fl);
+        InterlockedExchange(&g_present_flags, fl);
+        Log("[bridge] presentation: output %s, colour space %s, contract %s%s.",
+            FormatName(fmt[SLOT_OUTPUT]),
+            ColorSpaceName(InterlockedCompareExchange(&g_present_space, 0, 0)),
+            (fl >= 0 && (fl & 1)) ? "HDR (IsHDR)" : "SDR",
+            g_present_expo > 0.0f ? ", exposure texture supplied" : "");
+    }
 
     // A DLSS 5 add-on captures its contract by detouring
     // NVSDK_NGX_D3D12_CreateFeature and reading the create it sees. It arms when
@@ -3209,6 +3237,31 @@ static bool BridgeEnsureExposure(ID3D11Device *dev11, ID3D11Texture2D *src)
         Log("[bridge] the game supplies an exposure texture (%ux%u fmt=%u); it is "
             "mirrored to D3D12 so both sides run the same contract.",
             sd.Width, sd.Height, static_cast<unsigned>(sd.Format));
+        // Its value, read once per mirror. A 1x1 R32 is the shape every exposure
+        // texture in evidence has had, and DLSS scales its input by it; a value
+        // far from 1 is worth knowing when a picture comes back wrong.
+        if (sd.Width == 1 && sd.Height == 1 && sd.Format == DXGI_FORMAT_R32_FLOAT)
+        {
+            ID3D11DeviceContext *ctx = nullptr;
+            dev11->GetImmediateContext(&ctx);
+            D3D11_TEXTURE2D_DESC st = sd;
+            st.Usage = D3D11_USAGE_STAGING; st.BindFlags = 0; st.MiscFlags = 0;
+            st.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ID3D11Texture2D *stage = nullptr;
+            if (ctx != nullptr && SUCCEEDED(dev11->CreateTexture2D(&st, nullptr, &stage)) && stage != nullptr)
+            {
+                ctx->CopyResource(stage, src);
+                D3D11_MAPPED_SUBRESOURCE m = {};
+                if (SUCCEEDED(ctx->Map(stage, 0, D3D11_MAP_READ, 0, &m)))
+                {
+                    g_present_expo = *static_cast<const float *>(m.pData);
+                    ctx->Unmap(stage, 0);
+                    Log("[bridge]   exposure texture value %.4f", g_present_expo);
+                }
+                stage->Release();
+            }
+            if (ctx != nullptr) ctx->Release();
+        }
     }
     return true;
 }
@@ -3824,7 +3877,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         code == 0 && re == NGX_SUCCESS)
     {
         g_bridge.hashed = true;
-        BridgeHashOutput(v_out);
+        BridgeReadback(v_out);
     }
 
     if (code != 0)

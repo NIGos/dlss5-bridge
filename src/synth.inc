@@ -6367,6 +6367,13 @@ static void SynthForget()
     g_synth_last_verdict = 0;
 }
 
+// The colour space the game presents in, as ReShade reads it off the swapchain
+// it just created or resized. Kept for the feature-build line and the panel.
+static void OnSynthInitSwapchain(reshade::api::swapchain *sc, bool)
+{
+    if (sc != nullptr) InterlockedExchange(&g_present_space, static_cast<LONG>(sc->get_color_space()));
+}
+
 static void OnSynthInitEffectRuntime(reshade::api::effect_runtime *)
 {
     // A new runtime has its own texture list, so whatever was reported belonged
@@ -6895,6 +6902,7 @@ static void SynthRegisterEvents()
     }
 
     reg(reshade::addon_event::init_effect_runtime,    reinterpret_cast<void *>(&OnSynthInitEffectRuntime));
+    reg(reshade::addon_event::init_swapchain,         reinterpret_cast<void *>(&OnSynthInitSwapchain));
     reg(reshade::addon_event::reshade_reloaded_effects, reinterpret_cast<void *>(&OnSynthReloadedEffects));
     reg(reshade::addon_event::reshade_begin_effects,  reinterpret_cast<void *>(&OnSynthBeginEffects));
 
@@ -7470,6 +7478,20 @@ static void OnPanelDraw(reshade::api::effect_runtime *rt)
         PanelLine("%s. %ux%u in, %ux%u out.", SynthApiName(dev_api), b_rw, b_rh, b_nw, b_nh);
     else
         PanelLine("%s. No DLSS yet.", SynthApiName(dev_api));
+    // What is being presented and how bright the output came back: the two
+    // things an HDR report needs and a screenshot can carry.
+    {
+        const LONG pf = InterlockedCompareExchange(&g_present_flags, 0, 0);
+        const LONG ps = InterlockedCompareExchange(&g_present_space, 0, 0);
+        if (pf >= 0 || ps != 0)
+            PanelLine("Presentation: %s, %s%s.", ColorSpaceName(ps),
+                      pf >= 0 ? ((pf & 1) ? "HDR contract" : "SDR contract") : "no contract yet",
+                      g_present_expo > 0.0f ? ", exposure texture" : "");
+        if (g_bright_in > 0.0f && g_bright_out > 0.0f)
+            PanelLine("Brightness out/in: %.2f%s", g_bright_out / g_bright_in,
+                      (g_bright_out / g_bright_in > 1.5f || g_bright_out / g_bright_in < 0.67f)
+                          ? " -- the picture came back at a different brightness than it went in" : "");
+    }
 
     {
         // Whether frames are still arriving, not only how many have.
