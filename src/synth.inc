@@ -2478,7 +2478,7 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
     }
 
     const UINT64 n = ++g_s12.frames;
-    InterlockedIncrement(&g_frames_delivered);
+    CountDelivered();
     if (n <= 1 || (n % 1800) == 0)
         Log("[synth] D3D12 frame %llu delivered (%ux%u)", n, w, h);
 }
@@ -4034,7 +4034,7 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     if (!ok) return;
 
     const UINT64 n = ++g_svk.frames;
-    InterlockedIncrement(&g_frames_delivered);
+    CountDelivered();
     if (n <= 1 || (n % 1800) == 0)
         Log("[synth] Vulkan frame %llu delivered (%ux%u)", n, w, h);
 }
@@ -5605,8 +5605,17 @@ static void SynthVkShutdownForDevice()
     Breadcrumb("shutdown: waiting the game's Vulkan queue idle");
     if (g_svk.DeviceWaitIdle != nullptr) g_svk.DeviceWaitIdle(g_svk.dev);
 
+    // The rebuild, not the bare close: it closes the engine's own session on the
+    // private D3D11 device first, and it collapses g_ovk.tried to g_ovk.stopped.
+    // The bare close left tried standing, so after ReShade recreated its runtime
+    // -- every swapchain change in a Vulkan game -- SynthOfaVkOpen returned false
+    // without a word, the gate in OnSynthBeginEffects never found a motion source
+    // again, and the substitute contract did not come back for the session.
+    // The transport underneath had been given its second attempt (g_svk.tried,
+    // below) on 2026-09-01; the engine on top of it had not. Baldur's Gate 3 on
+    // Vulkan, borderless to fullscreen, 2026-09-02.
     Breadcrumb("shutdown: closing the optical flow session");
-    SynthOfaVkClose();
+    SynthOfaVkRebuild();
     Breadcrumb("shutdown: releasing the depth compute");
     SynthDepthCsRelease();
     Breadcrumb("shutdown: destroying the imported Vulkan images");

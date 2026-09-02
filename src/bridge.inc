@@ -3736,7 +3736,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         // The one place a completed evaluate exists to be copied back, so the
         // only honest place to count a delivered frame. The stage<3 returns
         // above move frames_done as well, and they deliver nothing.
-        InterlockedIncrement(&g_frames_delivered);
+        CountDelivered();
 
         // Did a DLSS 5 add-on detour CreateFeature after this add-on had already
         // called it? Only asked on the synthetic path, and only for the first

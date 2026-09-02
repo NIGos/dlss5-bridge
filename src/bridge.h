@@ -58,6 +58,15 @@ static volatile LONG g_source;
 // source would keep its own. ReportIdle needs one liveness signal that does not
 // have to be taught about each new source.
 static volatile LONG g_frames_delivered;
+// Every source counts here -- the D3D11 bridge, the Vulkan mirror and the
+// substitute contract on either transport. Logged every 600 frames, so a log
+// shows whether delivery went on after the last runtime teardown; the mirror's
+// own counter cannot say that, and the substitute had no counter at all.
+static void CountDelivered()
+{
+    const LONG n = InterlockedIncrement(&g_frames_delivered);
+    if (n % 600 == 0) Log("[bridge] %ld frames delivered so far.", n);
+}
 
 // The mirror runs on the game's render thread; a synthetic source runs on the
 // thread ReShade renders its effects from. Both reach the one g_bridge -- its

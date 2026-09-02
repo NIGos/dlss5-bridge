@@ -562,7 +562,7 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
                     g_vkm.stalls = 0;
                 }
                 g_vkm.fails = 0;
-                if (g_cfg.stage >= 3) InterlockedIncrement(&g_frames_delivered);
+                if (g_cfg.stage >= 3) CountDelivered();
             }
             else if (InterlockedIncrement(&g_vkm.fails) >= 5)
                 VkmRefuse("five consecutive D3D12 evaluates were refused -- the results are "
