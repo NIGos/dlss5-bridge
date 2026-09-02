@@ -1,7 +1,8 @@
 # DLSS 5 Bridge
 
-**DLSS 5 Neural Rendering for DirectX 11 games, Vulkan games, and games that
-have no DLSS at all.**
+**DLSS 5 Neural Rendering for DirectX 11 games, Vulkan games, and, as an
+option, games that have no DLSS at all, through NVIDIA Optical Flow, at lower
+quality.**
 
 A ReShade add-on. The DLSS 5 neural rendering add-on only works where a game
 runs DLSS on DirectX 12. This bridge gives it that: it mirrors a DirectX 11 or
