@@ -1048,8 +1048,10 @@ static unsigned int SynthCreateFlags(DXGI_FORMAT back_fmt, int depth_reversed)
     // IsHDR selects the DLSS 5 add-on's codec. The measurement is the back
     // buffer's own format, and the question it has to answer is whether that
     // format can hold a value above 1.0 -- not whether it is wider than eight
-    // bits, which is a different question with a different answer at ten.
-    if (SynthFormatCanExceedOne(back_fmt)) f |= 0x01;
+    // bits, which is a different question with a different answer at ten. A PQ
+    // presentation is the exception: the texture NGX gets is the decoded float
+    // (PqBackBuffer, bridge.inc), so the flag is true of what it reads.
+    if (SynthFormatCanExceedOne(back_fmt) || PqBackBuffer(back_fmt)) f |= 0x01;
 
     // DepthInverted is the one thing about ReShade's depth encoding that NGX has
     // a way to state, and RESHADE_DEPTH_INPUT_IS_REVERSED is the definition that
@@ -1263,6 +1265,10 @@ struct Synth12
     ID3D12PipelineState  *cvt_pso;
     ID3D12DescriptorHeap *cvt_heap;
 
+    // The HDR10 pair, built for a synthetic contract on a PQ presentation;
+    // see PqBackBuffer in bridge.inc. pq.in is null otherwise.
+    PqPass                pq;
+
     UINT            w, h;
     // The Output slot's own size. On the synthetic path it is always w,h -- that
     // contract is DLAA by construction -- but the Vulkan mirror copies a real
@@ -1392,6 +1398,7 @@ static void Synth12ReleaseTextures()
     if (g_s12.cvt_heap  != nullptr) { g_s12.cvt_heap->Release();  g_s12.cvt_heap  = nullptr; }
     if (g_s12.cvt_pso   != nullptr) { g_s12.cvt_pso->Release();   g_s12.cvt_pso   = nullptr; }
     if (g_s12.cvt_rs    != nullptr) { g_s12.cvt_rs->Release();    g_s12.cvt_rs    = nullptr; }
+    PqPassRelease(&g_s12.pq);
 }
 
 static bool Synth12Begin()
@@ -2007,6 +2014,11 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     if (depth_packed && !Synth12MakeDepthUnpack(w, h))
     { Synth12ReleaseTextures(); return false; }
 
+    if (g_s12.shared && InterlockedCompareExchange(&g_source, 0, 0) != SRC_MIRROR &&
+        PqBackBuffer(back_fmt) &&
+        !PqPassMake(&g_s12.pq, g_s12.dev, g_s12.tex[SLOT_COLOR], g_s12.tex[SLOT_OUTPUT]))
+    { Synth12ReleaseTextures(); return false; }
+
     Log("[synth] colour in %s, output %s -- the frame is copied into the first and the "
         "result is copied back out of the second, because NGX reads one as a shader "
         "resource and writes the other through a UAV in the same call.",
@@ -2116,8 +2128,8 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     // ones the evaluates will name.
     if (g_s12.params != nullptr)
     {
-        g_s12.params->Set("Color",         g_s12.tex[SLOT_COLOR]);
-        g_s12.params->Set("Output",        g_s12.tex[SLOT_OUTPUT]);
+        g_s12.params->Set("Color",         g_s12.pq.in  != nullptr ? g_s12.pq.in  : g_s12.tex[SLOT_COLOR]);
+        g_s12.params->Set("Output",        g_s12.pq.out != nullptr ? g_s12.pq.out : g_s12.tex[SLOT_OUTPUT]);
         g_s12.params->Set("Depth",         g_s12.tex[SLOT_DEPTH]);
         g_s12.params->Set("MotionVectors", g_s12.tex[SLOT_MV]);
     }
@@ -2533,8 +2545,19 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
 
-    g_s12.params->Set("Color",         g_s12.tex[SLOT_COLOR]);
-    g_s12.params->Set("Output",        g_s12.tex[SLOT_OUTPUT]);
+    if (g_s12.pq.in != nullptr && !PqPassBefore(&g_s12.pq, g_s12.queue))
+    {
+        Log("[synth] the HDR10 decode did not run, so this frame is not evaluated.");
+        for (int i = 0; i < SLOT_COUNT; ++i)
+            Barrier(g_s12.list, g_s12.tex[i],
+                    i == SLOT_OUTPUT ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                     : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_COMMON);
+        Synth12End();
+        return false;
+    }
+    g_s12.params->Set("Color",         g_s12.pq.in  != nullptr ? g_s12.pq.in  : g_s12.tex[SLOT_COLOR]);
+    g_s12.params->Set("Output",        g_s12.pq.out != nullptr ? g_s12.pq.out : g_s12.tex[SLOT_OUTPUT]);
     g_s12.params->Set("Depth",         g_s12.depth_cvt != nullptr ? g_s12.depth_cvt
                                                                   : g_s12.tex[SLOT_DEPTH]);
     // The engine's own texture when it is the source, and the transport's
@@ -2573,7 +2596,9 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
     if (g_s12.depth_cvt != nullptr)
         Barrier(g_s12.list, g_s12.depth_cvt, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_COMMON);
-    const UINT64 v = Synth12End();
+    UINT64 v = Synth12End();
+    if (g_s12.pq.in != nullptr)
+        v = PqPassAfter(&g_s12.pq, g_s12.queue, g_s12.fence, &g_s12.fence_value, v);
 
     if (code != 0)
     {
@@ -6445,9 +6470,13 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
                 "opened yet -- this session armed on the expectation of it. The flow field "
                 "sizes are reported by the line that opens it, on one of the next frames.");
         }
-        Log("[synth]   IsHDR is %s because the back buffer is %s; DepthInverted is %s "
+        Log("[synth]   IsHDR is %s because the back buffer is %s%s; DepthInverted is %s "
             "because RESHADE_DEPTH_INPUT_IS_REVERSED is %d.",
             (flags & 0x01) ? "set" : "clear", FormatName(back.fmt),
+            PqBackBuffer(back.fmt)
+                ? " presented as HDR10 (PQ), which is decoded to linear BT.709 for the "
+                  "evaluate and encoded again after"
+                : "",
             (flags & 0x08) ? "set" : "clear", f->def_value[SYNTH_DEF_REVERSED]);
 
         // A known defect, stated rather than hidden, because it is the first

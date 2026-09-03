@@ -81,6 +81,37 @@ static void CountDelivered()
 // sources are ever live at once, which is the thing the latch forbids.
 static CRITICAL_SECTION g_bridge_cs;
 
+// The HDR10 pair of passes, one per D3D12 session that can carry a synthetic
+// contract. On an HDR10 presentation the back buffer holds PQ code values in
+// R10G10B10A2; the decode pass turns the colour copy into linear BT.709 float
+// (1.0 = 80 nits, the scRGB convention), NGX reads that and writes a linear
+// result, and the encode pass turns the result back into PQ in the output
+// copy. Defined in bridge.inc; see PqBackBuffer there for when it is built.
+struct PqPass
+{
+    ID3D12Device         *dev;
+    ID3D12Resource       *in;     // linear colour NGX reads
+    ID3D12Resource       *out;    // linear result NGX writes
+    ID3D12RootSignature  *rs;
+    ID3D12PipelineState  *pso;
+    ID3D12DescriptorHeap *heap;
+    UINT                  cw, ch, ow, oh;
+    // Not owned: the session's colour and output textures the passes convert.
+    ID3D12Resource       *colour, *output;
+    // Command lists of their own, one per direction, executed on the session's
+    // queue before and after the list NGX records into. Nothing of this
+    // add-on's is ever recorded into that list: the DLSS 5 add-on records the
+    // host state it sees there -- descriptor heaps included, NGX's own among
+    // them -- and sets it again when it intercepts a create, and a heap the
+    // feature release freed came back as a dangling pointer inside ReShade
+    // (measured 2026-09-03). Reuse is fenced.
+    ID3D12CommandAllocator    *alloc[2];
+    ID3D12GraphicsCommandList *list[2];
+    ID3D12Fence               *fence;
+    HANDLE                     ev;
+    UINT64                     fv, done[2];
+};
+
 struct Bridge
 {
     bool disabled;          // set after a hard failure; never retried
@@ -194,6 +225,8 @@ struct Bridge
     bool             exp_reported;
 
     ID3D12Resource  *tex12[SLOT_COUNT];
+    // Built for a synthetic contract on an HDR10 presentation, else in is null.
+    PqPass           pq;
     ID3D11Texture2D *tex11[SLOT_COUNT];
     HANDLE           shared[SLOT_COUNT];
 

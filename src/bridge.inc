@@ -1704,8 +1704,313 @@ static void BridgeReadback(UINT64 fence_value)
             g_bright_out / g_bright_in);
 }
 
+// An HDR10 presentation with a UNORM back buffer: the surface carries PQ code
+// values, not light. Handing those to the evaluate as SDR colour is what made
+// Baldur's Gate 3's synthetic contract come out dimmer and less saturated than
+// the game's own DLSS, whose input is linear R11G11B10_FLOAT with IsHDR set
+// (measured 2026-09-03, D3D11 and Vulkan alike). A float back buffer on the
+// same presentation is scRGB and already linear, so it is left alone.
+static bool PqBackBuffer(DXGI_FORMAT f)
+{
+    if (InterlockedCompareExchange(&g_present_space, 0, 0) != 3 /* HDR10 (PQ) */) return false;
+    switch (f)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return false;
+    default:
+        return true;
+    }
+}
+
+// The two textures only. The heap, the root signature and the pipeline live as
+// long as the device does, and that is not tidiness: the DLSS 5 add-on records
+// the descriptor heaps it sees set on the command list and sets them again
+// when it intercepts a create, so a heap released at a rebuild came back as a
+// dangling pointer inside ReShade's SetDescriptorHeaps (measured 2026-09-03).
+// The descriptors are rewritten in place instead.
+static bool PqPassWait(PqPass *p, UINT64 value)
+{
+    if (p->fence == nullptr || p->fence->GetCompletedValue() >= value) return true;
+    if (FAILED(p->fence->SetEventOnCompletion(value, p->ev))) return false;
+    return WaitForSingleObject(p->ev, 4000) == WAIT_OBJECT_0;
+}
+
+static void PqPassRelease(PqPass *p)
+{
+    // The lists may still name the textures: let them finish first.
+    if (p->fence != nullptr) PqPassWait(p, p->fv);
+    if (p->in  != nullptr) { p->in->Release();  p->in  = nullptr; }
+    if (p->out != nullptr) { p->out->Release(); p->out = nullptr; }
+    p->colour = p->output = nullptr;
+}
+
+// One shader, one root constant choosing the direction: 0 decodes colour into
+// in, 1 encodes out into output. The BT.2020 matrices are the ones an HDR10
+// surface implies; the model side is BT.709.
+static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3D12Resource *output)
+{
+    PqPassRelease(p);
+    p->dev    = dev;
+    p->colour = colour;
+    p->output = output;
+    const D3D12_RESOURCE_DESC cd = colour->GetDesc(), od = output->GetDesc();
+    p->cw = static_cast<UINT>(cd.Width); p->ch = cd.Height;
+    p->ow = static_cast<UINT>(od.Width); p->oh = od.Height;
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource **pair[2] = { &p->in, &p->out };
+    for (int i = 0; i < 2; ++i)
+    {
+        rd.Width  = i == 0 ? p->cw : p->ow;
+        rd.Height = i == 0 ? p->ch : p->oh;
+        const HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COMMON, nullptr, __uuidof(ID3D12Resource),
+            reinterpret_cast<void **>(pair[i]));
+        if (FAILED(hr))
+        {
+            Log("[bridge] the %llux%u R16G16B16A16_FLOAT texture for the HDR10 %s could not be "
+                "created: 0x%08X", rd.Width, rd.Height, i == 0 ? "decode" : "encode", hr);
+            PqPassRelease(p);
+            return false;
+        }
+    }
+
+    if (p->heap == nullptr)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            if (FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    __uuidof(ID3D12CommandAllocator), reinterpret_cast<void **>(&p->alloc[i]))) ||
+                FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p->alloc[i], nullptr,
+                    __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&p->list[i]))))
+            { Log("[bridge] the HDR10 pass could not get a command list"); PqPassRelease(p); return false; }
+            p->list[i]->Close();
+        }
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                    reinterpret_cast<void **>(&p->fence))))
+        { Log("[bridge] the HDR10 pass could not get a fence"); PqPassRelease(p); return false; }
+        p->ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        p->fv = p->done[0] = p->done[1] = 0;
+
+        static const char kSrc[] =
+            "Texture2D<float4>   src : register(t0);\n"
+            "RWTexture2D<float4> dst : register(u0);\n"
+            "cbuffer C : register(b0) { uint mode; };\n"
+            "static const float m1 = 0.1593017578125, m2 = 78.84375;\n"
+            "static const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+            "static const float3x3 k2020to709 = { 1.6605, -0.5876, -0.0728,\n"
+            "                                    -0.1246,  1.1329, -0.0083,\n"
+            "                                    -0.0182, -0.1006,  1.1187 };\n"
+            "static const float3x3 k709to2020 = { 0.6274, 0.3293, 0.0433,\n"
+            "                                     0.0691, 0.9195, 0.0114,\n"
+            "                                     0.0164, 0.0880, 0.8956 };\n"
+            "float3 pq_to_nits(float3 e)\n"
+            "{\n"
+            "    float3 p = pow(max(e, 0.0), 1.0 / m2);\n"
+            "    return pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1) * 10000.0;\n"
+            "}\n"
+            "float3 nits_to_pq(float3 n)\n"
+            "{\n"
+            "    float3 y = pow(saturate(n / 10000.0), m1);\n"
+            "    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);\n"
+            "}\n"
+            "[numthreads(8,8,1)]\n"
+            "void main(uint3 id : SV_DispatchThreadID)\n"
+            "{\n"
+            "    uint w, h; dst.GetDimensions(w, h);\n"
+            "    if (id.x >= w || id.y >= h) return;\n"
+            "    float4 v = src[id.xy];\n"
+            "    if (mode == 0)\n"
+            "        dst[id.xy] = float4(mul(k2020to709, pq_to_nits(v.rgb)) / 80.0, v.a);\n"
+            "    else\n"
+            "        dst[id.xy] = float4(nits_to_pq(mul(k709to2020, v.rgb * 80.0)), v.a);\n"
+            "}\n";
+
+        PFN_D3DCompile_ compile = LoadSystemD3DCompiler();
+        if (compile == nullptr) { Log("[bridge] d3dcompiler_47.dll unavailable for the HDR10 pass"); PqPassRelease(p); return false; }
+        ID3DBlob *code = nullptr, *err = nullptr;
+        HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "pq", nullptr, nullptr, "main", "cs_5_0", 0, 0, &code, &err);
+        if (FAILED(hr) || code == nullptr)
+        {
+            Log("[bridge] the HDR10 shader would not compile: %s",
+                err != nullptr ? static_cast<const char *>(err->GetBufferPointer()) : "");
+            if (err != nullptr) err->Release();
+            PqPassRelease(p);
+            return false;
+        }
+        if (err != nullptr) err->Release();
+
+        D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+        ranges[0].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors                    = 1;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+        ranges[1].RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors                    = 1;
+        ranges[1].OffsetInDescriptorsFromTableStart = 1;
+        D3D12_ROOT_PARAMETER params[2] = {};
+        params[0].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable.NumDescriptorRanges = 2;
+        params[0].DescriptorTable.pDescriptorRanges   = ranges;
+        params[0].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.Num32BitValues            = 1;
+        params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC rsd = {};
+        rsd.NumParameters = 2;
+        rsd.pParameters   = params;
+
+        HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+        auto serialize = d3d12 != nullptr
+            ? reinterpret_cast<PFN_D3D12_SERIALIZE_ROOT_SIGNATURE>(GetProcAddress(d3d12, "D3D12SerializeRootSignature"))
+            : nullptr;
+        ID3DBlob *rsblob = nullptr, *rserr = nullptr;
+        hr = serialize != nullptr ? serialize(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsblob, &rserr) : E_FAIL;
+        if (FAILED(hr) || rsblob == nullptr)
+        {
+            Log("[bridge] the HDR10 root signature would not serialize 0x%08X: %s", hr,
+                rserr != nullptr ? static_cast<const char *>(rserr->GetBufferPointer()) : "");
+            if (rserr != nullptr) rserr->Release();
+            code->Release();
+            PqPassRelease(p);
+            return false;
+        }
+        if (rserr != nullptr) rserr->Release();
+        hr = dev->CreateRootSignature(0, rsblob->GetBufferPointer(), rsblob->GetBufferSize(),
+                                      __uuidof(ID3D12RootSignature), reinterpret_cast<void **>(&p->rs));
+        rsblob->Release();
+        if (FAILED(hr)) { Log("[bridge] the HDR10 root signature failed 0x%08X", hr); code->Release(); PqPassRelease(p); return false; }
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+        pd.pRootSignature     = p->rs;
+        pd.CS.pShaderBytecode = code->GetBufferPointer();
+        pd.CS.BytecodeLength  = code->GetBufferSize();
+        hr = dev->CreateComputePipelineState(&pd, __uuidof(ID3D12PipelineState), reinterpret_cast<void **>(&p->pso));
+        code->Release();
+        if (FAILED(hr)) { Log("[bridge] the HDR10 pipeline failed 0x%08X", hr); PqPassRelease(p); return false; }
+
+        // Four descriptors, two tables: [colour SRV, in UAV] for the decode and
+        // [out SRV, output UAV] for the encode.
+        D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+        hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 4;
+        hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void **>(&p->heap));
+        if (FAILED(hr)) { Log("[bridge] the HDR10 descriptor heap failed 0x%08X", hr); PqPassRelease(p); return false; }
+    }
+
+    const UINT inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = p->heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels     = 1;
+    sd.Format = cd.Format;
+    dev->CreateShaderResourceView(colour, &sd, cpu);
+    cpu.ptr += inc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    ud.Format        = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    dev->CreateUnorderedAccessView(p->in, nullptr, &ud, cpu);
+    cpu.ptr += inc;
+    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    dev->CreateShaderResourceView(p->out, &sd, cpu);
+    cpu.ptr += inc;
+    ud.Format = od.Format;
+    dev->CreateUnorderedAccessView(output, nullptr, &ud, cpu);
+
+    Log("[bridge] HDR10 PQ conversion ready: the %s back buffer is decoded to linear BT.709 "
+        "(1.0 = 80 nits) before the evaluate and the result encoded again after, so the "
+        "contract can say IsHDR and mean it.", FormatName(cd.Format));
+    return true;
+}
+
+// The colour is expected in NON_PIXEL_SHADER_RESOURCE and the output in
+// UNORDERED_ACCESS, which is where both sessions hold them around the evaluate.
+static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode)
+{
+    const UINT inc = p->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    ID3D12DescriptorHeap *heaps[] = { p->heap };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(p->rs);
+    list->SetPipelineState(p->pso);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = p->heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(mode) * 2 * inc;
+    list->SetComputeRootDescriptorTable(0, gpu);
+    list->SetComputeRoot32BitConstant(1, static_cast<UINT>(mode), 0);
+    const UINT w = mode == 0 ? p->cw : p->ow, h = mode == 0 ? p->ch : p->oh;
+    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+// One of the two lists, recorded, executed on the session's queue and fenced.
+// Every texture goes in and out in COMMON except the two NGX is about to use:
+// in is left in NON_PIXEL_SHADER_RESOURCE and out in UNORDERED_ACCESS by the
+// decode, and the encode takes them back to COMMON. The session's own barriers
+// on its colour and output are unaffected, since both are returned to COMMON.
+static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode)
+{
+    ID3D12GraphicsCommandList *list = p->list[mode];
+    if (!PqPassWait(p, p->done[mode])) return false;
+    if (FAILED(p->alloc[mode]->Reset()) || FAILED(list->Reset(p->alloc[mode], nullptr))) return false;
+    if (mode == 0)
+    {
+        Barrier(list, p->colour, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(list, p->in, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        PqPassDispatch(p, list, 0);
+        Barrier(list, p->in, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(list, p->colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(list, p->out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    else
+    {
+        Barrier(list, p->out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(list, p->output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        PqPassDispatch(p, list, 1);
+        Barrier(list, p->output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(list, p->out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(list, p->in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+    list->Close();
+    ID3D12CommandList *lists[] = { list };
+    queue->ExecuteCommandLists(1, lists);
+    queue->Signal(p->fence, ++p->fv);
+    p->done[mode] = p->fv;
+    return true;
+}
+
+// Before the NGX list is recorded: the decode, executed now, runs ahead of it.
+static bool PqPassBefore(PqPass *p, ID3D12CommandQueue *queue)
+{
+    return PqPassRun(p, queue, 0);
+}
+
+// After the NGX list was executed: the encode runs behind it, and the session's
+// fence is signalled once more so whoever waits on the value returned here
+// waits for the encoded result and not only for the evaluate.
+static UINT64 PqPassAfter(PqPass *p, ID3D12CommandQueue *queue, ID3D12Fence *session_fence,
+                          UINT64 *session_value, UINT64 fallback)
+{
+    if (!PqPassRun(p, queue, 1)) return fallback;
+    const UINT64 v = ++*session_value;
+    queue->Signal(session_fence, v);
+    return v;
+}
+
 static void BridgeReleaseTextures()
 {
+    PqPassRelease(&g_bridge.pq);
     BridgeDrainGpu();
 
     // The exposure mirror goes with the rest. Leaving it out kept a shared NT
@@ -2712,8 +3017,19 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // Neither state is a description of anything. These are the exact resources
     // the evaluates will use, they exist by this line, and naming them is the
     // only answer here that is true.
-    g_bridge.params->Set("Color",         g_bridge.tex12[SLOT_COLOR]);
-    g_bridge.params->Set("Output",        g_bridge.tex12[SLOT_OUTPUT]);
+    // The synthetic contract on an HDR10 presentation; see PqBackBuffer. The
+    // mirror copies a game's own contract and never sees a PQ surface as colour.
+    if (InterlockedCompareExchange(&g_source, 0, 0) == SRC_SYNTH &&
+        PqBackBuffer(TypedFormat(fmt[SLOT_COLOR])) &&
+        !PqPassMake(&g_bridge.pq, g_bridge.dev12, g_bridge.tex12[SLOT_COLOR], g_bridge.tex12[SLOT_OUTPUT]))
+    {
+        Log("[bridge] the HDR10 conversion could not be built, so the synthetic contract is not "
+            "built either: an SDR evaluate over a PQ surface is the picture this exists to fix.");
+        return false;
+    }
+
+    g_bridge.params->Set("Color",         g_bridge.pq.in  != nullptr ? g_bridge.pq.in  : g_bridge.tex12[SLOT_COLOR]);
+    g_bridge.params->Set("Output",        g_bridge.pq.out != nullptr ? g_bridge.pq.out : g_bridge.tex12[SLOT_OUTPUT]);
     g_bridge.params->Set("Depth",         g_bridge.tex12[SLOT_DEPTH]);
     g_bridge.params->Set("MotionVectors", g_bridge.tex12[SLOT_MV]);
 
@@ -3833,8 +4149,15 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    g_bridge.params->Set("Color", g_bridge.tex12[SLOT_COLOR]);
-    g_bridge.params->Set("Output", g_bridge.tex12[SLOT_OUTPUT]);
+    if (g_bridge.pq.in != nullptr && !PqPassBefore(&g_bridge.pq, g_bridge.queue))
+    {
+        BridgeFail("HDR10 decode");
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
+    g_bridge.params->Set("Color", g_bridge.pq.in  != nullptr ? g_bridge.pq.in  : g_bridge.tex12[SLOT_COLOR]);
+    g_bridge.params->Set("Output", g_bridge.pq.out != nullptr ? g_bridge.pq.out : g_bridge.tex12[SLOT_OUTPUT]);
     g_bridge.params->Set("Depth", g_bridge.tex12[SLOT_DEPTH]);
     g_bridge.params->Set("MotionVectors", g_bridge.tex12[SLOT_MV]);
     if (g_bridge.exp12 != nullptr)
@@ -3892,7 +4215,9 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     Barrier(g_bridge.list, g_bridge.tex12[SLOT_OUTPUT],
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 
-    const UINT64 v_out = EndCommands();
+    UINT64 v_out = EndCommands();
+    if (g_bridge.pq.in != nullptr)
+        v_out = PqPassAfter(&g_bridge.pq, g_bridge.queue, g_bridge.fence12, &g_bridge.fence_value, v_out);
 
     // No CPU wait here, and that is deliberate rather than an omission: the
     // signal above is a GPU-side fence and the game's queue waits on it, so this
