@@ -2480,6 +2480,14 @@ static void LogEnvironment()
                     vi.dwBuildNumber >= 22000 ? "Windows 11" : "Windows 10",
                     vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber);
         }
+        // Wine says so through an export of its own ntdll. Under Proton the D3D12
+        // runtime is vkd3d-proton, and the neural pass has a known wall there
+        // that is not this add-on's; a report that carries this line skips a
+        // round trip.
+        typedef const char *(*PFN_wine_get_version)();
+        if (auto wv = reinterpret_cast<PFN_wine_get_version>(GetProcAddress(nt, "wine_get_version")))
+            Log("  wine: %s. The D3D12 runtime here is vkd3d-proton; see dlss5-bridge #22 "
+                "for where the neural pass stands under Proton.", wv());
     }
 }
 
@@ -2742,6 +2750,21 @@ static void LogNeighbours()
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
+
+        // Two DIFFERENT DLSS 5 add-ons is the other shape: renodx-dlss5 beside
+        // renodx-dlssfix, each detouring the same NGX D3D12 entry points. Under
+        // that pair the bridge's own feature create faulted inside D3D12Core
+        // before anything ran (Baldur's Gate 3, D3D11, #16). Which of the two is
+        // the trigger is not known; two at once is the thing to undo first.
+        {
+            int n_dlss5 = 0;
+            for (int i = 0; i < dup_n; ++i)
+                if (_wcsnicmp(dup[i], L"renodx-dlss", 11) == 0) ++n_dlss5;
+            if (n_dlss5 >= 2)
+                Log("  *** %d DLSS 5 add-ons are in this folder. Each detours the same NGX "
+                    "D3D12 entry points, and with two loaded at once this add-on's feature "
+                    "create has faulted inside D3D12Core (#16). Keep one. ***", n_dlss5);
+        }
 
         // Names compared after a trailing " (N)" is stripped from the stem. Two
         // that collide are the same add-on twice.
