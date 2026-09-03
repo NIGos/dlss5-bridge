@@ -163,6 +163,12 @@ struct BridgeCfg
     // 5 SLOW, 10 MEDIUM, 20 FAST -- NVOFA's own NV_OF_PERF_LEVEL values, so a
     // report quoting this number can be read against NVIDIA's table directly.
     int ofa_perf;
+    // How the Vulkan transport puts its result into the back buffer: 0 copies
+    // when the image allows it and draws otherwise, 1 copies only, 2 draws
+    // always. ReShade's layer gives every swapchain COLOR_ATTACHMENT and
+    // TRANSFER_SRC and nothing else, so an image a game created without
+    // TRANSFER_DST can be drawn into and not copied into (#23).
+    int vk_present;
 };
 
 // auto is not a fourth point on a scale with the other three, so this is stored
@@ -180,7 +186,7 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0 };
 
 // synth_after answers one question and used to answer two. It is still the
 // opt-in for synthesising a contract in a game that has never called DLSS --
@@ -465,6 +471,7 @@ static void CfgReload()
         else if (_stricmp(key, "hash_out")    == 0) next.hash_out    = val;
         else if (_stricmp(key, "ofa_grid")    == 0) next.ofa_grid    = val;
         else if (_stricmp(key, "ofa_perf")    == 0) next.ofa_perf    = val;
+        else if (_stricmp(key, "vk_present")  == 0) next.vk_present  = (val >= 0 && val <= 2) ? val : 0;
         // Only the sign is taken, because only the sign is unknown: the
         // magnitude is the back buffer size and this add-on measures that. A
         // number here that is not a sign would be a second way to say something
@@ -504,7 +511,8 @@ static void CfgReload()
                          (next.mv_sign_x != g_cfg.mv_sign_x) ||
                          (next.mv_sign_y != g_cfg.mv_sign_y) ||
                          (next.ofa_grid != g_cfg.ofa_grid) ||
-                         (next.ofa_perf != g_cfg.ofa_perf);
+                         (next.ofa_perf != g_cfg.ofa_perf) ||
+                         (next.vk_present != g_cfg.vk_present);
     // The first read reports whatever it found, changed or not. Until now the echo
     // fired only on a difference from the built-in defaults, so a session running on
     // defaults had no config line at all -- and "no config line" then meant either
@@ -517,11 +525,11 @@ static void CfgReload()
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
         "skip_game=%d dred=%d skip_exe=%d unwrap=%d source=%s synth=%d hash_out=%d synth_after=%d "
-        "mv_sign_x=%d mv_sign_y=%d ofa_grid=%d ofa_perf=%d",
+        "mv_sign_x=%d mv_sign_y=%d ofa_grid=%d ofa_perf=%d vk_present=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
         g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
         kCfgSourceName[g_cfg.source], g_cfg.synth, g_cfg.hash_out, g_cfg.synth_after,
-        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.ofa_grid, g_cfg.ofa_perf);
+        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.ofa_grid, g_cfg.ofa_perf, g_cfg.vk_present);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -594,6 +602,10 @@ static bool CfgWriteFile(const char *path)
         "# convention. 0 leaves it alone; -1 or 1 forces it. For diagnosis.\n"
         "mv_sign_x=%d\n"
         "mv_sign_y=%d\n"
+        "# How the Vulkan transport puts its result into the back buffer: 0 copies\n"
+        "# where the image allows it and draws it otherwise, 1 copies only, 2 draws\n"
+        "# always.\n"
+        "vk_present=%d\n"
         "\n"
         "# THE REST. stage 0 switches the add-on off without removing the file.\n"
         "# flags -1 copies the create flags the game declared; any other value\n"
@@ -610,7 +622,7 @@ static bool CfgWriteFile(const char *path)
         "unwrap=%d\n",
         1, g_cfg.synth, g_cfg.synth_after,
         kCfgSourceName[g_cfg.source], g_cfg.ofa_grid, g_cfg.ofa_perf,
-        g_cfg.mv_sign_x, g_cfg.mv_sign_y,
+        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.vk_present,
         g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
         g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
     fclose(f);

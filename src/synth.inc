@@ -3521,6 +3521,203 @@ struct SynthDepthCs
 
 static SynthDepthCs g_dcs;
 
+#include "present_spv.h"
+
+// The result drawn into the back buffer through a render pass, for a swapchain
+// created without VK_IMAGE_USAGE_TRANSFER_DST_BIT. ReShade's layer adds
+// COLOR_ATTACHMENT and TRANSFER_SRC to every swapchain it sees and nothing
+// else, so a game that asked for neither transfer bit -- Ghost Recon
+// Breakpoint on Vulkan, #23 -- leaves an image that can be copied out of and
+// not into. It can always be rendered into: that bit ReShade guarantees.
+//
+// The result crosses one extra image on the way. The imported D3D12 output is
+// transfer-only by construction (see the import), so it is copied into a
+// sampleable texture of ReShade's making, and that one is drawn with a point
+// sampler at the same size: a copy, by other means.
+struct SynthVkPresent
+{
+    bool tried, ready;
+    reshade::api::device         *dev;
+    reshade::api::pipeline_layout layout;
+    reshade::api::pipeline        pso;
+    reshade::api::sampler         samp;
+    DXGI_FORMAT                   pso_fmt;
+
+    reshade::api::resource        mid;
+    reshade::api::resource_view   mid_srv;
+    UINT                          w, h;
+    DXGI_FORMAT                   mid_fmt;
+};
+
+static SynthVkPresent g_vkp;
+
+// The per-size objects; the pipeline stays.
+static void SynthVkPresentRelease()
+{
+    if (g_vkp.dev == nullptr) return;
+    if (g_vkp.mid_srv.handle != 0)
+    { g_vkp.dev->destroy_resource_view(g_vkp.mid_srv); g_vkp.mid_srv = reshade::api::resource_view { 0 }; }
+    if (g_vkp.mid.handle != 0)
+    { g_vkp.dev->destroy_resource(g_vkp.mid); g_vkp.mid = reshade::api::resource { 0 }; }
+    g_vkp.w = g_vkp.h = 0;
+}
+
+// Everything, before the device goes.
+static void SynthVkPresentClose()
+{
+    SynthVkPresentRelease();
+    if (g_vkp.dev == nullptr) return;
+    if (g_vkp.pso.handle != 0)
+    { g_vkp.dev->destroy_pipeline(g_vkp.pso); g_vkp.pso = reshade::api::pipeline { 0 }; }
+    if (g_vkp.layout.handle != 0)
+    { g_vkp.dev->destroy_pipeline_layout(g_vkp.layout); g_vkp.layout = reshade::api::pipeline_layout { 0 }; }
+    if (g_vkp.samp.handle != 0)
+    { g_vkp.dev->destroy_sampler(g_vkp.samp); g_vkp.samp = reshade::api::sampler { 0 }; }
+    g_vkp.tried = g_vkp.ready = false;
+    g_vkp.dev = nullptr;
+}
+
+static bool SynthVkPresentOpen(reshade::api::device *dev, DXGI_FORMAT fmt)
+{
+    using namespace reshade::api;
+
+    if (g_vkp.ready && g_vkp.pso_fmt == fmt) return true;
+    if (g_vkp.tried && !g_vkp.ready) return false;
+    // The pipeline names its target format, so another back buffer format is
+    // another pipeline. The layout and the sampler carry over.
+    if (g_vkp.ready)
+    { g_vkp.dev->destroy_pipeline(g_vkp.pso); g_vkp.pso = pipeline { 0 }; g_vkp.ready = false; }
+    g_vkp.tried = true;
+    g_vkp.dev   = dev;
+    if (dev == nullptr) return false;
+
+    if (g_vkp.samp.handle == 0)
+    {
+        sampler_desc sd = {};
+        sd.filter    = filter_mode::min_mag_mip_point;
+        sd.address_u = texture_address_mode::clamp;
+        sd.address_v = texture_address_mode::clamp;
+        sd.address_w = texture_address_mode::clamp;
+        if (!dev->create_sampler(sd, &g_vkp.samp))
+        { Log("[synth] the present sampler could not be created."); return false; }
+    }
+    if (g_vkp.layout.handle == 0)
+    {
+        static const descriptor_range range = {
+            /*binding*/ 0, /*dx_register_index*/ 0, /*dx_register_space*/ 0, /*count*/ 1,
+            /*visibility*/ shader_stage::pixel, /*array_size*/ 1,
+            descriptor_type::sampler_with_resource_view };
+        pipeline_layout_param param = {};
+        param.type                    = pipeline_layout_param_type::push_descriptors_with_ranges;
+        param.descriptor_table.count  = 1;
+        param.descriptor_table.ranges = &range;
+        if (!dev->create_pipeline_layout(1, &param, &g_vkp.layout))
+        { Log("[synth] the present pipeline layout could not be created."); return false; }
+    }
+
+    shader_desc vs = {};
+    vs.code      = kPresentVertSpv;
+    vs.code_size = sizeof(kPresentVertSpv);
+    shader_desc ps = {};
+    ps.code      = kPresentFragSpv;
+    ps.code_size = sizeof(kPresentFragSpv);
+    format             rtf  = static_cast<format>(fmt);
+    primitive_topology topo = primitive_topology::triangle_list;
+    rasterizer_desc    rs   = {};
+    rs.cull_mode = cull_mode::none;
+    depth_stencil_desc ds   = {};
+    ds.depth_enable     = false;
+    ds.depth_write_mask = false;
+    blend_desc         bs   = {};
+
+    pipeline_subobject subs[7] = {
+        { pipeline_subobject_type::vertex_shader,         1, &vs },
+        { pipeline_subobject_type::pixel_shader,          1, &ps },
+        { pipeline_subobject_type::render_target_formats, 1, &rtf },
+        { pipeline_subobject_type::primitive_topology,    1, &topo },
+        { pipeline_subobject_type::rasterizer_state,      1, &rs },
+        { pipeline_subobject_type::depth_stencil_state,   1, &ds },
+        { pipeline_subobject_type::blend_state,           1, &bs },
+    };
+    if (!dev->create_pipeline(g_vkp.layout, 7, subs, &g_vkp.pso))
+    {
+        Log("[synth] the present pipeline could not be created for %s. The two SPIR-V "
+            "modules are the ones present_spv.h describes; a refusal here is the driver's.",
+            FormatName(fmt));
+        return false;
+    }
+    g_vkp.pso_fmt = fmt;
+    g_vkp.ready   = true;
+    Log("[synth] present pass built: the result is drawn into the %s back buffer with one "
+        "fullscreen triangle instead of copied, because the image was not created to be "
+        "copied into.", FormatName(fmt));
+    return true;
+}
+
+static bool SynthVkPresentSize(UINT w, UINT h, DXGI_FORMAT fmt)
+{
+    using namespace reshade::api;
+
+    if (g_vkp.mid.handle != 0 && g_vkp.w == w && g_vkp.h == h && g_vkp.mid_fmt == fmt) return true;
+    SynthVkPresentRelease();
+
+    const resource_desc rd(w, h, 1, 1, static_cast<format>(fmt), 1, memory_heap::default_,
+                           resource_usage::shader_resource | resource_usage::copy_dest);
+    if (!g_vkp.dev->create_resource(rd, nullptr, resource_usage::shader_resource, &g_vkp.mid))
+    {
+        Log("[synth] the %ux%u %s texture the present pass samples could not be created.",
+            w, h, FormatName(fmt));
+        return false;
+    }
+    if (!g_vkp.dev->create_resource_view(g_vkp.mid, resource_usage::shader_resource,
+                                         resource_view_desc(static_cast<format>(fmt)), &g_vkp.mid_srv))
+    {
+        Log("[synth] no shader resource view could be made over the present pass's texture.");
+        SynthVkPresentRelease();
+        return false;
+    }
+    g_vkp.w = w;
+    g_vkp.h = h;
+    g_vkp.mid_fmt = fmt;
+    return true;
+}
+
+// Records into the caller's command list. The back buffer arrives in
+// copy_source and leaves in render_target, as it does on the copy path.
+static void SynthVkPresentDraw(reshade::api::command_list *cmd, SVkCommandBuffer cb,
+                               reshade::api::resource back, reshade::api::resource_view rtv,
+                               UINT w, UINT h)
+{
+    using namespace reshade::api;
+
+    cmd->barrier(g_vkp.mid, resource_usage::shader_resource, resource_usage::copy_dest);
+    SynthVkBarrier(cb, g_svk.img[SLOT_OUTPUT], kSVkLayoutGeneral, kSVkLayoutGeneral);
+    SynthVkCopyImage(cb, g_svk.img[SLOT_OUTPUT], kSVkLayoutGeneral,
+                     static_cast<SVkHandle>(g_vkp.mid.handle), kSVkLayoutTransferDst, w, h);
+    cmd->barrier(g_vkp.mid, resource_usage::copy_dest, resource_usage::shader_resource);
+    cmd->barrier(back, resource_usage::copy_source, resource_usage::render_target);
+
+    render_pass_render_target_desc rt = {};
+    rt.view     = rtv;
+    rt.load_op  = render_pass_load_op::load;
+    rt.store_op = render_pass_store_op::store;
+    cmd->begin_render_pass(1, &rt, nullptr);
+    const viewport vp = { 0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f };
+    const rect     sc = { 0, 0, static_cast<int32_t>(w), static_cast<int32_t>(h) };
+    cmd->bind_viewports(0, 1, &vp);
+    cmd->bind_scissor_rects(0, 1, &sc);
+    cmd->bind_pipeline(pipeline_stage::all_graphics, g_vkp.pso);
+    sampler_with_resource_view sv = { g_vkp.samp, g_vkp.mid_srv };
+    descriptor_table_update u = {};
+    u.binding     = 0;
+    u.count       = 1;
+    u.type        = descriptor_type::sampler_with_resource_view;
+    u.descriptors = &sv;
+    cmd->push_descriptors(shader_stage::pixel, g_vkp.layout, 0, u);
+    cmd->draw(3, 1, 0, 0);
+    cmd->end_render_pass();
+}
+
 // Built once. A failure is latched and never retried, the same rule Synth12Open
 // and SynthVkOpen follow, and every branch that returns false names its own
 // reason -- there is no path out of here that is silently off.
@@ -3830,10 +4027,19 @@ static void SynthOfaVkRebuild();
 // sampled read wants. See SynthDepthCsRun.
 static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cmd,
                          const SynthParams *sp, reshade::api::resource back,
+                         reshade::api::resource_view back_view, uint32_t back_usage,
                          reshade::api::resource depth, reshade::api::resource mv,
                          UINT w, UINT h, DXGI_FORMAT back_fmt)
 {
     using reshade::api::resource_usage;
+
+    // Drawn rather than copied when the back buffer cannot be copied into, or
+    // when the file says so. Decided per frame from the usage ReShade reports,
+    // because a swapchain is recreated on every mode change and the next one
+    // need not be created like the last.
+    const bool draw = g_cfg.vk_present == 2 ||
+                      (g_cfg.vk_present == 0 &&
+                       (back_usage & static_cast<uint32_t>(resource_usage::copy_dest)) == 0);
 
     if (!Synth12Open(rt)) return;
     if (!SynthVkOpen(rt)) return;
@@ -3869,6 +4075,7 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
         // submitted still names them. The pipeline, the layout and the sampler
         // survive -- none of them depends on the size.
         SynthDepthCsRelease();
+        SynthVkPresentRelease();
         if (!Synth12Build(sp, w, h, w, h, back_fmt)) { Synth12NoteBuildFailure(true); return; }
         if (!SynthVkImport()) { SynthVkReleaseImages(); g_svk.ready = false; return; }
     }
@@ -4023,7 +4230,25 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     // submitted, and recording into it now would be recording into nothing.
     cb = reinterpret_cast<SVkCommandBuffer>(static_cast<uintptr_t>(cmd->get_native()));
 
-    if (ok && g_cfg.mode == 2)
+    if (ok && g_cfg.mode == 2 && draw)
+    {
+        if (SynthVkPresentOpen(rt->get_device(), back_fmt) && SynthVkPresentSize(w, h, back_fmt))
+            SynthVkPresentDraw(cmd, cb, back, back_view, w, h);
+        else
+        {
+            // Nothing can put the result into this back buffer, so the session
+            // stops rather than deliver frames nobody sees. The reason is the
+            // line the present pass logged.
+            cmd->barrier(back, resource_usage::copy_source, resource_usage::render_target);
+            if (!ofa_mv)
+                cmd->barrier(mv, resource_usage::copy_source, resource_usage::shader_resource);
+            Log("[synth] the present pass could not be built, so this transport stops. "
+                "The game keeps rendering on its own.");
+            g_svk.ready = false;
+            return;
+        }
+    }
+    else if (ok && g_cfg.mode == 2)
     {
         cmd->barrier(back, resource_usage::copy_source, resource_usage::copy_dest);
         SynthVkBarrier(cb, g_svk.img[SLOT_OUTPUT], kSVkLayoutGeneral, kSVkLayoutGeneral);
@@ -5654,6 +5879,8 @@ static void SynthVkShutdownForDevice()
     SynthOfaVkRebuild();
     Breadcrumb("shutdown: releasing the depth compute");
     SynthDepthCsRelease();
+    Breadcrumb("shutdown: releasing the present pass");
+    SynthVkPresentClose();
     Breadcrumb("shutdown: destroying the imported Vulkan images");
     SynthVkReleaseImages();
     Breadcrumb("shutdown: releasing the private D3D12 textures and feature");
@@ -6102,23 +6329,27 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     // of the render target here because this is where it is first resolved. The
     // Vulkan transport copies out of it and back into it, and both directions
     // need the corresponding usage on the image ReShade created.
-    if (f->device_api == static_cast<uint32_t>(reshade::api::device_api::vulkan) &&
-        (back.usage & static_cast<uint32_t>(reshade::api::resource_usage::copy_source |
-                                            reshade::api::resource_usage::copy_dest)) !=
-        static_cast<uint32_t>(reshade::api::resource_usage::copy_source |
-                              reshade::api::resource_usage::copy_dest))
+    // Out of it by a copy, always: ReShade gives every swapchain TRANSFER_SRC.
+    // Into it by a copy where the game asked for TRANSFER_DST, and by a draw
+    // where it did not (#23), unless vk_present=1 pins the copy.
+    if (f->device_api == static_cast<uint32_t>(reshade::api::device_api::vulkan))
     {
-        static bool said;
-        if (!said)
+        const uint32_t need = static_cast<uint32_t>(reshade::api::resource_usage::copy_source) |
+            (g_cfg.vk_present == 1 ? static_cast<uint32_t>(reshade::api::resource_usage::copy_dest) : 0u);
+        if ((back.usage & need) != need)
         {
-            said = true;
-            Log("[synth] not delivering: the render target ReShade supplies has usage "
-                "0x%08X, and a Vulkan transfer needs it to be both a copy source and a "
-                "copy destination. Nothing is copied out of an image that was not "
-                "created to be copied out of.", back.usage);
+            static bool said;
+            if (!said)
+            {
+                said = true;
+                Log("[synth] not delivering: the render target ReShade supplies has usage "
+                    "0x%08X, and this transport needs it to be a copy source%s. Nothing is "
+                    "copied out of an image that was not created to be copied out of.",
+                    back.usage, g_cfg.vk_present == 1 ? " and, with vk_present=1, a copy destination" : "");
+            }
+            if (back.tex11 != nullptr) back.tex11->Release();
+            return;
         }
-        if (back.tex11 != nullptr) back.tex11->Release();
-        return;
     }
 
     // Only the D3D11 transport needs a device context; the D3D12 one records
@@ -6300,7 +6531,7 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
         // Same rule as the D3D12 arm below: SynthArmRefusal has already refused
         // anything under stage 3, and neither of these transports has a step to
         // isolate at 1 or 2 the way the mirror's cross-device copies do.
-        SynthVkFrame(rt, cmd, &sp, back.res, depth->res, mv->res,
+        SynthVkFrame(rt, cmd, &sp, back.res, rtv, back.usage, depth->res, mv->res,
                      back.w, back.h, back.fmt);
     }
     else if (g_cfg.stage >= 3)

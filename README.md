@@ -112,6 +112,7 @@ not re-read until the game's DLSS goes quiet.
 | `ofa_grid` | 2 | Grid of the driver's optical flow engine on the substitute path: `1`, `2`, `4`, or `0` to use a ReShade motion-vector shader instead. |
 | `ofa_perf` | 20 | Optical flow effort, NVIDIA's own values: `5` slow, `10` medium, `20` fast. |
 | `mv_sign_x`, `mv_sign_y` | 0 | Force the motion-vector sign (`1`, `-1`); `0` uses the provider's convention or the engine's measurement. Diagnostic. |
+| `vk_present` | 0 | How the substitute's result reaches a Vulkan back buffer: `0` copies where the image allows it and draws it otherwise, `1` copies only, `2` draws always. |
 | `stage` | 3 | How much runs: `0` inert, `1` input copies, `2` plus depth conversion, `3` everything. Below `3` the substitute does not evaluate; below `2` the Vulkan mirror records nothing. |
 | `mode` | 2 | `0` never writes to the game, `1` transport only, `2` the full path. |
 | `skip_game` | 1 | Skip the game's own DLSS evaluate while the bridge is delivering; its result would be overwritten. |
