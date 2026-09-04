@@ -169,6 +169,16 @@ struct BridgeCfg
     // TRANSFER_SRC and nothing else, so an image a game created without
     // TRANSFER_DST can be drawn into and not copied into (#23).
     int vk_present;
+    // How the Vulkan transport of the SUBSTITUTE contract orders itself against
+    // the private D3D12 device: 0 parks the game's queue on a Vulkan event while
+    // a worker thread runs the optical flow and the evaluate, 1 waits the queue
+    // idle on the CPU and runs both on the present thread, which is what 1.4.8
+    // did. 0 is the default because 1 costs a full CPU-GPU serialisation per
+    // frame -- Ghost Recon Breakpoint measured ~150 fps of its own against ~75
+    // with the substitute and the GPU 46% busy (#23). 1 is the fallback if a
+    // driver does not like the park; the mirror's own park is not affected by
+    // this key.
+    int vk_sync;
 };
 
 // auto is not a fourth point on a scale with the other three, so this is stored
@@ -186,7 +196,7 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0 };
 
 // synth_after answers one question and used to answer two. It is still the
 // opt-in for synthesising a contract in a game that has never called DLSS --
@@ -472,6 +482,7 @@ static void CfgReload()
         else if (_stricmp(key, "ofa_grid")    == 0) next.ofa_grid    = val;
         else if (_stricmp(key, "ofa_perf")    == 0) next.ofa_perf    = val;
         else if (_stricmp(key, "vk_present")  == 0) next.vk_present  = (val >= 0 && val <= 2) ? val : 0;
+        else if (_stricmp(key, "vk_sync")     == 0) next.vk_sync     = (val >= 0 && val <= 1) ? val : 0;
         // Only the sign is taken, because only the sign is unknown: the
         // magnitude is the back buffer size and this add-on measures that. A
         // number here that is not a sign would be a second way to say something
@@ -512,7 +523,8 @@ static void CfgReload()
                          (next.mv_sign_y != g_cfg.mv_sign_y) ||
                          (next.ofa_grid != g_cfg.ofa_grid) ||
                          (next.ofa_perf != g_cfg.ofa_perf) ||
-                         (next.vk_present != g_cfg.vk_present);
+                         (next.vk_present != g_cfg.vk_present) ||
+                         (next.vk_sync != g_cfg.vk_sync);
     // The first read reports whatever it found, changed or not. Until now the echo
     // fired only on a difference from the built-in defaults, so a session running on
     // defaults had no config line at all -- and "no config line" then meant either
@@ -525,11 +537,12 @@ static void CfgReload()
     g_cfg = next;
     Log("[bridge] config: stage=%d mode=%d flags=%d subrects=%d reset_every=%d pixels=%d "
         "skip_game=%d dred=%d skip_exe=%d unwrap=%d source=%s synth=%d hash_out=%d synth_after=%d "
-        "mv_sign_x=%d mv_sign_y=%d ofa_grid=%d ofa_perf=%d vk_present=%d",
+        "mv_sign_x=%d mv_sign_y=%d ofa_grid=%d ofa_perf=%d vk_present=%d vk_sync=%d",
         g_cfg.stage, g_cfg.mode, g_cfg.flags, g_cfg.subrects, g_cfg.reset_every, g_cfg.pixels,
         g_cfg.skip_game, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap,
         kCfgSourceName[g_cfg.source], g_cfg.synth, g_cfg.hash_out, g_cfg.synth_after,
-        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.ofa_grid, g_cfg.ofa_perf, g_cfg.vk_present);
+        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.ofa_grid, g_cfg.ofa_perf, g_cfg.vk_present,
+        g_cfg.vk_sync);
 
     // Creation-time values only take effect on a new feature, so invalidate the
     // current one and let the next frame build it again.
@@ -606,6 +619,11 @@ static bool CfgWriteFile(const char *path)
         "# where the image allows it and draws it otherwise, 1 copies only, 2 draws\n"
         "# always.\n"
         "vk_present=%d\n"
+        "# How the substitute's Vulkan transport orders itself against the private\n"
+        "# D3D12 device: 0 parks the game's queue on a Vulkan event while a worker\n"
+        "# thread runs the optical flow and the evaluate, 1 waits the queue idle on\n"
+        "# the CPU instead, which is slower and is the fallback if 0 misbehaves.\n"
+        "vk_sync=%d\n"
         "\n"
         "# THE REST. stage 0 switches the add-on off without removing the file.\n"
         "# flags -1 copies the create flags the game declared; any other value\n"
@@ -622,7 +640,7 @@ static bool CfgWriteFile(const char *path)
         "unwrap=%d\n",
         1, g_cfg.synth, g_cfg.synth_after,
         kCfgSourceName[g_cfg.source], g_cfg.ofa_grid, g_cfg.ofa_perf,
-        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.vk_present,
+        g_cfg.mv_sign_x, g_cfg.mv_sign_y, g_cfg.vk_present, g_cfg.vk_sync,
         g_cfg.stage, g_cfg.mode, g_cfg.skip_game, g_cfg.flags, g_cfg.subrects,
         g_cfg.reset_every, g_cfg.pixels, g_cfg.dred, g_cfg.skip_exe, g_cfg.unwrap);
     fclose(f);

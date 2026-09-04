@@ -2676,15 +2676,17 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
     }
 
     // The only thing ordering these two queues, since there is no shared fence
-    // between them. The caller has already idled the game's Vulkan queue before
-    // this ran; this waits out the D3D12 half before the caller reads the output
-    // back. Cheap to say, expensive to run -- see the note below.
+    // between them. The caller has already made sure the copies in have executed
+    // -- by idling the game's Vulkan queue, or by seeing the park's ev_in -- and
+    // this waits out the D3D12 half before the output is read back. Cheap to say,
+    // expensive to run -- see the note below.
     // The budget is the caller's, because who is waiting decides what a safe wait
-    // is. On the synthetic path this runs on ReShade's present thread with
-    // nothing else parked behind it, and four seconds is a generous ceiling. On
-    // the Vulkan mirror the game's own GPU is parked at a vkCmdWaitEvents until
-    // this returns, and Windows resets a device that stops for two seconds -- so
-    // the mirror sets a shorter one and gives up inside the TDR window.
+    // is. With vk_sync=1 this runs on ReShade's present thread with nothing else
+    // parked behind it, and four seconds is a generous ceiling. On the Vulkan
+    // mirror, and on the substitute's own park, the game's GPU is stopped at a
+    // vkCmdWaitEvents until this returns, and Windows resets a device that stops
+    // for two seconds -- so both set a shorter one and give up inside the TDR
+    // window.
     const DWORD budget = g_s12.wait_ms != 0 ? g_s12.wait_ms : 4000;
     {
         if (!Synth12WaitFence(v, budget))
@@ -2725,15 +2727,21 @@ static bool Synth12EvaluateShared(const SynthParams *sp)
 // back, and a jump left in place across an unload. There is no Vulkan hook to
 // remove on detach because there is none to install.
 //
-// The price of not importing the fence is that the two queues are ordered on the
-// CPU: ReShade's queue is idled after the copies in, and the D3D12 fence is
-// waited on before the copy out.
-// ponytail: a full pipeline bubble per delivered frame. The upgrade is importing
-// g_s12.fence as a Vulkan timeline semaphore -- a D3D12 fence and a timeline
-// semaphore are the same object, and g_s12.fence would only have to be created
-// D3D12_FENCE_FLAG_SHARED -- which needs VK_KHR_external_semaphore_win32, which
-// ReShade does not enable, which is what would need the hook. Do it when a
-// Vulkan title measures badly enough to be worth that.
+// The price of not importing the fence is that the two queues are ordered by
+// something other than a shared fence. That used to be the CPU -- ReShade's queue
+// idled after the copies in, the D3D12 fence waited on before the copy out, both
+// on the present thread -- and it is now the same event park the Vulkan mirror
+// runs, with the CPU wait left in place behind vk_sync=1. See "The park" above
+// SynthVkFrame for the shape and for what it does and does not fix.
+// ponytail: the park stops the game's QUEUE for the length of the evaluate
+// instead of its render thread, which is the whole win and is not the whole of
+// it. The upgrade is importing g_s12.fence as a Vulkan timeline semaphore -- a
+// D3D12 fence and a timeline semaphore are the same object, and g_s12.fence
+// would only have to be created D3D12_FENCE_FLAG_SHARED -- which needs
+// VK_KHR_external_semaphore_win32, which ReShade does not enable, which is what
+// would need the hook. The cheaper one before that is a second set of shared
+// images, so frame N's evaluate can run while the game renders N+1 and nothing
+// parks at all, at one frame of latency.
 //
 // Every Vulkan entry point is resolved through vkGetDeviceProcAddr out of a
 // LoadLibrary of vulkan-1.dll. There is deliberately no import of it: a D3D11
@@ -3070,7 +3078,7 @@ static void SynthVkBarrier(SVkCommandBuffer cb, SVkHandle img, uint32_t from, ui
     // Not a queue family ownership transfer. These images are
     // VK_SHARING_MODE_EXCLUSIVE and are only ever touched from the one queue
     // ReShade renders effects on; the other API's access to them is separated by
-    // the CPU wait, not by an acquire and release pair.
+    // the CPU wait or by the event park, not by an acquire and release pair.
     b.srcQueueFamilyIndex = kSVkQueueFamilyIgnored;
     b.dstQueueFamilyIndex = kSVkQueueFamilyIgnored;
     b.image               = img;
@@ -3535,8 +3543,12 @@ struct SynthDepthCs
     // The view over whatever the DEPTH semantic is bound to, cached because the
     // binding almost never changes, and retired one frame late because the
     // command buffer that names it has not been submitted yet when it is
-    // replaced. The transport idles the queue once per frame, so a view retired
-    // at the top of frame N+1 is a view no submitted work still names.
+    // replaced. What makes a view retired at the top of frame N+1 safe to destroy
+    // is that frame N-1's command buffer -- the last one that named it -- has
+    // finished by then. Serialised, the queue idle at the top of every frame says
+    // so; parked, the wait on the park's idle handle does, because the worker sets
+    // it only after seeing the GPU reach frame N's own copies, and everything
+    // frame N-1 recorded is earlier in the same queue.
     uint64_t                    src_res;
     reshade::api::resource_view src_srv;
     reshade::api::resource_view retire_srv;
@@ -3937,8 +3949,9 @@ static reshade::api::resource SynthDepthCsRun(reshade::api::command_list *cmd,
     if (!g_dcs.ready || cmd == nullptr) return resource { 0 };
     if (!SynthDepthCsSize(w, h)) { g_dcs.ready = false; return resource { 0 }; }
 
-    // Last frame's view, retired now. The transport idles the queue once per
-    // frame, so nothing submitted still names it.
+    // Last frame's view, retired now. Nothing still in flight names it -- see the
+    // field's own note, which states what makes that true on each of the two
+    // transports.
     if (g_dcs.retire_srv.handle != 0)
     {
         g_dcs.dev->destroy_resource_view(g_dcs.retire_srv);
@@ -4030,6 +4043,319 @@ static bool SynthOfaVkStopped();
 // replaced, which is what a resolution or format change does.
 static void SynthOfaVkRebuild();
 
+// ---------------------------------------------------------------------------
+// The park
+//
+// What the note above the Vulkan declarations calls the price of not importing
+// the fence: rq->wait_idle() drains the game's queue on the CPU in the middle of
+// reshade_begin_effects, and the optical flow and the D3D12 evaluate then run
+// with the game's render thread stopped behind them. Ghost Recon Breakpoint on
+// an RTX 4070 SUPER, 1920x1080, reported ~150 fps of its own against ~75 with
+// the substitute contract and the GPU 46% busy (#23). The work is not what
+// costs; the serialisation is.
+//
+// So the Vulkan mirror's park, on this transport. The copies in are recorded, a
+// vkCmdSetEvent announces them, a vkCmdWaitEvents on a second event stops the
+// game's QUEUE at that point instead of its CPU, and the copy back is recorded
+// after the wait. A worker thread sees the first event, runs the optical flow
+// and the D3D12 evaluate on the private devices, and host-sets the second.
+// Nothing is hooked and no extension is needed -- vkmirror.inc's header states
+// why that is the whole reason this shape exists, and why the Khronos validation
+// layer reports two VUIDs for it that are the park rather than a mistake.
+//
+// Three things differ from the mirror's, and each is a decision rather than an
+// accident of where the code sits:
+//
+//   The command buffer is ReShade's own immediate one and not the game's. So the
+//   park is submitted by ReShade at the end of the frame it was recorded in, and
+//   everything ReShade records after this -- every technique, and its blit to the
+//   swapchain -- is behind the wait as well. That is what makes releasing the
+//   event unconditional here too, and for a worse consequence than a dropped
+//   frame.
+//
+//   The worker runs the optical flow as well as the evaluate. On this transport
+//   the vectors are computed between the copies and the evaluate, and its own
+//   CPU wait on an ID3D11Query is exactly the second half of what is being moved
+//   off the present thread.
+//
+//   A stall RETIRES this transport rather than draining. The mirror keeps going
+//   because a game that has its own DLSS loses nothing when a mirrored frame is
+//   skipped; here the substitute IS the picture, and a queue that stops answering
+//   is not a condition this transport can improve on by trying again. Retiring
+//   also makes the reuse question moot without a drain gate: nothing records
+//   again, so no pair can be reset while a queued vkCmdWaitEvents may still read
+//   it.
+//
+// The two alternating pairs are the mirror's and the proof is the mirror's, in
+// its own words: at the top of frame N+2 the render thread has waited on idle,
+// which the worker sets only after it has seen frame N+1's ev_in signalled by
+// the GPU, so everything frame N recorded -- its vkCmdWaitEvents included -- is
+// earlier in queue order and has completed. One queue, one submission order.
+//
+// vk_sync=1 in dlss5-bridge.cfg puts the serialisation back. It is the fallback
+// a user is told to try when the park misbehaves on their driver, and it is this
+// transport exactly as 1.4.8 shipped it.
+//
+// WHAT IT DOES NOT FIX, measured in ngxGym on 2026-09-04, RTX 5090, the two
+// transports run against each other on the same scenario. At 1920x1080 the
+// present thread's own time inside this function fell from 8.06 ms to 4.41 ms a
+// frame, and the game's queue was parked 4.41 ms; at 3840x1600 it fell from 9.04
+// to 8.47 with 8.39 ms of park. So the CPU wait is gone and the GPU stall is
+// not: the optical flow and the evaluate are real work on the same GPU, and
+// while the queue is parked the game has nothing else in it to overlap them
+// with. What this buys is the game's render thread, which is what a title with
+// CPU work of its own between two presents can use -- and it is why the frame
+// rate in the gym did not move at all: that host renders one frame at a time and
+// waits for its own fence, so there was no CPU time there to give back.
+// ---------------------------------------------------------------------------
+
+// Budgets, in milliseconds, and every one of them is about the 2 s Windows TDR
+// window rather than about what is comfortable. The game's GPU is stopped for
+// the whole of the worker's body, so the worst case is the sum of what it can
+// wait on: 300 to see the copies, then the optical flow's colour copy and its
+// D3D11 query and the evaluate, which is 300 + 600 + 200 + 600 = 1700 ms. The
+// mirror's own budget is 300 + 900 because its worker waits on one thing and
+// this one waits on three; the sum is what has to stay inside the window, not
+// the individual number.
+static const DWORD kSvpSeeCopiesMs = 300;
+static const DWORD kSvpWorkMs      = 600;
+// What the render thread gives the previous frame's worker before it decides the
+// worker is stuck rather than slow. Derived from the budget above and not chosen:
+// a hand-picked number below it retires the transport on one slow-but-successful
+// frame. The margin is the wake-up and the CPU frame between the two clocks.
+static const DWORD kSvpIdleMs      = kSvpSeeCopiesMs + 2 * kSvpWorkMs + 200 + 200;
+
+struct SynthVkPark
+{
+    // Off for the session: the events or the thread could not be made. The
+    // transport then runs serialised, which is a slower frame and not a lost one.
+    bool      off;
+    bool      said;        // which transport this session is on, said once
+
+    SVkHandle ev_in[2];    // device -> host: the copies in have executed
+    SVkHandle ev_out[2];   // host -> device: the evaluate is done
+    int       next;        // the pair the next frame takes; render thread only
+    volatile LONG cur;     // the pair the worker is servicing
+    HANDLE    idle;        // manual reset, set while no frame is parked
+    HANDLE    wake;        // auto reset, kicks the worker
+    HANDLE    worker;
+    volatile LONG stop;
+
+    // Handed over while the worker is idle and read by it alone after that. The
+    // present thread's own SynthParams is a stack object in OnSynthBeginEffects
+    // and is gone by the time the worker runs, so this is a copy and not a
+    // pointer.
+    SynthParams sp;
+    bool      ofa_mv;
+
+    // Whether the shared Output image holds a frame that was evaluated. The copy
+    // back has to be RECORDED before the evaluate that fills it has run, so this
+    // frame's decision is made on the last frame's result: false means the game's
+    // own back buffer goes to the screen untouched, which is what the first frames
+    // after an arm or a rebuild need -- the image is undefined until something has
+    // written it, and copying that over the back buffer is a frame of garbage.
+    bool      out_valid;
+
+    // The two numbers a performance report needs, and they answer different
+    // questions: how long the game's queue was stopped, and how long the present
+    // thread spent inside the transport. Serialised, the second is the first plus
+    // the queue drain; parked, it should be the recording alone.
+    // ponytail: the render thread adds to the frame pair while the worker reads
+    // and clears both. A lost sample in a log statistic is not worth a lock; make
+    // them interlocked if anything ever decides on these numbers.
+    double    park_ms, frame_ms;
+    LONG      park_n, frame_n;
+    UINT64    frames;      // delivered by the worker; the log line's counter
+};
+
+static SynthVkPark g_svp;
+
+// Wall clock in milliseconds. QueryPerformanceCounter because the numbers this
+// measures are single-digit milliseconds and GetTickCount's 16 ms cannot see
+// them.
+static double SynthNowMs()
+{
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    return static_cast<double>(t.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+}
+
+static DWORD WINAPI SynthVkParkWorker(LPVOID)
+{
+    for (;;)
+    {
+        WaitForSingleObject(g_svp.wake, INFINITE);
+        if (g_svp.stop != 0)
+        {
+            // The one break in this loop, and it releases the game on its way
+            // out. Both pairs, because which one the render thread armed is
+            // exactly what is unknowable here -- the same reason the mirror's
+            // worker sets both.
+            if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
+                for (int i = 0; i < 2; ++i)
+                    if (g_svp.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_svp.ev_out[i]);
+            SetEvent(g_svp.idle);
+            break;
+        }
+
+        // Poll rather than wait: a VkEvent signalled by the GPU has no waitable
+        // Win32 handle behind it. SwitchToThread first so a fast frame costs no
+        // sleep quantum, Sleep(1) after the first millisecond so a slow one does
+        // not burn a core.
+        const int slot = static_cast<int>(g_svp.cur);
+        const ULONGLONG t0 = GetTickCount64();
+        bool seen = false;
+        for (;;)
+        {
+            if (g_svk.EvStatus(g_svk.dev, g_svp.ev_in[slot]) == kSVkEventSet) { seen = true; break; }
+            const ULONGLONG waited = GetTickCount64() - t0;
+            if (waited > kSvpSeeCopiesMs) break;
+            if (waited == 0) SwitchToThread(); else Sleep(1);
+        }
+
+        if (seen)
+        {
+            const double a = SynthNowMs();
+            // The budget the two D3D12 waits below run under, stated here rather
+            // than inherited from whichever path ran last: the mirror sets its
+            // own 900 and nothing resets it. Read by Synth12EvaluateShared and by
+            // the optical flow's colour copy, which is the wait this transport
+            // added to the parked section.
+            g_s12.wait_ms = kSvpWorkMs;
+            // Serialised against the game's own NGX evaluate, as the mirror's
+            // worker is. On the present thread the two could not overlap because
+            // ReShade presents from the thread the game renders on; off that
+            // thread they can, for the one frame a handover takes.
+            if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
+            const bool mv_ready = !g_svp.ofa_mv || SynthOfaVkFrame();
+            const bool ok = mv_ready && Synth12EvaluateShared(&g_svp.sp);
+            if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
+            g_svp.park_ms += SynthNowMs() - a;
+            ++g_svp.park_n;
+
+            // Read by the render thread on the next frame, and only there: it
+            // decides whether that frame records a copy back at all.
+            g_svp.out_valid = ok;
+            if (ok)
+            {
+                const UINT64 n = ++g_svp.frames;
+                CountDelivered();
+                if (n <= 1 || (n % 600) == 0)
+                    Log("[synth] Vulkan frame %llu delivered; the game's queue was parked "
+                        "%.2f ms and the present thread spent %.2f ms in the transport, "
+                        "averaged over the last %ld frames.",
+                        n, g_svp.park_n != 0 ? g_svp.park_ms / g_svp.park_n : 0.0,
+                        g_svp.frame_n != 0 ? g_svp.frame_ms / g_svp.frame_n : 0.0,
+                        g_svp.park_n);
+                if ((n % 600) == 0)
+                { g_svp.park_ms = g_svp.frame_ms = 0.0; g_svp.park_n = g_svp.frame_n = 0; }
+            }
+        }
+        else
+        {
+            // Not a skipped frame: the frame this worker was woken for is still
+            // queued with its own vkCmdWaitEvents unexecuted, and reusing its pair
+            // later would reset an event that wait may still be about to read.
+            // Retiring answers that without a drain gate -- nothing records again
+            // -- and a queue that did not reach a copy in 300 ms is not a
+            // condition trying again improves on.
+            Log("[synth] the game's queue did not reach the substitute's copies within "
+                "%lu ms, so this transport stops here and the game keeps rendering on its "
+                "own. If it happens repeatedly on this driver, vk_sync=1 in "
+                "dlss5-bridge.cfg runs the transport without the park at the cost of a "
+                "full CPU wait every frame.", kSvpSeeCopiesMs);
+            g_svk.ready = false;
+        }
+
+        // UNCONDITIONAL, and written here rather than inside either branch for
+        // exactly that reason. ReShade's command buffer is stopped at a
+        // vkCmdWaitEvents on this event with the whole rest of the frame behind
+        // it; an exit path that does not set it is a device loss for the game
+        // rather than a dropped frame.
+        g_svk.EvSet(g_svk.dev, g_svp.ev_out[slot]);
+        SetEvent(g_svp.idle);
+    }
+    return 0;
+}
+
+// The four VkEvents, the two Win32 events and the thread. Each piece tested on
+// its own: a teardown can leave one made and the others gone, and remaking one
+// that exists leaks a handle or starts a second thread on the same slot.
+static bool SynthVkParkEnsure()
+{
+    if (g_svp.ev_in[0] != 0 && g_svp.worker != nullptr) return true;
+
+    if (g_svp.ev_in[0] == 0)
+    {
+        SVkEventCreateInfo eci = {};
+        eci.sType = kSVkStEventCreateInfo;
+        for (int i = 0; i < 2; ++i)
+            if (g_svk.EvCreate(g_svk.dev, &eci, nullptr, &g_svp.ev_in[i]) != kSVkSuccess ||
+                g_svk.EvCreate(g_svk.dev, &eci, nullptr, &g_svp.ev_out[i]) != kSVkSuccess)
+            { Log("[synth] vkCreateEvent refused, so the frame cannot be parked."); return false; }
+    }
+
+    if (g_svp.idle == nullptr) g_svp.idle = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+    if (g_svp.wake == nullptr) g_svp.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_svp.idle == nullptr || g_svp.wake == nullptr)
+    { Log("[synth] the park's own Win32 events could not be created."); return false; }
+    // Set, not merely present: a shutdown can join the worker with idle clear, and
+    // the next frame's wait would then time out for a park that no longer exists.
+    SetEvent(g_svp.idle);
+
+    if (g_svp.worker == nullptr)
+    {
+        g_svp.stop = 0;
+        g_svp.worker = CreateThread(nullptr, 0, &SynthVkParkWorker, nullptr, 0, nullptr);
+        if (g_svp.worker == nullptr)
+        { Log("[synth] the transport's worker thread would not start."); return false; }
+    }
+    return true;
+}
+
+// Detach, and the one case that has to work: the add-on unloaded or the device
+// destroyed while a frame is parked. Release the game first, then stop the
+// thread -- the same order VkmShutdown establishes and for the same reason.
+//
+// It must also run BEFORE SynthVkShutdownForDevice's vkDeviceWaitIdle: a queue
+// parked at a vkCmdWaitEvents never goes idle, so that wait would never return.
+static void SynthVkParkStop()
+{
+    if (g_svp.worker != nullptr)
+    {
+        if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
+            for (int i = 0; i < 2; ++i)
+                if (g_svp.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_svp.ev_out[i]);
+        g_svp.stop = 1;
+        SetEvent(g_svp.wake);
+        WaitForSingleObject(g_svp.worker, 2000);
+        // Again, and this pass is the one that counts: it covers the 2000 ms
+        // expiring on a worker still inside its evaluate, which leaves the loop's
+        // own release unreached.
+        if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
+            for (int i = 0; i < 2; ++i)
+                if (g_svp.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_svp.ev_out[i]);
+        CloseHandle(g_svp.worker);
+        g_svp.worker = nullptr;
+    }
+
+    // The VkEvents only now: every EvSet above needs them and the worker has been
+    // joined, so nothing can wait on one after this. They are four of the objects
+    // the Khronos validation layer counts at vkDestroyDevice.
+    if (g_svk.EvDestroy != nullptr && g_svk.dev != nullptr)
+        for (int i = 0; i < 2; ++i)
+        {
+            if (g_svp.ev_in[i]  != 0) { g_svk.EvDestroy(g_svk.dev, g_svp.ev_in[i],  nullptr); g_svp.ev_in[i]  = 0; }
+            if (g_svp.ev_out[i] != 0) { g_svk.EvDestroy(g_svk.dev, g_svp.ev_out[i], nullptr); g_svp.ev_out[i] = 0; }
+        }
+    if (g_svp.idle != nullptr) { CloseHandle(g_svp.idle); g_svp.idle = nullptr; }
+    if (g_svp.wake != nullptr) { CloseHandle(g_svp.wake); g_svp.wake = nullptr; }
+    g_svp.stop      = 0;
+    g_svp.out_valid = false;
+    g_svp.said      = false;
+}
+
 // One frame.
 //
 // The states the game's resources are in at reshade_begin_effects are the same
@@ -4074,19 +4400,69 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     reshade::api::command_queue *rq = rt->get_command_queue();
     if (rq == nullptr) return;
 
+    const double frame_t0 = SynthNowMs();
+
+    // The park, unless the file asks for the serialisation or the park could not
+    // be built. Decided per frame because vk_sync is re-read about once a second,
+    // like every other key.
+    bool park = g_cfg.vk_sync == 0 && !g_svp.off;
+    if (park && !SynthVkParkEnsure())
+    {
+        // Said by whichever branch failed. The transport still works serialised,
+        // so this is a slower frame rather than a lost one.
+        Log("[synth] the park could not be built, so this session runs the fully "
+            "serialised transport instead.");
+        g_svp.off = true;
+        park = false;
+    }
+    if (!g_svp.said)
+    {
+        g_svp.said = true;
+        Log("[synth] the Vulkan transport %s. %s",
+            park ? "parks the game's queue on a Vulkan event while the optical flow and "
+                   "the D3D12 evaluate run on a worker thread"
+                 : "waits the game's queue idle on the CPU and runs the optical flow and "
+                   "the D3D12 evaluate on the present thread",
+            park ? "Set vk_sync=1 in dlss5-bridge.cfg to go back to the serialised "
+                   "transport if the picture or the driver misbehaves."
+                 : "vk_sync=0 parks instead, which is the default and does not stop the "
+                   "render thread.");
+    }
+
+    // Before anything reads or writes the private D3D12 session, the optical flow
+    // engine or the shared images: the worker owns all three for the length of a
+    // park. Waited on whenever a worker exists, not only when this frame parks --
+    // vk_sync can be edited between two frames, and the rebuild below idles the
+    // game's queue, which never happens while it is parked.
+    if (g_svp.worker != nullptr && g_svp.idle != nullptr &&
+        WaitForSingleObject(g_svp.idle, kSvpIdleMs) != WAIT_OBJECT_0)
+    {
+        Log("[synth] the previous frame's park had not cleared %lu ms later, so this "
+            "transport stops rather than record another one. The game keeps rendering on "
+            "its own.", kSvpIdleMs);
+        g_svk.ready = false;
+        return;
+    }
+
     if (g_s12.feature == nullptr || g_s12.w != w || g_s12.h != h || g_s12.fmt != back_fmt)
     {
         Log("[synth] building the D3D12 feature and its Vulkan import for %ux%u %s",
             w, h, FormatName(back_fmt));
-        // Idled first, and this is not belt and braces. The only wait this
-        // transport performs sits in the middle of a frame -- everything after
-        // it, the copy out of the output image included, is recorded and
-        // submitted with nothing waiting on it -- so at the top of the next
+        // Idled first, and this is not belt and braces. Nothing waits for the
+        // command buffer this transport records into -- serialised, everything
+        // after the wait in the middle of the frame is submitted with nothing
+        // behind it; parked, the whole frame is -- so at the top of the next
         // frame last frame's command buffer may still be executing and still
         // naming these images. Destroying a VkImage a submitted command buffer
         // names is undefined, and a resolution change is exactly when it would
-        // happen.
+        // happen. Safe here because the wait on idle above returned, so no frame
+        // is parked and the queue can reach the end of its work.
         rq->wait_idle();
+        // The new Output image holds nothing until something has evaluated into
+        // it, and the park records its copy back a frame before it knows. Without
+        // this every resolution change would put one frame of undefined memory on
+        // screen.
+        g_svp.out_valid = false;
         // The images before the textures they are backed by: releasing a D3D12
         // resource that an imported VkDeviceMemory still names is a use after
         // free neither API has any way to report.
@@ -4224,36 +4600,80 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     SynthVkCopyImage(cb, static_cast<SVkHandle>(dconv.handle), kSVkLayoutTransferSrc,
                      g_svk.img[SLOT_DEPTH], kSVkLayoutGeneral, w, h);
 
-    // The whole of the CPU synchronisation on this side, and the reason there is
-    // no fence in this transport. wait_idle flushes ReShade's immediate command
-    // list and then waits the queue out, so everything above has finished on the
-    // GPU before the D3D12 evaluate below reads any of it.
-    rq->wait_idle();
+    bool ok;
+    if (!park)
+    {
+        // The whole of the CPU synchronisation on this side, and the reason there
+        // is no fence in this transport. wait_idle flushes ReShade's immediate
+        // command list and then waits the queue out, so everything above has
+        // finished on the GPU before the D3D12 evaluate below reads any of it.
+        rq->wait_idle();
 
-    // The optical flow engine copies the colour that has just crossed into its
-    // own texture on the D3D12 side, reads it through the private D3D11 device,
-    // and writes the vectors the evaluate below hands to NGX. It has to sit here
-    // and nowhere else: above the wait the colour is not there yet, and below the
-    // evaluate it would be a frame late.
-    //
-    // A frame the engine does not deliver -- the first one, which has no
-    // previous frame to compare against, or one whose execute was refused -- is
-    // not delivered at all. That is the same rule the D3D11 path follows and for
-    // the same reason: the alternative is handing DLSS somebody else's vectors
-    // for one frame.
-    const bool mv_ready = !ofa_mv || SynthOfaVkFrame();
+        // The optical flow engine copies the colour that has just crossed into its
+        // own texture on the D3D12 side, reads it through the private D3D11 device,
+        // and writes the vectors the evaluate below hands to NGX. It has to sit here
+        // and nowhere else: above the wait the colour is not there yet, and below the
+        // evaluate it would be a frame late.
+        //
+        // A frame the engine does not deliver -- the first one, which has no
+        // previous frame to compare against, or one whose execute was refused -- is
+        // not delivered at all. That is the same rule the D3D11 path follows and for
+        // the same reason: the alternative is handing DLSS somebody else's vectors
+        // for one frame.
+        const bool mv_ready = !ofa_mv || SynthOfaVkFrame();
 
-    // The mirror sets this to its own 900 ms and nothing resets it, so state the
-    // budget here rather than inheriting whichever path ran last: nothing is
-    // parked behind this one, and an overrun sets g_s12.ready false for good.
-    g_s12.wait_ms = 0;
-    const bool ok = mv_ready && Synth12EvaluateShared(sp);
+        // The mirror sets this to its own 900 ms and the park to its own 600, and
+        // nothing resets it, so state the budget here rather than inheriting
+        // whichever path ran last: nothing is parked behind this one, and an
+        // overrun sets g_s12.ready false for good.
+        g_s12.wait_ms = 0;
+        ok = mv_ready && Synth12EvaluateShared(sp);
 
-    // Read again, and this is not defensive. The flush inside wait_idle advances
-    // ReShade's immediate command list to its next command buffer and begins
-    // recording into that one; the handle taken before it has been closed and
-    // submitted, and recording into it now would be recording into nothing.
-    cb = reinterpret_cast<SVkCommandBuffer>(static_cast<uintptr_t>(cmd->get_native()));
+        // Read again, and this is not defensive. The flush inside wait_idle advances
+        // ReShade's immediate command list to its next command buffer and begins
+        // recording into that one; the handle taken before it has been closed and
+        // submitted, and recording into it now would be recording into nothing.
+        cb = reinterpret_cast<SVkCommandBuffer>(static_cast<uintptr_t>(cmd->get_native()));
+    }
+    else
+    {
+        // Read BEFORE the worker is woken, because the worker writes it: this
+        // frame's copy back is recorded on the evidence of the last frame's
+        // evaluate. There is no other order available -- the copy back has to be
+        // in the command buffer before the evaluate that fills the image runs.
+        ok = g_svp.out_valid;
+
+        // The pair, armed. Alternating, so the pair being reset here is one whose
+        // vkCmdWaitEvents the queue is proven to have passed; see the header above.
+        const int pair = g_svp.next;
+        g_svp.next ^= 1;
+        g_svk.EvReset(g_svk.dev, g_svp.ev_in[pair]);
+        g_svk.EvReset(g_svk.dev, g_svp.ev_out[pair]);
+
+        // Everything the worker reads, written while it is idle. The contract is
+        // copied rather than pointed at: the caller's SynthParams is a stack
+        // object in OnSynthBeginEffects and is gone before the worker runs.
+        g_svp.sp     = *sp;
+        g_svp.ofa_mv = ofa_mv;
+        ResetEvent(g_svp.idle);
+
+        // The park. Everything above has to have executed before the worker
+        // submits the evaluate that reads it, and the copy back below has to run
+        // after that evaluate has finished -- and ReShade records the rest of the
+        // frame after this function returns, into this same command buffer, so
+        // the copy back cannot wait for a later one.
+        g_svk.CmdSetEvent(cb, g_svp.ev_in[pair], kSVkStageAllCommands);
+        g_svp.cur = pair;
+        SetEvent(g_svp.wake);
+
+        SVkMemoryBarrier mb = {};
+        mb.sType         = kSVkStMemoryBarrier;
+        mb.srcAccessMask = kSVkAccessMemoryRead | kSVkAccessMemoryWrite;
+        mb.dstAccessMask = kSVkAccessMemoryRead | kSVkAccessMemoryWrite;
+        const SVkHandle ev = g_svp.ev_out[pair];
+        g_svk.CmdWaitEvents(cb, 1, &ev, kSVkStageHost, kSVkStageAllCommands,
+                            1, &mb, 0, nullptr, 0, nullptr);
+    }
 
     if (ok && g_cfg.mode == 2 && draw)
     {
@@ -4295,12 +4715,28 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
     if (!ofa_mv)
         cmd->barrier(mv, resource_usage::copy_source, resource_usage::shader_resource);
 
-    if (!ok) return;
+    // The present thread's own cost, which is the number this change exists to
+    // move: serialised it holds the queue drain, the optical flow and the
+    // evaluate; parked it is the recording alone. Taken on every frame that got
+    // this far, delivered or not, and printed by the worker's line above -- or by
+    // the serialised one below.
+    g_svp.frame_ms += SynthNowMs() - frame_t0;
+    ++g_svp.frame_n;
+
+    // The park counts its own delivered frames in the worker, where the result is
+    // known. Everything below is the serialised path's.
+    if (park || !ok) return;
 
     const UINT64 n = ++g_svk.frames;
     CountDelivered();
-    if (n <= 1 || (n % 1800) == 0)
-        Log("[synth] Vulkan frame %llu delivered (%ux%u)", n, w, h);
+    if (n <= 1 || (n % 600) == 0)
+    {
+        Log("[synth] Vulkan frame %llu delivered (%ux%u); the present thread spent %.2f ms "
+            "in the transport, averaged over the last %ld frames.",
+            n, w, h, g_svp.frame_n != 0 ? g_svp.frame_ms / g_svp.frame_n : 0.0, g_svp.frame_n);
+        g_svp.frame_ms = 0.0;
+        g_svp.frame_n  = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5814,12 +6250,15 @@ struct SynthOfaVk
     HANDLE               hmv;
     // The only synchronisation between this private D3D11 device and the private
     // D3D12 one, and it is a CPU barrier rather than a shared fence. That is
-    // enough here and nowhere else: this runs between the caller's
-    // rq->wait_idle() and the D3D12 evaluate, and the previous frame's D3D12
-    // work was waited to completion on the CPU at the end of that frame -- so at
-    // the moment this executes there is no GPU work in flight on either device
-    // that names either texture. A shared fence would be the upgrade the day
-    // this transport stops being fully CPU-serialised.
+    // enough here and nowhere else: this runs between the transport's own wait
+    // for the copies -- rq->wait_idle() serialised, the park's ev_in on the
+    // worker -- and the D3D12 evaluate, and the previous frame's D3D12 work was
+    // waited to completion on the CPU at the end of that frame, on whichever
+    // thread ran it. So at the moment this executes there is no GPU work in
+    // flight on either device that names either texture. The park did not change
+    // that: it moved both halves onto one worker thread, and the render thread
+    // waits for that worker before a second frame can reach here. A shared fence
+    // would be the upgrade the day two frames are ever in flight at once.
     ID3D11Query         *done;
 
     UINT        w, h;
@@ -5888,6 +6327,12 @@ static void SynthVkShutdownForDevice()
     // three seconds earlier, on a completely different function, because nothing here
     // updated it -- and a fault attributed to the wrong place is worse than one
     // attributed to nowhere.
+    //
+    // The park goes FIRST, above the idle wait: a queue stopped at a
+    // vkCmdWaitEvents never goes idle, so releasing it after that wait would be
+    // releasing it after a wait that never returns.
+    Breadcrumb("shutdown: releasing and stopping the transport's park");
+    SynthVkParkStop();
     Breadcrumb("shutdown: waiting the game's Vulkan queue idle");
     if (g_svk.DeviceWaitIdle != nullptr) g_svk.DeviceWaitIdle(g_svk.dev);
 
@@ -6121,8 +6566,10 @@ static bool SynthOfaVkOpen(UINT w, UINT h, DXGI_FORMAT back_fmt)
     return true;
 }
 
-// One frame, run between the caller's queue idle and the D3D12 evaluate.
-// Returns true when g_s12.tex[SLOT_MV] now holds this frame's vectors.
+// One frame, run after the copies in have executed and before the D3D12
+// evaluate: on the present thread between rq->wait_idle() and the evaluate when
+// vk_sync=1, and on the park's worker thread between ev_in and the evaluate
+// otherwise. Returns true when g_s12.tex[SLOT_MV] now holds this frame's vectors.
 static bool SynthOfaVkFrame()
 {
     if (!g_ovk.ready) return false;
@@ -6178,11 +6625,19 @@ static bool SynthOfaVkFrame()
 
         const UINT64 v = Synth12End();
         {
-            if (!Synth12WaitFence(v, 4000))
+            // The caller's budget, for the same reason Synth12EvaluateShared takes
+            // one: who is waiting decides what a safe wait is. On the serialised
+            // transport this runs on the present thread with nothing behind it and
+            // four seconds is a generous ceiling; under the park the game's queue
+            // is stopped at a vkCmdWaitEvents until this returns, and four seconds
+            // there is twice the Windows TDR window.
+            const DWORD budget = g_s12.wait_ms != 0 ? g_s12.wait_ms : 4000;
+            if (!Synth12WaitFence(v, budget))
             {
                 Log("[synth] optical flow: the colour copy into the engine's texture did "
-                    "not complete within 4 s, so the engine is not run on it. Nothing is "
-                    "delivered this frame rather than flow computed on a stale frame.");
+                    "not complete within %lu ms, so the engine is not run on it. Nothing is "
+                    "delivered this frame rather than flow computed on a stale frame.",
+                    budget);
                 return false;
             }
         }

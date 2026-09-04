@@ -3620,6 +3620,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // set -- and an unloaded add-on that never sets it is a device loss for
         // the whole game rather than a dropped frame.
         VkmShutdown();
+        // The substitute contract's Vulkan transport parks the same way and for
+        // the same stakes, on ReShade's own command buffer rather than the game's.
+        SynthVkParkStop();
 
         EnterCriticalSection(&g_hook_cs);
         for (LONG i = 0; i < g_layer_count; ++i)
