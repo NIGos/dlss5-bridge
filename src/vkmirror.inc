@@ -551,7 +551,11 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             // observe, and stage 2 records no copy back at all.
             // Serialised against the game's own NGX evaluate -- see g_ngx_cs.
             if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-            const bool ev_ok = Synth12EvaluateShared(&g_vkm.sp);
+            // The game's GPU is parked behind every GPU wait inside this call,
+            // so it is not the synthetic path's four seconds. Passed rather than
+            // set on a global: the same global was still standing at 900 for the
+            // D3D11/D3D12 transport, which parks nothing.
+            const bool ev_ok = Synth12EvaluateShared(&g_vkm.sp, kVkmEvaluateMs);
             if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
             if (ev_ok)
             {
@@ -1119,10 +1123,6 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     { VkmRefuse("the private D3D12 session could not be opened; the lines above say why"); return; }
     if (!SynthVkOpen(g_vkm_rt))
     { VkmRefuse("the Vulkan side of the transport could not be opened; the lines above say why"); return; }
-    // The game's GPU is parked behind this wait, so it is not the synthetic
-    // path's four seconds.
-    g_s12.wait_ms = kVkmEvaluateMs;
-
     // BEFORE the contract is read, not after it, and that ordering is the whole
     // point: g_vkm.sp is the single slot the worker is still reading out of while
     // the previous frame's Synth12EvaluateShared runs. Writing it while that call

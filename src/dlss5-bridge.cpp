@@ -3561,8 +3561,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         if (g_vk_mirror == 0)
             Log("[bridge] vk_mirror=0 in the configuration file, so the Vulkan NGX entry "
                 "points are not hooked and a Vulkan game's own DLSS cannot be mirrored. "
-                "Nothing else is affected; a DirectX game has none to hook. Remove the "
-                "line or set vk_mirror=1 to turn it back on.");
+                "The substitute contract still runs on Vulkan, park and all -- it is "
+                "registered above this line and does not read this key. A DirectX game "
+                "has no entry points to hook either way. Remove the line or set "
+                "vk_mirror=1 to turn the mirror back on.");
         VkmRegisterEvents();
         // Not behind SynthEnabled, unlike the events above. The panel's whole
         // job is to say which situation this session is in, and "synthesis is
