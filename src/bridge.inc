@@ -482,7 +482,7 @@ static void CfgReload()
         else if (_stricmp(key, "ofa_grid")    == 0) next.ofa_grid    = val;
         else if (_stricmp(key, "ofa_perf")    == 0) next.ofa_perf    = val;
         else if (_stricmp(key, "vk_present")  == 0) next.vk_present  = (val >= 0 && val <= 2) ? val : 0;
-        else if (_stricmp(key, "vk_sync")     == 0) next.vk_sync     = (val >= 0 && val <= 1) ? val : 0;
+        else if (_stricmp(key, "vk_sync")     == 0) next.vk_sync     = (val >= 0 && val <= 2) ? val : 0;
         // Only the sign is taken, because only the sign is unknown: the
         // magnitude is the back buffer size and this add-on measures that. A
         // number here that is not a sign would be a second way to say something
@@ -1763,18 +1763,20 @@ static void PqPassRelease(PqPass *p)
     if (p->fence != nullptr) PqPassWait(p, p->fv);
     if (p->in  != nullptr) { p->in->Release();  p->in  = nullptr; }
     if (p->out != nullptr) { p->out->Release(); p->out = nullptr; }
-    p->colour = p->output = nullptr;
+    p->colour = p->output = p->output_b = nullptr;
 }
 
 // One shader, one root constant choosing the direction: 0 decodes colour into
 // in, 1 encodes out into output. The BT.2020 matrices are the ones an HDR10
 // surface implies; the model side is BT.709.
-static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3D12Resource *output)
+static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3D12Resource *output,
+                       ID3D12Resource *output_b = nullptr)
 {
     PqPassRelease(p);
-    p->dev    = dev;
-    p->colour = colour;
-    p->output = output;
+    p->dev      = dev;
+    p->colour   = colour;
+    p->output   = output;
+    p->output_b = output_b;
     const D3D12_RESOURCE_DESC cd = colour->GetDesc(), od = output->GetDesc();
     p->cw = static_cast<UINT>(cd.Width); p->ch = cd.Height;
     p->ow = static_cast<UINT>(od.Width); p->oh = od.Height;
@@ -1919,11 +1921,19 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
         code->Release();
         if (FAILED(hr)) { Log("[bridge] the HDR10 pipeline failed 0x%08X", hr); PqPassRelease(p); return false; }
 
-        // Four descriptors, two tables: [colour SRV, in UAV] for the decode and
-        // [out SRV, output UAV] for the encode.
+        // Six descriptors, three tables: [colour SRV, in UAV] for the decode,
+        // [out SRV, output UAV] for the encode, and [out SRV, output_b UAV] for
+        // the encode into the substitute's second Output. Six UNCONDITIONALLY,
+        // and that is the point rather than slack: this block runs only inside
+        // "if (p->heap == nullptr)" and the note above PqPassRelease says the heap
+        // is deliberately never rebuilt, so a size that depended on whether
+        // output_b was given would be four on a session that opened at vk_sync=0
+        // and would be written past the first time that session rebuilt into
+        // vk_sync=2. The last two go unwritten and unread when there is no second
+        // Output, which costs 64 bytes of a heap the device holds for its life.
         D3D12_DESCRIPTOR_HEAP_DESC hd = {};
         hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 4;
+        hd.NumDescriptors = 6;
         hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = dev->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), reinterpret_cast<void **>(&p->heap));
         if (FAILED(hr)) { Log("[bridge] the HDR10 descriptor heap failed 0x%08X", hr); PqPassRelease(p); return false; }
@@ -1948,6 +1958,20 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
     cpu.ptr += inc;
     ud.Format = od.Format;
     dev->CreateUnorderedAccessView(output, nullptr, &ud, cpu);
+    // The second encode table, written only when the caller gave a second Output.
+    // Its SRV is the same p->out the first one names -- the linear result NGX
+    // wrote is one texture whichever Output it is encoded into -- so only the UAV
+    // differs, which is why this is six descriptors and not eight.
+    if (output_b != nullptr)
+    {
+        const D3D12_RESOURCE_DESC bd = output_b->GetDesc();
+        cpu.ptr += inc;
+        sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        dev->CreateShaderResourceView(p->out, &sd, cpu);
+        cpu.ptr += inc;
+        ud.Format = bd.Format;
+        dev->CreateUnorderedAccessView(output_b, nullptr, &ud, cpu);
+    }
 
     Log("[bridge] HDR10 PQ conversion ready: the %s back buffer is decoded to linear BT.709 "
         "(1.0 = 80 nits) before the evaluate and the result encoded again after, so the "
@@ -1957,7 +1981,7 @@ static bool PqPassMake(PqPass *p, ID3D12Device *dev, ID3D12Resource *colour, ID3
 
 // The colour is expected in NON_PIXEL_SHADER_RESOURCE and the output in
 // UNORDERED_ACCESS, which is where both sessions hold them around the evaluate.
-static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode)
+static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode, int set)
 {
     const UINT inc = p->dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     ID3D12DescriptorHeap *heaps[] = { p->heap };
@@ -1965,7 +1989,10 @@ static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode)
     list->SetComputeRootSignature(p->rs);
     list->SetPipelineState(p->pso);
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = p->heap->GetGPUDescriptorHandleForHeapStart();
-    gpu.ptr += static_cast<UINT64>(mode) * 2 * inc;
+    // Table 0 decodes; table 1 encodes into output and table 2 into output_b. The
+    // set is read on the encode alone, because the decode reads colour, and the
+    // pipeline does not double colour.
+    gpu.ptr += static_cast<UINT64>(mode == 0 ? 0 : 2 + 2 * set) * inc;
     list->SetComputeRootDescriptorTable(0, gpu);
     list->SetComputeRoot32BitConstant(1, static_cast<UINT>(mode), 0);
     const UINT w = mode == 0 ? p->cw : p->ow, h = mode == 0 ? p->ch : p->oh;
@@ -1977,16 +2004,20 @@ static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode)
 // in is left in NON_PIXEL_SHADER_RESOURCE and out in UNORDERED_ACCESS by the
 // decode, and the encode takes them back to COMMON. The session's own barriers
 // on its colour and output are unaffected, since both are returned to COMMON.
-static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode)
+static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode, int set)
 {
     ID3D12GraphicsCommandList *list = p->list[mode];
+    // Which Output this frame's evaluate wrote into. Set 1 arrives only from the
+    // substitute's pipelined transport and only after Synth12Build made the
+    // texture; every other caller reads the single one it always did.
+    ID3D12Resource *const outp = (set == 1 && p->output_b != nullptr) ? p->output_b : p->output;
     if (!PqPassWait(p, p->done[mode])) return false;
     if (FAILED(p->alloc[mode]->Reset()) || FAILED(list->Reset(p->alloc[mode], nullptr))) return false;
     if (mode == 0)
     {
         Barrier(list, p->colour, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(list, p->in, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        PqPassDispatch(p, list, 0);
+        PqPassDispatch(p, list, 0, 0);
         Barrier(list, p->in, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(list, p->colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         Barrier(list, p->out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1994,9 +2025,9 @@ static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode)
     else
     {
         Barrier(list, p->out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        Barrier(list, p->output, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        PqPassDispatch(p, list, 1);
-        Barrier(list, p->output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(list, outp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        PqPassDispatch(p, list, 1, set);
+        Barrier(list, outp, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Barrier(list, p->out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         Barrier(list, p->in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
@@ -2011,16 +2042,16 @@ static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode)
 // Before the NGX list is recorded: the decode, executed now, runs ahead of it.
 static bool PqPassBefore(PqPass *p, ID3D12CommandQueue *queue)
 {
-    return PqPassRun(p, queue, 0);
+    return PqPassRun(p, queue, 0, 0);
 }
 
 // After the NGX list was executed: the encode runs behind it, and the session's
 // fence is signalled once more so whoever waits on the value returned here
 // waits for the encoded result and not only for the evaluate.
 static UINT64 PqPassAfter(PqPass *p, ID3D12CommandQueue *queue, ID3D12Fence *session_fence,
-                          UINT64 *session_value, UINT64 fallback)
+                          UINT64 *session_value, UINT64 fallback, int set = 0)
 {
-    if (!PqPassRun(p, queue, 1)) return fallback;
+    if (!PqPassRun(p, queue, 1, set)) return fallback;
     const UINT64 v = ++*session_value;
     queue->Signal(session_fence, v);
     return v;

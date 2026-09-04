@@ -97,7 +97,11 @@ struct PqPass
     ID3D12DescriptorHeap *heap;
     UINT                  cw, ch, ow, oh;
     // Not owned: the session's colour and output textures the passes convert.
-    ID3D12Resource       *colour, *output;
+    // output_b is the substitute's second Output, and it is null on every other
+    // caller and in every mode but vk_sync=2 -- see kOutB in synth.inc. The
+    // encode has to know which of the two the evaluate wrote into, because the
+    // pipeline alternates them; the decode never does, because colour is single.
+    ID3D12Resource       *colour, *output, *output_b;
     // Command lists of their own, one per direction, executed on the session's
     // queue before and after the list NGX records into. Nothing of this
     // add-on's is ever recorded into that list: the DLSS 5 add-on records the
