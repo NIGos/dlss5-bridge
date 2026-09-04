@@ -2545,6 +2545,7 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
             // so a report carried the code and nothing else (#22).
             wchar_t who[MAX_PATH + 64] = {};
             if (NameFaultOwner(who, _countof(who))) Log("[bridge]   it faulted in %ls", who);
+            LogFaultStack("[bridge]");
         }
         // Named for the create failure already and never for this one, which is
         // the gap: "inside a snippet" and "inside the D3D12 runtime" are different
@@ -2761,6 +2762,7 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
             // so a report carried the code and nothing else (#22).
             wchar_t who[MAX_PATH + 64] = {};
             if (NameFaultOwner(who, _countof(who))) Log("[bridge]   it faulted in %ls", who);
+            LogFaultStack("[bridge]");
         }
         {
             wchar_t who[MAX_PATH + 64] = {};
@@ -8293,6 +8295,12 @@ static void OnSynthDestroyRuntime(reshade::api::effect_runtime *rt)
     // two calls in one of the two orders they already use.
     if (!VkmShutdown())
     {
+        // The gate shuts even though nothing is released; see the same two lines
+        // in OnVkmDestroyRuntime for why. g_svk.ready is written nowhere else on
+        // the way down, so returning here without it leaves this transport armed
+        // over a device that is going away.
+        g_svk.ready   = false;
+        g_svp.retired = true;
         Log("[synth] the mirror's worker did not join, so nothing imported onto that "
             "VkDevice is released: the reason is the line above this one.");
         return;

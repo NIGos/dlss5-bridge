@@ -1123,11 +1123,69 @@ static HMODULE FindNgxLoader()
 // available. NameFaultOwner uses the same lookup the crash reporter does.
 static void *g_last_fault_at;
 
+// The return addresses as well, and the two words an access violation carries.
+// The address alone named the victim and never the caller, which on 2026-09-04
+// left the one question that mattered unanswerable: an access violation inside
+// D3D12Core's SetDescriptorHeaps, validating a descriptor heap that is not one,
+// with three candidate callers in a neighbouring add-on and no way to tell them
+// apart. The crash reporter has walked the stack in its own filter since 1.0;
+// this one is the same walk in the guarded-call filter, which runs on the
+// faulting thread before anything unwinds, so its stack IS that thread's.
+static void *g_last_fault_frames[24];
+static USHORT g_last_fault_n;
+static ULONG_PTR g_last_fault_op;    // 0 read, 1 write, 8 execute
+static ULONG_PTR g_last_fault_addr;  // the address the faulting access touched
+static bool g_last_fault_is_av;
+
 static int CaptureFault(EXCEPTION_POINTERS *ep)
 {
     g_last_fault_at = ep != nullptr && ep->ExceptionRecord != nullptr
                     ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    g_last_fault_n  = RtlCaptureStackBackTrace(0, 24, g_last_fault_frames, nullptr);
+    g_last_fault_is_av = false;
+    if (ep != nullptr && ep->ExceptionRecord != nullptr &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        ep->ExceptionRecord->NumberParameters >= 2)
+    {
+        g_last_fault_is_av = true;
+        g_last_fault_op    = ep->ExceptionRecord->ExceptionInformation[0];
+        g_last_fault_addr  = ep->ExceptionRecord->ExceptionInformation[1];
+    }
     return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Printed beside the "it faulted in <module>" line every caller already logs.
+// Module and offset rather than an absolute address, for the same reason that
+// line gives: an address changes every run and means nothing to whoever owns
+// the module it lands in.
+static void LogFaultStack(const char *tag)
+{
+    if (g_last_fault_is_av)
+        Log("%s   the access was a %s of %p", tag,
+            g_last_fault_op == 1 ? "write" : g_last_fault_op == 8 ? "execute" : "read",
+            reinterpret_cast<void *>(g_last_fault_addr));
+    if (g_last_fault_n == 0) return;
+    Log("%s   called from (thread %lu):", tag, GetCurrentThreadId());
+    for (USHORT i = 0; i < g_last_fault_n; ++i)
+    {
+        HMODULE mod = nullptr;
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               static_cast<LPCWSTR>(g_last_fault_frames[i]), &mod) &&
+            mod != nullptr && GetModuleFileNameW(mod, path, MAX_PATH) != 0)
+        {
+            const wchar_t *leaf = wcsrchr(path, L'\\');
+            Log("%s   %2u  %ls+0x%llX", tag, i, leaf != nullptr ? leaf + 1 : path,
+                static_cast<unsigned long long>(
+                    static_cast<const unsigned char *>(g_last_fault_frames[i]) -
+                    reinterpret_cast<const unsigned char *>(mod)));
+        }
+        else
+        {
+            Log("%s   %2u  %p, in no loaded module", tag, i, g_last_fault_frames[i]);
+        }
+    }
 }
 
 // Fills out with the module owning the last fault, or a description of why no

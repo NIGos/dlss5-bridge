@@ -450,6 +450,16 @@ static void OnVkmDestroyRuntime(reshade::api::effect_runtime *rt)
         // this side can enforce -- so the whole set is leaked and the reason is
         // in the line VkmShutdown just logged. The game's queue has already been
         // released twice, which is the part that had to happen.
+        //
+        // What must NOT be leaked with it is the substitute's readiness. Before
+        // this branch existed the teardown always ran, and its tail is the only
+        // writer of g_svk.ready; skipping it left the substitute's Vulkan
+        // transport armed over a VkDevice the game is destroying, so the next
+        // reshade_begin_effects recorded copies and a park onto it. Shutting the
+        // gate is free and is not a release of anything: what the orphan holds
+        // stays held.
+        g_svk.ready   = false;
+        g_svp.retired = true;
         Breadcrumb("shutdown: the mirror's worker did not join, so nothing is released");
         return;
     }

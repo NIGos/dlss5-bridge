@@ -4328,6 +4328,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             // so a report carried the code and nothing else (#22).
             wchar_t who[MAX_PATH + 64] = {};
             if (NameFaultOwner(who, _countof(who))) Log("[bridge]   it faulted in %ls", who);
+            LogFaultStack("[bridge]");
         }
         BridgeDisable("NGX raised an exception inside the D3D12 evaluate");
     }
