@@ -2598,8 +2598,26 @@ static ID3D12Resource *SynthOfaVkMvTexture();
 // pipelined transport's worker, which alternates it with kOutB so the game can
 // copy the previous frame's result out of the other one while this runs.
 static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
-                                  int out_slot = SLOT_OUTPUT)
+                                  int out_slot = SLOT_OUTPUT, bool *wrote_out = nullptr)
 {
+    // ONE observation of mode, taken before anything else and handed back, and
+    // the reason is that two reads of it disagree. "Did an evaluate write this
+    // pair's Output" is the caller's question and the answer is decided here; the
+    // caller used to read g_cfg.mode again after this function returned, with the
+    // whole submission -- barriers, Synth12End, PqPassAfter, Synth12WaitFence --
+    // between the two reads, while CfgReload replaces g_cfg wholesale from
+    // another thread about once a second. A live 1 -> 2 edit landing in that gap
+    // marked an Output nothing had ever written as valid, and under the pipeline
+    // the copy back is decided from an earlier frame's flag, so that Output --
+    // created fresh at the rebuild and never touched -- reached the back buffer.
+    //
+    // An out-parameter rather than a return value: the mirror's worker reads
+    // false as a refusal and counts it toward the five that retire the mirror,
+    // so this must not change what this function returns. It is written on every
+    // path out, including the Synth12Begin failure below.
+    const bool wrote = g_cfg.mode != 1;
+    if (wrote_out != nullptr) *wrote_out = wrote;
+
     if (!Synth12Begin(wait_ms)) return false;
 
     // The three inputs by the loop and the Output by name, rather than the loop
@@ -2676,17 +2694,28 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
     Breadcrumb("running the D3D12 evaluate for the synthetic contract");
     static const char kNgxMark[] = "ngx evaluate";
     g_s12.list->BeginEvent(1, kNgxMark, sizeof(kNgxMark));
-    // mode 1 runs everything except the write: the transport is exercised and the
-    // Output is left exactly as it was. Callers that decide whether to put that
-    // Output on screen have to know -- see the worker's out_valid.
+    // mode 1 runs everything except the evaluate: the transport is exercised and
+    // no upscaled result is written. Callers that decide whether to put that
+    // Output on screen have to know -- see the worker's out_valid, which is
+    // handed `wrote` rather than reading the key a second time.
+    //
+    // "Left exactly as it was" is true on an SDR presentation only. PqPassBefore
+    // and PqPassAfter below are gated on g_s12.pq.in and on nothing about mode,
+    // so on an HDR10 presentation the encode dispatch still writes tex[out_slot]
+    // every mode-1 frame, out of a p->out that mode 1 left as the last real
+    // evaluate wrote it -- or undefined, on a session that opened at mode 1.
+    // Nothing reaches the screen from that on its own, because out_valid is false
+    // and the copy back needs mode 2; it matters to a reader who would drop the
+    // `wrote` term on the strength of the shorter sentence.
     //
     // ponytail: read off g_cfg without a lock, on the park's worker as well as on
     // the present thread, while CfgReload replaces the whole struct in one
     // non-atomic assignment about once a second. The worst case is one frame
     // built from two configurations -- the same register as the note on
-    // work_ms/frame_n -- and it is not worth a lock. Synth12FrameParams reads
-    // reset_every the same way.
-    NVSDK_NGX_Result re = g_cfg.mode != 1
+    // work_ms/frame_n -- and it is not worth a lock. What is NOT tolerable is two
+    // reads of the same key deciding two halves of one question, which is what
+    // `wrote` exists to prevent. Synth12FrameParams reads reset_every the same way.
+    NVSDK_NGX_Result re = wrote
         ? SafeEvaluateGuarded(g_s12.eval_feature, g_s12.list, g_s12.feature, g_s12.params, &code)
         : NGX_SUCCESS;
     g_s12.list->EndEvent();
@@ -4451,6 +4480,14 @@ static const DWORD kSvpWorkMs      = 600;
 // HDR10 presentation a worker at its true worst case is retired one second
 // early. Moving the wait above the Enter is the real answer and is a bigger
 // rearrangement than it looks, since SynthVkFrame is called from inside.
+//
+// SynthVkDrainWorker takes this same budget a second time on the same thread,
+// and the two are ADDITIVE within one forwarded evaluate: the mirror's rebuild
+// spends kVkmIdleMs on g_vkm.idle and then this on the substitute's free events,
+// so the number a report needs for a mirrored game with a stuck substitute
+// worker is 1400 + 3100 = 4.5 s, not 3.1. The drain waits both free events in
+// ONE WaitForMultipleObjects for exactly that reason -- two sequential waits
+// would have made it 1400 + 6200.
 static const DWORD kSvpIdleMs      = kSvpSeeCopiesMs + 4 * kSvpWorkMs + 200 + 200;
 
 struct SynthVkPark
@@ -4532,6 +4569,19 @@ struct SynthVkPark
     // nothing to wait for and nothing to copy back, and is why this is not
     // "armed", which would never become false again.
     bool      pending[2];
+
+    // Whether the PREVIOUS delivering frame armed at all, and it is what makes
+    // pending[] mean "armed one frame ago" rather than "armed at some point".
+    // Cleared at the top of every SynthMaybeDeliver on a Vulkan runtime and set
+    // only at the arm, so a frame that finds it false knows delivery stopped and
+    // resumed -- however many frames the gap was -- and clears the pair state
+    // there rather than at each of the dozen returns that can skip an arm. Those
+    // returns are real and ordinary: SynthArmRefusal, a depth binding that flaps
+    // as generic_depth swaps its backup, a render-target shape disagreement, a
+    // live vk_present edit. Without it the first frame back waits an ev_out
+    // signalled arbitrarily long ago and copies back that pair's Output -- a real
+    // picture, from before the gap, however old the gap is. Render thread only.
+    bool      armed_last;
 
     // Whether that pair's Output image holds a frame that was evaluated. The copy
     // back has to be RECORDED before the evaluate that fills it has run, so this
@@ -4667,7 +4717,12 @@ static DWORD WINAPI SynthVkParkWorker(LPVOID)
                 const int out_slot = (a.pipe && a.pair != 0) ? kOutB : SLOT_OUTPUT;
                 if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
                 const bool mv_ready = !a.ofa_mv || SynthOfaVkFrame(kSvpWorkMs);
-                const bool ok = mv_ready && Synth12EvaluateShared(&a.sp, kSvpWorkMs, out_slot);
+                // Whether an evaluate ran, decided inside the call from the same
+                // observation that decided whether to run it. Left false when
+                // mv_ready short-circuits, which is what a refused frame needs.
+                bool wrote = false;
+                const bool ok = mv_ready &&
+                                Synth12EvaluateShared(&a.sp, kSvpWorkMs, out_slot, &wrote);
                 if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
                 g_svp.work_ms += SynthNowMs() - t_body;
                 ++g_svp.work_n;
@@ -4675,17 +4730,24 @@ static DWORD WINAPI SynthVkParkWorker(LPVOID)
                 // Read by the render thread on a later frame, and only there: it
                 // decides whether that frame records a copy back at all.
                 //
-                // mode is part of it because this flag means "an evaluate WROTE
+                // `wrote` is part of it because this flag means "an evaluate WROTE
                 // this pair's Output", and mode 1 runs the whole transport with
                 // the evaluate itself skipped -- Synth12EvaluateShared returns
-                // success having written nothing. Under the pipeline the copy
-                // back is decided from an earlier frame's flag, so a true here at
-                // mode 1 puts a texture nothing has ever written on screen; the
-                // pair's second Output is created fresh at every rebuild, so that
-                // is undefined GPU memory rather than a stale frame. mode 0 keeps
-                // a true and is right to: it evaluates, and only withholds the
-                // copy back.
-                g_svp.out_valid[slot] = ok && g_cfg.mode != 1;
+                // success having written no evaluate result. Under the pipeline
+                // the copy back is decided from an earlier frame's flag, so a true
+                // here at mode 1 puts a texture nothing has ever written on
+                // screen; the pair's second Output is created fresh at every
+                // rebuild, so that is undefined GPU memory rather than a stale
+                // frame. mode 0 keeps a true and is right to: it evaluates, and
+                // only withholds the copy back.
+                //
+                // It comes back OUT of the call and is not re-read here. Reading
+                // g_cfg.mode again at this line was a second, independent
+                // observation of a struct CfgReload replaces wholesale about once
+                // a second, taken a whole submission after the one that decided
+                // whether to write -- so a live 1 -> 2 edit landing between them
+                // marked an unwritten Output valid. Same size, and no window left.
+                g_svp.out_valid[slot] = ok && wrote;
                 // The pipelined transport counts and prints on the render thread,
                 // where the copy back it counts is actually recorded. Under the park
                 // the worker is the only place the result is known in time.
@@ -4901,20 +4963,23 @@ static void SynthVkParkStop()
     g_svp.next      = 0;
     g_svp.take      = 0;
     g_svp.pending[0] = g_svp.pending[1] = false;
-    // Cleared HERE and not in SynthVkParkEnsure, which is where it would read more
-    // naturally and would never run: SynthVkFrame tests this flag at the top,
-    // above the call that builds the park, so a teardown that left it standing
-    // retired the whole transport for the session -- measured in ngxGym on
-    // 2026-09-04, synth-vk-nomirror, where the substitute delivered nothing after
-    // the first mode change. Everything the flag was guarding is destroyed by the
-    // time this line runs.
-    g_svp.stopping  = 0;
+    g_svp.armed_last = false;
     g_svp.out_valid[0] = g_svp.out_valid[1] = false;
     g_svp.said      = 0;
-    // A new device gets a new attempt at the transport -- SynthVkShutdownForDevice
-    // clears g_svk.tried for exactly that -- so the retirement goes with the
-    // device it was decided on.
-    g_svp.retired   = false;
+    // stopping and retired are NOT cleared here, and that is the difference
+    // between this function's two callers. SynthVkShutdownForDevice clears them
+    // itself once its own teardown has finished, because a new device gets a new
+    // attempt at the transport. The detach in DllMain must not: SynthVkFrame's
+    // entry test is `retired || stopping != 0`, so clearing them at the foot of
+    // this function reopens the gate on a present thread that has not yet reached
+    // that test, and SynthVkParkEnsure then builds fresh events and a NEW worker
+    // whose start address is in the module the loader is unloading. The mirror
+    // never had this: VkmShutdown sets stopping and only OnVkmInitRuntime clears
+    // it. Which is also why they cannot be cleared in SynthVkParkEnsure, where
+    // they would read more naturally: SynthVkFrame tests them above the call that
+    // builds the park, so a clear there never runs and the transport stays retired
+    // for the session -- measured in ngxGym on 2026-09-04, synth-vk-nomirror,
+    // where the substitute delivered nothing after the first mode change.
 }
 
 // The four VkEvents, and the only caller is SynthVkShutdownForDevice, AFTER its
@@ -4935,11 +5000,20 @@ static void SynthVkParkDestroyEvents()
     }
 }
 
-// WHO MAY TOUCH g_s12, in one sentence, because it now has two threads in it:
-// the private D3D12 session belongs to whoever holds g_bridge_cs, EXCEPT for the
-// length of one substitute arm, when it belongs to the park's worker -- and what
-// proves the worker is not inside it is its free event, which it sets last on
-// every path out of its body.
+// WHO MAY TOUCH g_s12, and there are THREE owners rather than the two this
+// sentence used to name. The private D3D12 session belongs to whoever holds
+// g_bridge_cs, EXCEPT for the length of one substitute arm, when it belongs to
+// the park's worker -- whose free event is the proof, set last on every path out
+// of its body -- and for the length of one mirrored evaluate, when it belongs to
+// the mirror's worker, whose proof is a different handle again, g_vkm.idle.
+//
+// The two workers exclude each other with g_ngx_cs. g_bridge_cs held by the
+// mirror excludes the park's worker through the drain below and the mirror's own
+// through its idle wait. g_bridge_cs held by the SUBSTITUTE's render thread
+// excludes the park's worker the same way and excludes the mirror's worker by
+// nothing at all: it waits no g_vkm handle anywhere -- nothing in this file so
+// much as names g_vkm -- and what stands between them is the five-second quiet
+// window in SynthReleaseLatch, which is a window and not a handshake.
 //
 // This is that proof, taken by hand. The render thread already waits both free
 // events at the top of every frame that rebuilds; the Vulkan mirror had no such
@@ -4958,12 +5032,25 @@ static void SynthVkParkDestroyEvents()
 // reaches its submit without g_bridge_cs.
 static bool SynthVkDrainWorker()
 {
+    // A park that is being torn down is not one to wait on, and refusing is the
+    // right answer either way: SynthVkParkStop is called from DllMain with no
+    // lock held, so it can close both free events and null them while this
+    // function is between its test and its wait. A closed Win32 handle is worse
+    // than a zeroed VkEvent -- the OS may reissue the value to any other
+    // allocation in the process, so the wait can succeed on something unrelated
+    // or block on it for the whole budget. The caller must not rebuild across a
+    // teardown in any case.
+    if (g_svp.stopping != 0 || g_svp.orphaned) return false;
     if (g_svp.worker == nullptr) return true;
-    for (int i = 0; i < 2; ++i)
-        if (g_svp.free_ev[i] != nullptr &&
-            WaitForSingleObject(g_svp.free_ev[i], kSvpIdleMs) != WAIT_OBJECT_0)
-            return false;
-    return true;
+    // Into locals before the test and the wait, the same rule the arm blocks
+    // follow and for the same teardown. One WaitForMultipleObjects rather than
+    // two waits, so the budget below is the budget for the whole drain: two
+    // sequential waits of kSvpIdleMs each is twice the number the constant's own
+    // derivation reasons about, on the game's render thread, inside its DLSS
+    // detour, under g_bridge_cs.
+    HANDLE fe[2] = { g_svp.free_ev[0], g_svp.free_ev[1] };
+    if (fe[0] == nullptr || fe[1] == nullptr) return true;
+    return WaitForMultipleObjects(2, fe, TRUE, kSvpIdleMs) == WAIT_OBJECT_0;
 }
 
 // One frame.
@@ -5468,6 +5555,10 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
             InterlockedIncrement(&g_svp.queued);
             SetEvent(g_svp.wake);
             g_svp.pending[pipe_p] = true;
+            // Read at the top of the NEXT frame's SynthMaybeDeliver, which is
+            // what makes the line above mean "one frame ago" instead of "at some
+            // point". Every other way out of this function leaves it false.
+            g_svp.armed_last      = true;
             g_svp.next = pipe_p ^ 1;
         }
 
@@ -5478,11 +5569,20 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
         // answers is "has an evaluate ever written this pair's Output", which is
         // the question that matters -- undefined memory must never reach the
         // screen -- while the vkCmdWaitEvents above is what answers "are this
-        // frame's pixels there". A stale true after a failed evaluate repeats a
-        // frame, and a false hands the back buffer home as the game rendered it
-        // -- which is NOT the park's trade and is worth saying so: the park
-        // repeats a frame on a refusal, the pipeline shows one un-upscaled frame
-        // in the middle of an upscaled sequence. The order is what forces it, the
+        // frame's pixels there". A stale true after a failed evaluate repeats
+        // this pair's last SUCCESSFUL frame, which is three presents back and not
+        // one, because the pairs alternate and nothing orders this read against
+        // the worker's write: the wait at the top of the frame covers only the
+        // pair being armed, never prev.
+        //
+        // A false hands the back buffer home as the game rendered it. The park
+        // pays that too, one present later rather than on the same frame -- its
+        // ok is read for the PREVIOUS pair while the image it copies is the one
+        // this frame's worker fills, so one refusal there costs a repeated frame
+        // and then an un-upscaled one. So the difference is not what reaches the
+        // screen but how much of it: the pipeline shows the un-upscaled frame
+        // without the duplicate in front of it, because its ok is read for the
+        // same pair whose picture it copies. The order is what forces it, the
         // same order that costs a present of latency: by the time a refusal is
         // known here, the pair it belongs to is the one being read back.
         ok = out_pair >= 0 && g_svp.out_valid[out_pair];
@@ -5508,9 +5608,14 @@ static void SynthVkFrame(reshade::api::effect_runtime *rt, reshade::api::command
         // what it copies is the previous frame's picture: SLOT_OUTPUT still holds
         // it, because a refusal writes nothing. That is deliberate and it is the
         // only choice this order leaves -- by the time the refusal is known the
-        // copy back is already in the game's queue. One duplicated frame against
-        // the alternative, which is a frame of the game's own unupscaled render
-        // arriving in the middle of an upscaled sequence.
+        // copy back is already in the game's queue.
+        //
+        // It costs BOTH, one present apart, which this used to price as one. The
+        // refused frame writes out_valid[pair] = false; the frame after it reads
+        // exactly that entry, since next has flipped, so ok is false and the
+        // game's own un-upscaled render goes to the screen behind the duplicate.
+        // The alternative is the un-upscaled frame on its own and a present
+        // sooner, which is what the pipeline does.
         ok = g_svp.out_valid[g_svp.next ^ 1];
 
         // The pair, armed. Alternating, and the reset is safe because the
@@ -5740,6 +5845,11 @@ static void SynthStandDown()
     // for a case the rebuild already covers.
     g_svp.out_valid[0] = g_svp.out_valid[1] = false;
     g_svp.pending[0]   = g_svp.pending[1]   = false;
+    // With them, because the mirror's own frames never reach the clear at the top
+    // of SynthMaybeDeliver -- it returns here, above it -- and a flag left true
+    // through a whole mirrored stretch would tell the substitute's first frame
+    // back that the frame before it armed.
+    g_svp.armed_last   = false;
     LeaveCriticalSection(&g_bridge_cs);
 
     // What this says is what happens, which is not what it used to say. The
@@ -7353,6 +7463,15 @@ static void SynthVkShutdownForDevice()
     // It stays one-way WITHIN a device: a transport that refused once is not
     // retried every frame. This only says a new device gets a new attempt.
     g_svk.tried = false;
+    // And the park's own two latches with it, on this caller and on this caller
+    // only. SynthVkParkStop leaves them standing precisely because its other
+    // caller is DllMain, where clearing them lets a present thread build a new
+    // worker inside a module the loader is unloading; here everything they were
+    // guarding is destroyed, the whole function ran under g_bridge_cs -- the
+    // section SynthVkFrame itself runs inside, so no render thread has been in it
+    // -- and a device that comes back is entitled to a new attempt.
+    g_svp.stopping = 0;
+    g_svp.retired  = false;
 }
 
 // Torn down and allowed to open again, which is what a resolution change needs:
@@ -7711,6 +7830,33 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
     CfgReload();
     LeaveCriticalSection(&g_bridge_cs);
 
+    // The pipeline's pair state does not survive a gap in delivery, and this is
+    // the one place every path routes through -- above SynthArmRefusal, above the
+    // binding tests, above the shape and usage tests, and above SynthVkFrame's
+    // own dozen early returns. Put on a single refusal branch it guarded one door
+    // of twelve: the first frame back would find pending[prev] true, record a wait
+    // on an ev_out signalled arbitrarily long ago, and copy back that pair's
+    // Output -- a real frame, from before the gap. It also inflated the free_n
+    // "already satisfied" counter, which is the one number the pipeline's log line
+    // offers as evidence that the wait is doing anything.
+    //
+    // Two statements rather than one because the read is a frame later than the
+    // write: armed_last says whether the frame BEFORE this one armed, so the test
+    // has to happen before this frame clears it. An ordinal on the arm cannot do
+    // this -- armed_n does not advance during a gap either, so the arm's own
+    // ordinal still matches.
+    //
+    // Vulkan runtimes only. A process holding a Vulkan and a D3D12 effect runtime
+    // calls this function twice per frame, and the D3D12 call must not be read as
+    // a frame in which the Vulkan transport failed to arm. Two VULKAN runtimes
+    // would still confuse it, and that configuration is the open residual named
+    // above OnSynthDestroyRuntime rather than something this line can settle.
+    if (f->device_api == static_cast<uint32_t>(reshade::api::device_api::vulkan))
+    {
+        if (!g_svp.armed_last) g_svp.pending[0] = g_svp.pending[1] = false;
+        g_svp.armed_last = false;
+    }
+
     const char *why = SynthArmRefusal(f, false);
     // Split, and the motion-vector half asks about the ReShade providers only.
     //
@@ -7755,20 +7901,6 @@ static void SynthMaybeDeliver(reshade::api::effect_runtime *rt,
         // does. The compare is on the pointer: every string here is a literal
         // returned from that one function, so identity is the reason and the
         // text is only how it reads.
-        // The pipeline's pair state does not survive a gap in delivery. Nothing
-        // below this line runs, so SynthVkFrame is not reached and nothing else
-        // would clear it: the first frame back would find pending[prev] true,
-        // record a wait on an ev_out signalled arbitrarily long ago, and copy
-        // back that pair's Output -- a real frame, from before the gap, however
-        // old the gap is. Cleared here, where the gap begins, because that is the
-        // only place that knows one has. Costs the resumed frame its copy back,
-        // which is what the first frame after a rebuild already costs.
-        //
-        // An ordinal test on the arm cannot do this: armed_n does not advance
-        // during a gap either, so the arm's own ordinal still matches.
-        // Render-thread only, like every other writer of pending[].
-        g_svp.pending[0] = g_svp.pending[1] = false;
-
         static const char *said;
         if (why != said)
         {
@@ -8111,6 +8243,11 @@ static void OnSynthInitEffectRuntime(reshade::api::effect_runtime *)
 // Defined in vkmirror.inc, which is included after this file. The deferral below
 // is the one place that has to know WHICH runtime the mirror will act on.
 bool VkmOwnsRuntime(const reshade::api::effect_runtime *rt);
+// And the mirror's own stop, for the case the deferral does NOT cover -- see the
+// call below. Idempotent: it returns true on a null worker and on vk_mirror=0,
+// where the mirror has no worker to stop. Answers false only when its join
+// expired, which means nothing may be released at all.
+static bool VkmShutdown();
 
 static void OnSynthDestroyRuntime(reshade::api::effect_runtime *rt)
 {
@@ -8121,12 +8258,7 @@ static void OnSynthDestroyRuntime(reshade::api::effect_runtime *rt)
     // arrived last, this file's device came from whichever SynthVkFrame saw
     // first, and on the mismatch neither handler ran and the park kept polling
     // four events on a device that was going away. The device test below then
-    // decides the rest, which is what it is there for. What this does not do on
-    // that mismatch is stop the MIRROR's own worker, which the mirror's handler
-    // would have done first: its park can hold the same queue, so the idle wait
-    // inside the teardown below can be a long one. Tearing down late beats not
-    // tearing down at all, and a shared idempotent teardown both handlers call is
-    // the real answer if a second Vulkan runtime is ever seen in the wild.
+    // decides the rest, which is what it is there for.
     if (g_vk_mirror != 0 && VkmOwnsRuntime(rt)) return;
     if (g_svk.dev == nullptr || rt == nullptr) return;
     // This runtime and not another one. A process can hold two -- vkmirror.inc's
@@ -8140,6 +8272,32 @@ static void OnSynthDestroyRuntime(reshade::api::effect_runtime *rt)
     Log("[synth] the game is destroying the effect runtime, so the substitute's Vulkan "
         "transport stops: the park is released and joined and everything imported onto "
         "that VkDevice is released before the device is.");
+
+    // The MIRROR's worker, stopped here as well, and this call is the whole of
+    // what the deferral above does not cover. Reaching this line means the mirror
+    // does not own the runtime that is going away but the substitute's device came
+    // from it, so the mirror's own handler will never run for it -- and the
+    // teardown below releases exactly what the mirror's worker is inside: the NGX
+    // feature, g_s12.tex[], the imported VkImages, the optical flow's private
+    // D3D11 device. That worker holds g_ngx_cs alone; g_bridge_cs is not a section
+    // it ever enters, so the lock below excludes it from nothing.
+    //
+    // Two lines rather than the shared idempotent teardown the note here used to
+    // ask for: VkmShutdown already IS idempotent -- it returns true on a null
+    // worker, which covers vk_mirror=0 and a mirror already stopped -- and calling
+    // it is exactly what OnVkmDestroyRuntime does, in this position, above its own
+    // Enter. Nothing recurses: VkmShutdown reaches no destroy_effect_runtime
+    // handler. Nothing deadlocks: it is called with no lock held, it takes none,
+    // and its join waits a worker whose only lock is g_ngx_cs, which this thread
+    // does not hold. A shared function would have been one wrapper around these
+    // two calls in one of the two orders they already use.
+    if (!VkmShutdown())
+    {
+        Log("[synth] the mirror's worker did not join, so nothing imported onto that "
+            "VkDevice is released: the reason is the line above this one.");
+        return;
+    }
+
     // Under the same section the mirror's handler takes it under, and for the same
     // reason: SynthVkFrame runs the whole transport inside it.
     EnterCriticalSection(&g_bridge_cs);

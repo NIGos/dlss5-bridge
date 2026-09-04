@@ -273,6 +273,14 @@ struct VkMirror
     // cleared when a runtime comes back. refused stays one-way.
     bool    stopping;
 
+    // The join in VkmShutdown expired and the worker is still inside its body.
+    // Everything it names is leaked on purpose from that point and never
+    // destroyed, so this is one-way for the process: it is the mirror's half of
+    // g_svp.orphaned and it means the same thing. Nothing after it may release
+    // the shared D3D12 session either, which is why VkmShutdown answers its
+    // callers rather than returning void.
+    bool    orphaned;
+
     // TWO pairs, alternating, and the second pair is not pipelining -- there is
     // still exactly one frame in flight. It exists because a VkEvent must not be
     // host-reset while a submitted vkCmdWaitEvents may still be about to observe
@@ -397,7 +405,7 @@ static void OnVkmInitRuntime(reshade::api::effect_runtime *rt)
 }
 // Defined below, next to the worker it stops. Forward-declared because the runtime
 // teardown hook has to run before it in this file and after it in time.
-static void VkmShutdown();
+static bool VkmShutdown();
 
 // The game is taking its VkDevice away, and everything this add-on imported onto
 // that device has to go first.
@@ -432,7 +440,19 @@ static void OnVkmDestroyRuntime(reshade::api::effect_runtime *rt)
     // only record that can name it.
     ModuleSnapshot();
     Breadcrumb("shutdown: stopping the Vulkan mirror worker");
-    VkmShutdown();
+    if (!VkmShutdown())
+    {
+        // The join expired, so the worker is still inside Synth12EvaluateShared
+        // and everything the teardown below would release is what it is holding:
+        // the NGX feature, the shared textures, the imported VkImages and the
+        // private D3D11 device the optical flow runs on. Releasing any of them
+        // here is a use after free while that thread lives, and it has no bound
+        // this side can enforce -- so the whole set is leaked and the reason is
+        // in the line VkmShutdown just logged. The game's queue has already been
+        // released twice, which is the part that had to happen.
+        Breadcrumb("shutdown: the mirror's worker did not join, so nothing is released");
+        return;
+    }
     Breadcrumb("shutdown: taking the bridge lock");
     EnterCriticalSection(&g_bridge_cs);
     SynthVkShutdownForDevice();
@@ -652,9 +672,24 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
 
 // Detach, and the one case that has to work: the add-on unloaded while a frame
 // is parked. Release the game first, then stop the thread.
-static void VkmShutdown()
+//
+// It answers whether the worker is provably out, because two callers go on to
+// release the shared D3D12 session -- the NGX feature, g_s12.tex[] and the
+// imported VkImages -- and every one of those is what the worker is inside. The
+// join below is 2000 ms against a worker whose own worst case is
+// kVkmSeeCopiesMs + 2 * kVkmEvaluateMs = 2100, so the expiry is a case this
+// file's own arithmetic admits rather than a theoretical one; it was previously
+// called for its side effect only and the teardown ran regardless. False means
+// the objects stay standing and the caller releases nothing, which is the same
+// answer SynthVkParkStop gives through g_svp.orphaned.
+static bool VkmShutdown()
 {
-    if (g_vkm.worker == nullptr) return;
+    // Latched, so a second call cannot EvSet on a device the game has destroyed,
+    // cannot join a thread this one already gave up on, and cannot close the
+    // Win32 handles the orphan still sets at the foot of its loop. The detach in
+    // DllMain is exactly that second call after a shutdown that orphaned.
+    if (g_vkm.orphaned) return false;
+    if (g_vkm.worker == nullptr) return true;
 
     // FIRST, before anything is released. VkMirrorFrame's entry guard reads this,
     // so a render thread that has not started a frame yet cannot arm one behind
@@ -667,17 +702,45 @@ static void VkmShutdown()
             if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
     g_vkm.stop = 1;
     SetEvent(g_vkm.wake);
-    WaitForSingleObject(g_vkm.worker, 2000);
+    const bool joined = WaitForSingleObject(g_vkm.worker, 2000) == WAIT_OBJECT_0;
 
     // Again, and this pass is the one that counts. The set above races a render
     // thread that was already inside VkMirrorFrame when refused went true and has
     // not yet reached the re-check before the arm -- the reset is that thread's,
     // not the worker's. This pass runs after both windows have closed. It also
     // covers the 2000 ms wait expiring on a worker still inside its evaluate,
-    // which leaves the loop's own release unreached.
+    // which leaves the loop's own release unreached. It runs whether or not the
+    // join succeeded, because releasing the game is the part that has to happen
+    // either way.
     if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
         for (int i = 0; i < 2; ++i)
             if (g_vkm.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_vkm.ev_out[i]);
+
+    if (!joined)
+    {
+        // Nothing below runs and the objects are leaked on purpose -- the same
+        // answer SynthVkParkStop reached for the substitute's worker, for the
+        // same reason. That thread is still inside its body and still names all
+        // of it: the four VkEvents it polls and sets, the two Win32 handles, and
+        // through Synth12EvaluateShared the NGX feature, g_s12.tex[] and the
+        // private D3D12 queue. Closing g_vkm.idle under it is worse than leaking
+        // it, because the OS may reissue that handle value to any CreateEvent in
+        // the process and the orphan sets it at the foot of every turn.
+        //
+        // stop stays at 1 and the wake is still signalled, so the worker exits by
+        // itself when it finishes; it is the join that gave up, not the stop.
+        // stopping stays true, so no render thread arms another frame.
+        Log("[vkmirror] the mirror's worker did not finish within 2000 ms -- its own worst "
+            "case is %u + 2 x %u = %u ms -- so its four VkEvents, its two Win32 handles and "
+            "the shared D3D12 session it is inside are left standing rather than destroyed "
+            "under a thread that still names them. The game's queue was released twice. "
+            "Nothing imported onto this VkDevice is released either, and the mirror does "
+            "not run again in this process.",
+            kVkmSeeCopiesMs, kVkmEvaluateMs, kVkmSeeCopiesMs + 2 * kVkmEvaluateMs);
+        g_vkm.refused  = true;
+        g_vkm.orphaned = true;
+        return false;
+    }
 
     CloseHandle(g_vkm.worker);
     g_vkm.worker = nullptr;
@@ -701,6 +764,7 @@ static void VkmShutdown()
     if (g_vkm.idle != nullptr) { CloseHandle(g_vkm.idle); g_vkm.idle = nullptr; }
     if (g_vkm.wake != nullptr) { CloseHandle(g_vkm.wake); g_vkm.wake = nullptr; }
     g_vkm.stop = 0;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,9 +1461,32 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         // here, and no substitute frame arms again once SRC_MIRROR is published.
         if (!SynthVkDrainWorker())
         {
+            // The substitute's queue, by hand, before anything else. The only
+            // condition that reaches here is an arm whose worker is not done,
+            // which under vk_sync=0 means ReShade's command buffer is stopped at
+            // a vkCmdWaitEvents on that pair's ev_out with the rest of the frame
+            // behind it -- and this branch is the end of the line for it: the
+            // refusal below is permanent, g_source is already SRC_MIRROR, so
+            // SynthMaybeDeliver stands down on every later frame and SynthVkFrame
+            // -- the only other code that sets these by hand -- is never called
+            // again. Both pairs, because nothing here can tell which one a queued
+            // wait names. This is the same statement synth.inc's own idle-wait
+            // expiry makes, and it carries the same trade: the copy back is
+            // already recorded and the stuck worker may still be writing that
+            // Output, so that frame can be torn. A torn frame against a queue
+            // parked past the TDR window.
+            //
+            // retired with them, so the substitute cannot arm another frame
+            // behind a worker that still holds one.
+            if (g_svk.EvSet != nullptr && g_svk.dev != nullptr)
+                for (int i = 0; i < 2; ++i)
+                    if (g_svp.ev_out[i] != 0) g_svk.EvSet(g_svk.dev, g_svp.ev_out[i]);
+            g_svp.retired = true;
             SetEvent(g_vkm.idle);
             VkmRefuse("the substitute's transport worker did not finish, so the shared "
-                      "D3D12 session could not be rebuilt out from under it");
+                      "D3D12 session could not be rebuilt out from under it; the "
+                      "substitute's own queue was released by hand and its transport is "
+                      "retired, so that frame may be torn");
             return;
         }
         g_svk.DeviceWaitIdle(g_svk.dev);
