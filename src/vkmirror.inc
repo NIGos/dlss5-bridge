@@ -239,8 +239,15 @@ static const LONG  kVkmStallGiveUp = 300;
 static const DWORD kVkmEvaluateMs  = 900;
 
 // Derived, not chosen, and it was chosen once: 1000 against a worker whose own
-// documented worst case is 300 + 900 = 1200, so the guard was 200 ms shorter
-// than the thing it guards. The render thread waits this long for the previous
+// documented worst case was said to be 300 + 900 = 1200, so the guard was 200 ms
+// shorter than the thing it guards. It is still shorter, by more: that worker
+// waits on TWO things, the command allocator's retire fence inside Synth12Begin
+// and then the evaluate, so its worst case is 300 + 900 + 900 = 2100 against the
+// 1400 here.
+// ponytail: kVkmSeeCopiesMs + 2 * kVkmEvaluateMs + 200 is the honest derivation
+// and is left undone on purpose -- it decides how long a mirrored game's render
+// thread is held, and nothing in ngxGym has measured a mirror worker anywhere
+// near either number. A stage of its own, with evidence. The render thread waits this long for the previous
 // frame's worker to finish and refuses the mirror permanently if it does not --
 // so a hand-picked number below the budget means one slow-but-successful
 // evaluate retires the mirror for the whole session, silently, because the game
@@ -486,6 +493,16 @@ static void VkmRegisterEvents()
 // The panel's read of the flag below. Non-static because synth.inc is included
 // first and forward-declares it; it is the one symbol these two files share.
 bool VkmStoodDown() { return g_vkm.refused; }
+
+// The substitute's destroy_effect_runtime handler defers to this file's, and it
+// has to defer on the runtime this file will actually act on rather than on the
+// mirror merely being registered: with two Vulkan runtimes the one the
+// substitute opened its device from can be the one g_vkm_rt does not name, and
+// then neither handler runs. Non-static for the same reason VkmStoodDown is.
+bool VkmOwnsRuntime(const reshade::api::effect_runtime *rt)
+{
+    return g_vkm_rt != nullptr && g_vkm_rt == rt;
+}
 
 // Said once, and then the mirror never tries again this session. Everything it
 // refuses on is a property of the game or the machine, not of the frame -- which
@@ -1131,7 +1148,8 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     // actually armed, so every refusal between here and there returns with it
     // still set and costs the next frame nothing.
     // ponytail: a per-frame pipeline bubble, the same one the synthetic Vulkan
-    // path already pays at its wait_idle. Three slots with per-slot events and a
+    // path pays at vk_sync=1; its default no longer pays it -- it parks the
+    // game's queue instead, and at vk_sync=2 it waits on work a frame old. Three slots with per-slot events and a
     // retire fence if a title ever measures badly enough to be worth it.
     if (g_vkm.idle != nullptr && WaitForSingleObject(g_vkm.idle, kVkmIdleMs) != WAIT_OBJECT_0)
     {
@@ -1359,6 +1377,31 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         // no queue to idle -- so the device is. A resolution change costs one
         // visible hitch, which is what it costs everywhere else too.
         g_vkm.rebuild_on_game_create = false;
+        // FIRST, above the idle wait, because none of the rest of this block is
+        // safe while the substitute's worker is inside the shared session. That
+        // worker holds g_ngx_cs only and everything here runs under g_bridge_cs
+        // only, so the two sections do not overlap -- and what follows releases
+        // exactly what it is inside: the NGX feature, the shared textures, the
+        // imported VkImages, the optical flow's private D3D11 device. Its free
+        // events are the proof that it is out; see SynthVkDrainWorker.
+        //
+        // It looked safe before only because of the substitute's default: with
+        // vk_sync=0 the game's queue is parked at a vkCmdWaitEvents, so the idle
+        // wait below could not return until the worker had set its event.
+        // vk_sync=2 parks nothing for that long and nothing in the file ever said
+        // the mirror's teardown rested on it.
+        //
+        // The rebuild alone is enough, and this is the one place it has to be:
+        // the handover zeroed g_s12.w a few lines up in ForwardVkEvaluate, so the
+        // first mirrored frame after a substitute frame always comes through
+        // here, and no substitute frame arms again once SRC_MIRROR is published.
+        if (!SynthVkDrainWorker())
+        {
+            SetEvent(g_vkm.idle);
+            VkmRefuse("the substitute's transport worker did not finish, so the shared "
+                      "D3D12 session could not be rebuilt out from under it");
+            return;
+        }
         g_svk.DeviceWaitIdle(g_svk.dev);
         SynthVkReleaseImages();
         // The same two teardowns the synthetic path already does before its own

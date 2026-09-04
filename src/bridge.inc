@@ -173,11 +173,14 @@ struct BridgeCfg
     // the private D3D12 device: 0 parks the game's queue on a Vulkan event while
     // a worker thread runs the optical flow and the evaluate, 1 waits the queue
     // idle on the CPU and runs both on the present thread, which is what 1.4.8
-    // did. 0 is the default because 1 costs a full CPU-GPU serialisation per
+    // did, and 2 pipelines -- one frame's evaluate runs while the game renders
+    // the next, so the wait the queue reaches is on work that started a frame
+    // ago. 0 is the default because 1 costs a full CPU-GPU serialisation per
     // frame -- Ghost Recon Breakpoint measured ~150 fps of its own against ~75
     // with the substitute and the GPU 46% busy (#23). 1 is the fallback if a
-    // driver does not like the park; the mirror's own park is not affected by
-    // this key.
+    // driver does not like the park; 2 is opt-in because it shows the result one
+    // present later and carries a second Output texture; the mirror's own park is
+    // not affected by this key.
     int vk_sync;
 };
 
@@ -622,7 +625,11 @@ static bool CfgWriteFile(const char *path)
         "# How the substitute's Vulkan transport orders itself against the private\n"
         "# D3D12 device: 0 parks the game's queue on a Vulkan event while a worker\n"
         "# thread runs the optical flow and the evaluate, 1 waits the queue idle on\n"
-        "# the CPU instead, which is slower and is the fallback if 0 misbehaves.\n"
+        "# the CPU instead, which is slower and is the fallback if 0 misbehaves, and\n"
+        "# 2 pipelines -- one frame's evaluate runs while the game renders the next,\n"
+        "# so the wait the queue reaches is on work that started a frame ago, at the\n"
+        "# price of showing the result one present later (about 17 ms at 60 fps) and\n"
+        "# one more Output texture. 0 is the default and has neither cost.\n"
         "vk_sync=%d\n"
         "\n"
         "# THE REST. stage 0 switches the add-on off without removing the file.\n"
@@ -1750,11 +1757,17 @@ static bool PqBackBuffer(DXGI_FORMAT f)
 // when it intercepts a create, so a heap released at a rebuild came back as a
 // dangling pointer inside ReShade's SetDescriptorHeaps (measured 2026-09-03).
 // The descriptors are rewritten in place instead.
-static bool PqPassWait(PqPass *p, UINT64 value)
+//
+// The budget is the caller's, for the same reason Synth12EvaluateShared's is:
+// this wait can run on a thread the game's Vulkan queue is parked behind, and a
+// hard-coded four seconds there is twice the Windows TDR window. Four seconds is
+// still the default, which is what every D3D11 and D3D12 caller wants -- nothing
+// is parked behind those.
+static bool PqPassWait(PqPass *p, UINT64 value, DWORD wait_ms = 4000)
 {
     if (p->fence == nullptr || p->fence->GetCompletedValue() >= value) return true;
     if (FAILED(p->fence->SetEventOnCompletion(value, p->ev))) return false;
-    return WaitForSingleObject(p->ev, 4000) == WAIT_OBJECT_0;
+    return WaitForSingleObject(p->ev, wait_ms) == WAIT_OBJECT_0;
 }
 
 static void PqPassRelease(PqPass *p)
@@ -2004,14 +2017,20 @@ static void PqPassDispatch(PqPass *p, ID3D12GraphicsCommandList *list, int mode,
 // in is left in NON_PIXEL_SHADER_RESOURCE and out in UNORDERED_ACCESS by the
 // decode, and the encode takes them back to COMMON. The session's own barriers
 // on its colour and output are unaffected, since both are returned to COMMON.
-static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode, int set)
+static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode, int set,
+                      DWORD wait_ms = 4000)
 {
     ID3D12GraphicsCommandList *list = p->list[mode];
-    // Which Output this frame's evaluate wrote into. Set 1 arrives only from the
+    // Which Output this frame's evaluate wrote into, resolved ONCE and used by
+    // both the barriers and the dispatch. Set 1 arrives only from the
     // substitute's pipelined transport and only after Synth12Build made the
-    // texture; every other caller reads the single one it always did.
-    ID3D12Resource *const outp = (set == 1 && p->output_b != nullptr) ? p->output_b : p->output;
-    if (!PqPassWait(p, p->done[mode])) return false;
+    // texture; every other caller reads the single one it always did. Passing the
+    // caller's raw set to PqPassDispatch left the two disagreeing about the same
+    // condition -- the barriers naming p->output while the shader wrote through a
+    // table whose UAV is a view over a texture that no longer exists.
+    const int s = (set == 1 && p->output_b != nullptr) ? 1 : 0;
+    ID3D12Resource *const outp = s == 1 ? p->output_b : p->output;
+    if (!PqPassWait(p, p->done[mode], wait_ms)) return false;
     if (FAILED(p->alloc[mode]->Reset()) || FAILED(list->Reset(p->alloc[mode], nullptr))) return false;
     if (mode == 0)
     {
@@ -2026,7 +2045,7 @@ static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode, int set)
     {
         Barrier(list, p->out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(list, outp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        PqPassDispatch(p, list, 1, set);
+        PqPassDispatch(p, list, 1, s);
         Barrier(list, outp, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Barrier(list, p->out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         Barrier(list, p->in, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -2040,18 +2059,19 @@ static bool PqPassRun(PqPass *p, ID3D12CommandQueue *queue, int mode, int set)
 }
 
 // Before the NGX list is recorded: the decode, executed now, runs ahead of it.
-static bool PqPassBefore(PqPass *p, ID3D12CommandQueue *queue)
+static bool PqPassBefore(PqPass *p, ID3D12CommandQueue *queue, DWORD wait_ms = 4000)
 {
-    return PqPassRun(p, queue, 0, 0);
+    return PqPassRun(p, queue, 0, 0, wait_ms);
 }
 
 // After the NGX list was executed: the encode runs behind it, and the session's
 // fence is signalled once more so whoever waits on the value returned here
 // waits for the encoded result and not only for the evaluate.
 static UINT64 PqPassAfter(PqPass *p, ID3D12CommandQueue *queue, ID3D12Fence *session_fence,
-                          UINT64 *session_value, UINT64 fallback, int set = 0)
+                          UINT64 *session_value, UINT64 fallback, int set = 0,
+                          DWORD wait_ms = 4000)
 {
-    if (!PqPassRun(p, queue, 1, set)) return fallback;
+    if (!PqPassRun(p, queue, 1, set, wait_ms)) return fallback;
     const UINT64 v = ++*session_value;
     queue->Signal(session_fence, v);
     return v;
