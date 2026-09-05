@@ -1278,6 +1278,7 @@ struct Synth12
     // that supplies no ExposureTexture. Its shape is independent of the render
     // shape, so it is remembered rather than derived from w/h.
     UINT            exp_w, exp_h;
+    DXGI_FORMAT     exp_fmt, out_fmt;
 
     // The Vulkan mirror's depth arrives packed rather than as floats when the
     // game's depth is D24_UNORM_S8_UINT -- see Synth12MakeDepthUnpack. Then
@@ -1388,6 +1389,7 @@ static void Synth12ReleaseTextures()
     if (g_s12.params != nullptr && g_s12.tex[kExpTex] != nullptr)
         g_s12.params->Set("ExposureTexture", static_cast<ID3D12Resource *>(nullptr));
     g_s12.exp_w = g_s12.exp_h = 0;
+    g_s12.exp_fmt = g_s12.out_fmt = DXGI_FORMAT_UNKNOWN;
 
     // The same rule, and the other four keys it was never applied to. Every
     // evaluate writes Color, Output, Depth and MotionVectors into this block; the
@@ -2002,13 +2004,12 @@ static void Synth12NoteBuildFailure(bool synthetic)
     if (synthetic) g_synth_build_dead = true;
 }
 
-// out_pair is LAST, after exp_h, and that placement is load-bearing: the Vulkan
-// mirror calls this with eight positional arguments (vkmirror.inc), so anywhere
-// earlier and its depth_packed or its exposure size would become the pipeline's
-// flag.
+// Optional formats follow out_pair to preserve existing positional callers.
 static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT out_h,
                          DXGI_FORMAT back_fmt, bool depth_packed = false,
-                         UINT exp_w = 0, UINT exp_h = 0, bool out_pair = false)
+                         UINT exp_w = 0, UINT exp_h = 0, bool out_pair = false,
+                         DXGI_FORMAT exp_fmt = DXGI_FORMAT_R32_FLOAT,
+                         DXGI_FORMAT output_fmt = DXGI_FORMAT_UNKNOWN)
 {
     Synth12ReleaseTextures();
     g_s12.w = w; g_s12.h = h; g_s12.fmt = back_fmt;
@@ -2020,7 +2021,7 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
     // the game's resources any more but copies of them.
     const DXGI_FORMAT slot_fmt[SLOT_COUNT] = {
         TypedFormat(back_fmt),
-        Synth12UavFormat(back_fmt),
+        Synth12UavFormat(output_fmt == DXGI_FORMAT_UNKNOWN ? back_fmt : output_fmt),
         // R32_FLOAT rather than any depth format: a depth-stencil resource is
         // not in the kernel's shared-format list, and NGX reads depth through
         // an ordinary shader resource view anyway. R16G16_FLOAT is what both
@@ -2034,6 +2035,8 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
         DXGI_FORMAT_R16G16_FLOAT,
     };
     const int slots = g_s12.shared ? SLOT_COUNT : (SLOT_OUTPUT + 1);
+    g_s12.out_fmt = slot_fmt[SLOT_OUTPUT];
+    g_s12.exp_fmt = exp_w != 0 && exp_h != 0 ? exp_fmt : DXGI_FORMAT_UNKNOWN;
     for (int i = 0; i < slots; ++i)
         if (!Synth12MakeTexture(i, i == SLOT_OUTPUT ? out_w : w, i == SLOT_OUTPUT ? out_h : h,
                                 slot_fmt[i], i == SLOT_OUTPUT))
@@ -2041,13 +2044,11 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
 
     // The exposure mirror. Not in the loop above: it is not a slot, it has its
     // own size, and it exists only when this frame's caller read one off the
-    // game. R32_FLOAT is pinned rather than mapped -- the mirror accepts only
-    // VK_FORMAT_R32_SFLOAT from the game, and SynthVkFormat already maps
-    // R32_FLOAT back to exactly that, so the import round-trips with no entry
-    // added to any format table. No UAV: NGX reads it and nothing writes it here.
+    // game. Preserve the caller's scalar float format, including R16_FLOAT.
+    // No UAV: NGX reads it and nothing writes it here.
     g_s12.exp_w = exp_w; g_s12.exp_h = exp_h;
     if (exp_w != 0 && exp_h != 0 &&
-        !Synth12MakeTexture(kExpTex, exp_w, exp_h, DXGI_FORMAT_R32_FLOAT, false))
+        !Synth12MakeTexture(kExpTex, exp_w, exp_h, exp_fmt, false))
     { Synth12ReleaseTextures(); return false; }
 
     // The pipeline's second Output, and it is the ONLY texture the pipeline
@@ -3197,6 +3198,7 @@ static uint32_t SynthVkFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_B8G8R8X8_UNORM:        return 44;
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   return 50;   // VK_FORMAT_B8G8R8A8_SRGB
     case DXGI_FORMAT_R10G10B10A2_UNORM:     return 64;   // VK_FORMAT_A2B10G10R10_UNORM_PACK32
+    case DXGI_FORMAT_R16_FLOAT:             return 76;   // VK_FORMAT_R16_SFLOAT
     case DXGI_FORMAT_R16G16_FLOAT:          return 83;   // VK_FORMAT_R16G16_SFLOAT
     case DXGI_FORMAT_R16G16B16A16_FLOAT:    return 97;   // VK_FORMAT_R16G16B16A16_SFLOAT
     case DXGI_FORMAT_R32_FLOAT:             return 100;  // VK_FORMAT_R32_SFLOAT
@@ -3425,7 +3427,7 @@ static bool SynthVkImport()
     // second Output to the substitute's pipelined transport, and a count would
     // make importing the second imply importing the first. Everything inside the
     // loop reads the texture that was actually created, so neither needs a
-    // special case: R32_FLOAT goes through SynthVkFormat to VK_FORMAT_R32_SFLOAT
+    // special case: each scalar float format goes through SynthVkFormat
     // like any other, and the second Output is the first one's format by
     // construction.
     int idx[SLOT_COUNT + 2];

@@ -118,9 +118,10 @@ static const uint32_t kVkFmtB8G8R8A8Unorm   = 44;
 static const uint32_t kVkFmtB8G8R8A8Srgb    = 50;
 static const uint32_t kVkFmtA2B10G10R10     = 64;
 static const uint32_t kVkFmtR16G16B16A16Sf  = 97;
-// The exposure texture's one accepted format, and deliberately NOT an entry in
+// Exposure formats, deliberately NOT entries in
 // MapVkColor: that table is the Colour/Output gate, and widening it widens what
 // the mirror will accept as a game's Colour image.
+static const uint32_t kVkFmtR16Sfloat       = 76;
 static const uint32_t kVkFmtR32Sfloat       = 100;
 static const uint32_t kVkFmtB10G11R11Uf     = 122;
 static const uint32_t kVkFmtD16UnormS8Uint  = 128;
@@ -147,26 +148,6 @@ static DXGI_FORMAT MapVkColor(uint32_t vkfmt)
     case kVkFmtR8G8B8A8Srgb:    return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
     case kVkFmtB10G11R11Uf:     return DXGI_FORMAT_R11G11B10_FLOAT;
     default:                    return DXGI_FORMAT_UNKNOWN;
-    }
-}
-
-// Bytes per texel for the same seven formats and nothing else, because the only
-// question it is asked is whether two images may legally be copied into one
-// another: vkCmdCopyImage between colour images requires equal texel block size.
-// Zero means "not a format this add-on knows", which is a refusal and not a
-// guess.
-static uint32_t VkColorTexelBytes(uint32_t vkfmt)
-{
-    switch (vkfmt)
-    {
-    case kVkFmtR16G16B16A16Sf:  return 8;
-    case kVkFmtA2B10G10R10:
-    case kVkFmtB8G8R8A8Unorm:
-    case kVkFmtB8G8R8A8Srgb:
-    case kVkFmtR8G8B8A8Unorm:
-    case kVkFmtR8G8B8A8Srgb:
-    case kVkFmtB10G11R11Uf:     return 4;
-    default:                    return 0;
     }
 }
 
@@ -1302,15 +1283,12 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     {
         const char *why = nullptr;
         const bool have = VkmGetRes(gp, "ExposureTexture", &exp_res, &why);
-        want_exp = have && exp_res.fmt == kVkFmtR32Sfloat &&
+        want_exp = have && (exp_res.fmt == kVkFmtR32Sfloat || exp_res.fmt == kVkFmtR16Sfloat) &&
                    exp_res.w != 0 && exp_res.h != 0;
 
-        // Once per session, and it prints whether or not the surface is carried:
-        // nothing in this tree has ever decoded a Vulkan ExposureTexture, and
-        // NVIDIA documents the parameter only as a 1x1 texture holding the
-        // exposure scale, without stating a format. So the transport refuses by
-        // number rather than guessing, and this line is what turns the next
-        // report into a one-line change.
+        // Preserve scalar floats in their original format. Endfield supplies
+        // R16_SFLOAT; R32_SFLOAT remains supported. Report other formats rather
+        // than drop the game's exposure or replace it with auto exposure.
         static bool said = false;
         if (have && !said)
         {
@@ -1319,7 +1297,7 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
                 "aspect=0x%X); it is %s.", exp_res.fmt, exp_res.w, exp_res.h,
                 exp_res.aspect, want_exp
                     ? "mirrored to D3D12 so both sides run the same contract"
-                    : "not a 1-component 32-bit float image, which is the only shape "
+                    : "not a 1-component 16-bit or 32-bit float image, which is the only shape "
                       "this transport carries");
         }
 
@@ -1337,11 +1315,8 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
                         "the game drives DLSS from an exposure texture this transport "
                         "cannot carry (%s, VkFormat %u, %ux%u) and has not set "
                         "AutoExposure -- delivering without it would be wrong "
-                        "brightness. To run anyway and let DLSS compute its own "
-                        "exposure, set flags in dlss5-bridge.cfg to the game's own "
-                        "value with bit 0x40 added -- but not to 107, which is treated "
-                        "as unset. The line above names the format, and adding it is a "
-                        "one-line change once a report shows what it is",
+                        "brightness. Supported exposure formats: R16_SFLOAT and "
+                        "R32_SFLOAT. The game's own DLSS remains on screen",
                         why != nullptr ? why : "an image view",
                         exp_res.fmt, exp_res.w, exp_res.h);
             VkmRefuse(msg);
@@ -1350,6 +1325,8 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     }
     const UINT exp_w = want_exp ? exp_res.w : 0;
     const UINT exp_h = want_exp ? exp_res.h : 0;
+    const DXGI_FORMAT exp_fmt = exp_res.fmt == kVkFmtR16Sfloat
+        ? DXGI_FORMAT_R16_FLOAT : DXGI_FORMAT_R32_FLOAT;
 
     const DXGI_FORMAT color_fmt = MapVkColor(res[SLOT_COLOR].fmt);
     if (color_fmt == DXGI_FORMAT_UNKNOWN)
@@ -1363,27 +1340,18 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         return;
     }
 
-    // Output. Never looked at before this: the shared Output texture is created
-    // from the COLOUR format, and the last thing the frame does is
-    // vkCmdCopyImage it over the game's own Output image. A copy between two
-    // images whose texel block sizes differ is invalid, and the driver is not
-    // required to say so -- so the game's Output format has to be one this add-on
-    // knows and has to be the same width in bytes as its Colour. Refused by
-    // number rather than converted: a conversion nobody measured is exactly the
-    // invention this project keeps out.
-    if (VkColorTexelBytes(res[SLOT_OUTPUT].fmt) == 0 ||
-        VkColorTexelBytes(res[SLOT_OUTPUT].fmt) != VkColorTexelBytes(res[SLOT_COLOR].fmt))
+    // Match the game's Output independently of Color. Each copy then preserves
+    // its own format, including packed float input with RGBA16 float output.
+    const DXGI_FORMAT output_fmt = MapVkColor(res[SLOT_OUTPUT].fmt);
+    if (output_fmt == DXGI_FORMAT_UNKNOWN)
     {
-        char msg[224];
+        char msg[160];
         _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                    "the game's Output is VkFormat %u against a Colour of VkFormat %u, and "
-                    "this add-on will not copy between two formats it cannot show are the "
-                    "same size -- add the entry to MapVkColor and it works",
-                    res[SLOT_OUTPUT].fmt, res[SLOT_COLOR].fmt);
+                    "the game's Output is VkFormat %u, which this transport cannot carry",
+                    res[SLOT_OUTPUT].fmt);
         VkmRefuse(msg);
         return;
     }
-
     // Depth. The transport carries the depth aspect out through a buffer and back
     // into the shared texture, and what those bytes mean is fixed by the format:
     //
@@ -1425,10 +1393,12 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
     const bool rebuild = g_s12.feature == nullptr || g_s12.w != rw || g_s12.h != rh ||
                          g_s12.out_w != ow || g_s12.out_h != oh || g_s12.fmt != color_fmt ||
                          g_s12.depth_packed != depth_packed ||
-                         g_s12.exp_w != exp_w || g_s12.exp_h != exp_h;
+                         g_s12.exp_w != exp_w || g_s12.exp_h != exp_h ||
+                         g_s12.exp_fmt != (want_exp ? exp_fmt : DXGI_FORMAT_UNKNOWN) ||
+                         g_s12.out_fmt != Synth12UavFormat(output_fmt);
     if (rebuild)
     {
-        // Which of the seven conditions fired, because "building" twice at an
+        // Which condition fired, because "building" twice at an
         // unchanged shape is a question this line could answer and did not --
         // and it was asked, on 2026-08-31, about two builds 245 ms apart.
         Log("[vkmirror] building the D3D12 feature and its Vulkan import for %ux%u -> %ux%u %s "
@@ -1445,7 +1415,7 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
             : g_s12.out_w != ow || g_s12.out_h != oh ? "output size changed"
             : g_s12.fmt != color_fmt ? "colour format changed"
             : g_s12.depth_packed != depth_packed ? "depth packing changed"
-            : "the exposure texture appeared, vanished or changed shape");
+            : "output or exposure format/shape changed");
         // Every submitted command buffer that names the old images has to be
         // finished with before they are destroyed, and inside a detour there is
         // no queue to idle -- so the device is. A resolution change costs one
@@ -1512,7 +1482,7 @@ static void VkMirrorFrame(void *cmd_raw, const NVSDK_NGX_Parameter *gp)
         // mirror-only session both of these no-op.
         SynthOfaVkRebuild();
         SynthDepthCsRelease();
-        if (!Synth12Build(&g_vkm.sp, rw, rh, ow, oh, color_fmt, depth_packed, exp_w, exp_h))
+        if (!Synth12Build(&g_vkm.sp, rw, rh, ow, oh, color_fmt, depth_packed, exp_w, exp_h, false, exp_fmt, output_fmt))
         {
             // The mirror stands down -- its own build failed -- but the shared
             // session is only written off after a run of failures, so this does
