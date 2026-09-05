@@ -182,6 +182,13 @@ struct BridgeCfg
     // present later and carries a second Output texture; the mirror's own park is
     // not affected by this key.
     int vk_sync;
+    // Diagnostic; see UnwrapList. 0 hands NGX the command list as it comes.
+    int unwrap_list;
+    // What this add-on does about a driver whose NGX loader drives neural
+    // rendering into a snippet that faults: 0 closes that route in memory and
+    // leaves everything else alone, 1 does nothing, 2 loads the previous
+    // driver's loader instead. See PreferWorkingNgxLoader.
+    int ngx_loader;
 };
 
 // auto is not a fourth point on a scale with the other three, so this is stored
@@ -199,7 +206,7 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0, 0, 0 };
 
 // synth_after answers one question and used to answer two. It is still the
 // opt-in for synthesising a contract in a game that has never called DLSS --
@@ -473,7 +480,7 @@ static void CfgReload()
         else if (_stricmp(key, "flags")       == 0) next.flags       = val;
         else if (_stricmp(key, "dred")        == 0) next.dred        = val;
         else if (_stricmp(key, "skip_exe")    == 0) next.skip_exe    = val;
-        else if (_stricmp(key, "unwrap")      == 0) next.unwrap      = val;
+        else if (_stricmp(key, "unwrap")      == 0) next.unwrap      = (val >= 0 && val <= 2) ? val : 1;
         else if (_stricmp(key, "subrects")    == 0) next.subrects    = val;
         else if (_stricmp(key, "reset_every") == 0) next.reset_every = val;
         else if (_stricmp(key, "pixels")      == 0) next.pixels      = val;
@@ -485,6 +492,8 @@ static void CfgReload()
         else if (_stricmp(key, "ofa_grid")    == 0) next.ofa_grid    = val;
         else if (_stricmp(key, "ofa_perf")    == 0) next.ofa_perf    = val;
         else if (_stricmp(key, "vk_present")  == 0) next.vk_present  = (val >= 0 && val <= 2) ? val : 0;
+        else if (_stricmp(key, "unwrap_list") == 0) next.unwrap_list = (val >= 0 && val <= 1) ? val : 0;
+        else if (_stricmp(key, "ngx_loader")  == 0) next.ngx_loader  = (val >= 0 && val <= 2) ? val : 0;
         else if (_stricmp(key, "vk_sync")     == 0) next.vk_sync     = (val >= 0 && val <= 2) ? val : 0;
         // Only the sign is taken, because only the sign is unknown: the
         // magnitude is the back buffer size and this add-on measures that. A
@@ -527,7 +536,9 @@ static void CfgReload()
                          (next.ofa_grid != g_cfg.ofa_grid) ||
                          (next.ofa_perf != g_cfg.ofa_perf) ||
                          (next.vk_present != g_cfg.vk_present) ||
-                         (next.vk_sync != g_cfg.vk_sync);
+                         (next.vk_sync != g_cfg.vk_sync) ||
+                         (next.unwrap_list != g_cfg.unwrap_list) ||
+                         (next.ngx_loader != g_cfg.ngx_loader);
     // The first read reports whatever it found, changed or not. Until now the echo
     // fired only on a difference from the built-in defaults, so a session running on
     // defaults had no config line at all -- and "no config line" then meant either
@@ -1003,6 +1014,52 @@ static void UnwrapReShadeProxy(ID3D12Device **dev)
     *dev = raw;
 }
 
+// The same question asked of the COMMAND LIST rather than the device, and the
+// reason it is a separate question. NGX is handed a device at Init and a list at
+// every evaluate; ReShade's add-on build wraps both, and a neural snippet that
+// takes one from the wrapped side and hands it to the other faults on the
+// mismatch. That is the shape measured on 2026-09-04: D3D12Core reading a
+// descriptor heap's own description out of what is a ReShade wrapper object,
+// inside SetDescriptorHeaps, on NVIDIA 32.0.16.1664 whose loader had just begun
+// routing feature 18 into nvngx_dlssnr.dll. Stripping the proxy from the DEVICE
+// stops the fault and costs the neural pass, because that build needs the queue
+// ReShade announces; this key asks whether stripping only the list is enough.
+//
+// Diagnostic, off by default, and it stays off until a session says otherwise:
+// nothing here knows which of the two ReShade's own conversion expects.
+static ID3D12GraphicsCommandList *UnwrapList(ID3D12GraphicsCommandList *list)
+{
+    static const GUID kUnwrapped =
+        { 0x7f2c9a11, 0x3b4e, 0x4d6a, { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 } };
+    if (g_cfg.unwrap_list == 0 || list == nullptr) return list;
+
+    ID3D12GraphicsCommandList *raw = nullptr;
+    if (FAILED(list->QueryInterface(kUnwrapped, reinterpret_cast<void **>(&raw))) ||
+        raw == nullptr)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[bridge] unwrap_list=%d, but the command list is not wrapped and there is "
+                "nothing to strip. ReShade wraps a list only on its add-on build.",
+                g_cfg.unwrap_list);
+        }
+        return list;
+    }
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        Log("[bridge] unwrap_list=%d: NGX is handed the command list underneath ReShade's "
+            "proxy, %p rather than %p, while the device it was initialised with keeps "
+            "whatever unwrap decided. This is a diagnostic: if it is what makes a session "
+            "work, that is worth a report.", g_cfg.unwrap_list,
+            static_cast<void *>(raw), static_cast<void *>(list));
+    }
+    return raw;
+}
+
 // Whether to strip ReShade's proxy, decided once for both device paths.
 //
 // unwrap=1 strips it, and is the shipped default for the reason UnwrapReShadeProxy
@@ -1019,6 +1076,29 @@ static void UnwrapReShadeProxy(ID3D12Device **dev)
 static void MaybeUnwrap(ID3D12Device **dev)
 {
     if (g_cfg.unwrap == 0) return;
+    // 2 strips the proxy whatever the two overrides below would have said. Both
+    // of them were measured on one driver against one add-on build, and neither
+    // can be re-measured while it is unconditional: a user who is told to try
+    // unwrap=0 for a build on the needs-proxy list is being told to set the
+    // value that is already in force. After NVIDIA 32.0.16.1664 the question
+    // reopened -- the wrapped and unwrapped device are two different objects,
+    // and a neural snippet that creates its descriptor heaps against one and
+    // sets them on the other is the shape of the fault seen there -- so the
+    // question needs an answer that is not a rebuild of this add-on.
+    if (g_cfg.unwrap == 2)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[bridge] unwrap=2: ReShade's proxy is stripped from the D3D12 device even "
+                "though something here would otherwise have kept it. This is the diagnostic "
+                "value; if it is what makes a session work, say so in a report, because the "
+                "rule it overrides is what this add-on believes about your DLSS 5 add-on.");
+        }
+        UnwrapReShadeProxy(dev);
+        return;
+    }
     // ReShade loaded under the name d3d12.dll IS the D3D12 runtime this device
     // was created through, not a wrapper it acquired along the way. Stripped
     // there, the device NGX gets is one ReShade never saw, and the create
@@ -2467,6 +2547,42 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             else if (rc != NGX_SUCCESS)
                 Log("[bridge] capability query failed 0x%08X, %s", rc, NgxResultName(rc));
             else if (caps != nullptr)   { Log("[bridge] NGX capabilities:"); DumpCapability(caps); }
+
+            // Whether this driver's loader drives the neural snippet itself, and
+            // whether the snippet beside us is one it faults on. Asked of the
+            // loader rather than of its file version: DLSSNR.Available exists in
+            // 32.0.16.1664's _nvngx.dll and in no earlier one, so its presence is
+            // the fact rather than a number that could be renumbered. See
+            // NrSnippetIsOlderThanLoader for what the pairing does.
+            if (caps != nullptr && code == 0)
+            {
+                // A loader that has no such name answers UnsupportedParameter,
+                // 0xBAD00010; one that has it answers success whatever the value.
+                // The value itself is not the question -- the NAME existing is.
+                unsigned int nr_avail = 0;
+                const NVSDK_NGX_Result nrq = caps->Get("DLSSNR.Available", &nr_avail);
+                const bool loader_drives_nr = nrq == NGX_SUCCESS;
+                char nrver[48] = "";
+                const bool snippet_old = NrSnippetIsOlderThanLoader(nrver, sizeof(nrver));
+                if (loader_drives_nr && snippet_old && !g_ngx_route_closed)
+                {
+                    Log("[bridge] *** This driver's NGX loader drives neural rendering itself -- it "
+                        "answers DLSSNR.Available -- and nvngx_dlssnr.dll beside the game is %s, "
+                        "which that route faults on: the snippet hands D3D12 a descriptor heap "
+                        "whose description reads back as garbage, D3D12 faults inside "
+                        "SetDescriptorHeaps, and the game then terminates or stops presenting. "
+                        "Neither this add-on nor the DLSS 5 add-on is between the two in the fault "
+                        "stack. Measured 2026-09-04 on 32.0.16.1664 against 32.0.16.1656. ***",
+                        nrver[0] != 0 ? nrver : "an older build");
+                    Log("[bridge]   That route is normally closed at attach: this add-on writes "
+                        "an empty name over entry 18 of the loader's feature table, in memory, "
+                        "so the loader loads no snippet for it and the DLSS 5 add-on drives "
+                        "neural rendering itself. The line logged at attach says whether that "
+                        "worked. It did not here, so either ngx_loader is set to 1 or the table "
+                        "did not match this driver -- ngx_loader=2 then falls back to the "
+                        "previous driver's loader if the driver store still holds one.");
+                }
+            }
         }
 
         D3D12_COMMAND_QUEUE_DESC qd = {};
@@ -3110,7 +3226,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
 
     DWORD code = 0;
     Breadcrumb("creating the D3D12 DLSS feature");
-    NVSDK_NGX_Result rf = SafeCreateFeature(g_bridge.create_feature, g_bridge.list,
+    NVSDK_NGX_Result rf = SafeCreateFeature(g_bridge.create_feature, UnwrapList(g_bridge.list),
                                             g_bridge.params, &g_bridge.feature, &code);
     const UINT64 v = EndCommands();
 
@@ -4271,7 +4387,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     static const char kNgxMark[] = "ngx evaluate";
     g_bridge.list->BeginEvent(1, kNgxMark, sizeof(kNgxMark));
     if (mode != 1)
-        re = SafeEvaluateGuarded(g_bridge.eval_feature, g_bridge.list,
+        re = SafeEvaluateGuarded(g_bridge.eval_feature, UnwrapList(g_bridge.list),
                                  g_bridge.feature, g_bridge.params, &code);
     g_bridge.list->EndEvent();
 

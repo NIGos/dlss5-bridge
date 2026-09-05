@@ -2230,7 +2230,7 @@ static bool Synth12Build(const SynthParams *sp, UINT w, UINT h, UINT out_w, UINT
         { Log("[synth] could not start a command list"); Synth12ReleaseTextures(); return false; }
         code = 0;
         Breadcrumb("creating the D3D12 DLSS feature for the synthetic contract");
-        rf = SafeCreateFeature(g_s12.create_feature, g_s12.list,
+        rf = SafeCreateFeature(g_s12.create_feature, UnwrapList(g_s12.list),
                                g_s12.params, &g_s12.feature, &code);
         const UINT64 v = Synth12End();
 
@@ -2481,7 +2481,7 @@ static void Synth12Frame(reshade::api::effect_runtime *rt, const SynthParams *sp
     static const char kNgxMark[] = "ngx evaluate";
     g_s12.list->BeginEvent(1, kNgxMark, sizeof(kNgxMark));
     NVSDK_NGX_Result re = g_cfg.mode != 1
-        ? SafeEvaluateGuarded(g_s12.eval_feature, g_s12.list, g_s12.feature, g_s12.params, &code)
+        ? SafeEvaluateGuarded(g_s12.eval_feature, UnwrapList(g_s12.list), g_s12.feature, g_s12.params, &code)
         : NGX_SUCCESS;
     g_s12.list->EndEvent();
 
@@ -2717,7 +2717,7 @@ static bool Synth12EvaluateShared(const SynthParams *sp, DWORD wait_ms = 4000,
     // reads of the same key deciding two halves of one question, which is what
     // `wrote` exists to prevent. Synth12FrameParams reads reset_every the same way.
     NVSDK_NGX_Result re = wrote
-        ? SafeEvaluateGuarded(g_s12.eval_feature, g_s12.list, g_s12.feature, g_s12.params, &code)
+        ? SafeEvaluateGuarded(g_s12.eval_feature, UnwrapList(g_s12.list), g_s12.feature, g_s12.params, &code)
         : NGX_SUCCESS;
     g_s12.list->EndEvent();
 

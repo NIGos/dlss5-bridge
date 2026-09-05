@@ -1525,6 +1525,16 @@ static void LogPrologue(const char *label, const BYTE *p);
 static volatile bool g_ngx_init_in_flight;
 static volatile bool g_scan_pending;
 
+// Defined below the include, beside the rest of the snippet-version reading, and
+// used inside it: the session opener asks whether the neural snippet beside this
+// game is one the driver's own loader faults on. See the note on the definition.
+static bool NrSnippetIsOlderThanLoader(char *ver_out, size_t ver_n);
+
+// Set once the loader's route to feature 18 has been closed in memory; the
+// capability probe uses it so it does not warn about a fault that can no longer
+// happen. See PatchNgxFeatureTable.
+static bool g_ngx_route_closed;
+
 #include "bridge.inc"
 
 
@@ -1581,6 +1591,349 @@ static int SnippetMajorVersion(char *ver_out, size_t ver_n)
         return 0;
     }
     return 0;
+}
+
+// The neural-rendering snippet's version, as four numbers, or all zeroes when
+// none has been scanned. Unlike the super-resolution one above this has to be
+// ranked rather than thresholded on a major, because the version that matters
+// differs in its second and third fields.
+// Defined further down, beside the rest of the file inspection; used here and by
+// the loader choice below, both of which run before it in file order.
+static bool FileVersionString(const wchar_t *path, char *out, size_t n);
+
+static void NrSnippetVersion(int out[4], char *ver_out, size_t ver_n)
+{
+    out[0] = out[1] = out[2] = out[3] = 0;
+    if (ver_out != nullptr && ver_n != 0) ver_out[0] = 0;
+    for (LONG i = 0; i < g_seen_count; ++i)
+    {
+        if (_wcsicmp(g_seen[i].leaf, L"nvngx_dlssnr.dll") != 0) continue;
+        if (ver_out != nullptr && ver_n != 0) strcpy_s(ver_out, ver_n, g_seen[i].ver);
+        sscanf_s(g_seen[i].ver, "%d.%d.%d.%d", &out[0], &out[1], &out[2], &out[3]);
+        return;
+    }
+
+    // Nothing scanned yet, and one caller runs before anything is. g_seen is
+    // filled when NGX's own modules are enumerated, which is long after attach,
+    // and the loader has to be chosen before NGX exists in the process at all --
+    // so the file is read where NGX would find it: beside this add-on first,
+    // then beside the executable, which is the order NGX searches.
+    wchar_t base[MAX_PATH] = {};
+    for (int where = 0; where < 2; ++where)
+    {
+        if (GetModuleFileNameW(where == 0 ? g_self : nullptr, base, MAX_PATH) == 0) continue;
+        wchar_t *sl = wcsrchr(base, L'\\');
+        if (sl == nullptr) continue;
+        wcscpy_s(sl + 1, MAX_PATH - (sl + 1 - base), L"nvngx_dlssnr.dll");
+        char ver[64];
+        if (!FileVersionString(base, ver, sizeof(ver))) continue;
+        if (ver_out != nullptr && ver_n != 0) strcpy_s(ver_out, ver_n, ver);
+        sscanf_s(ver, "%d.%d.%d.%d", &out[0], &out[1], &out[2], &out[3]);
+        return;
+    }
+}
+
+// The neural snippet that the driver's loader now drives, and the pairing that
+// crashes.
+//
+// NVIDIA 32.0.16.1664's NGX loader gained first-class support for feature 18:
+// its feature-id table names "dlssnr" where 32.0.16.1656 had an empty string,
+// and DLSSNR.Available and its siblings exist only in the newer file. From that
+// version the LOADER routes feature 18 into nvngx_dlssnr.dll, and 310.8.0.0 --
+// the newest neural snippet in circulation on 2026-09-04 -- then calls
+// ID3D12GraphicsCommandList::SetDescriptorHeaps with a heap whose own
+// description reads back as garbage. D3D12 faults validating its node mask,
+// this add-on's guarded call catches the access violation, the neighbouring
+// DLSS 5 add-on registers no unwind cleanup so its lock stays held, and the
+// next lock on that thread throws: the game either terminates or stops
+// presenting. Measured on an RTX 5090 with the fault stack this add-on records,
+// which names the snippet and puts neither this add-on nor its neighbour
+// between it and D3D12.
+//
+// The pairing is what is broken, not either half: the same snippet on 1656's
+// loader delivers frames, and this add-on's own DLSS on 1664 is healthy with no
+// neural add-on present. So the test is the pairing, and it self-heals -- a
+// newer snippet than the one measured is presumed fixed and allowed through,
+// because the alternative is an add-on that refuses to work after the fix lands.
+static bool NrSnippetIsOlderThanLoader(char *ver_out, size_t ver_n)
+{
+    int v[4];
+    NrSnippetVersion(v, ver_out, ver_n);
+    if (v[0] == 0) return false;   // none scanned; nothing to judge
+    // 310.8.0.0 and anything before it. The next field NVIDIA moves is the one
+    // this compares, whichever it is.
+    if (v[0] != 310) return v[0] < 310;
+    if (v[1] != 8)   return v[1] < 8;
+    return v[2] == 0 && v[3] == 0;
+}
+
+// Whether a file contains a byte sequence. Used on the NGX loader to ask what
+// it supports rather than what it is numbered, because a version can be
+// renumbered and a capability name in .rdata cannot be there by accident.
+static bool FileContainsAscii(const wchar_t *path, const char *needle)
+{
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    const size_t n = strlen(needle);
+    // Read in blocks with an overlap of n-1 bytes, so a match that straddles a
+    // block boundary is still found. 1 MB blocks against a 1.4 MB file is two
+    // reads; the whole thing runs once, at attach, on a local file.
+    static const DWORD kBlock = 1u << 20;
+    char *buf = static_cast<char *>(malloc(kBlock + 64));
+    bool  found = false;
+    if (buf != nullptr && n > 0 && n < 64)
+    {
+        DWORD carry = 0;
+        for (;;)
+        {
+            DWORD got = 0;
+            if (!ReadFile(h, buf + carry, kBlock, &got, nullptr) || got == 0) break;
+            const DWORD have = carry + got;
+            for (DWORD i = 0; i + n <= have; ++i)
+                if (memcmp(buf + i, needle, n) == 0) { found = true; break; }
+            if (found) break;
+            carry = static_cast<DWORD>(n - 1);
+            memmove(buf, buf + have - carry, carry);
+        }
+    }
+    free(buf);
+    CloseHandle(h);
+    return found;
+}
+
+// Choose the NGX loader before anything else can.
+//
+// NVIDIA 32.0.16.1664's _nvngx.dll gained first-class support for feature 18 --
+// its feature-id table names "dlssnr" where 32.0.16.1656 had an empty string,
+// and DLSSNR.Available exists only in the newer file -- and from that version
+// the LOADER routes feature 18 into nvngx_dlssnr.dll itself. Snippet 310.8.0.0,
+// the newest in circulation on 2026-09-04, then hands D3D12 a descriptor heap
+// whose description reads back as garbage: D3D12 faults inside
+// SetDescriptorHeaps, this add-on's guarded call catches it, the neural add-on
+// beside us registers no unwind cleanup so its lock stays held, and the game
+// terminates or stops presenting. The captured fault stack names the snippet
+// with neither add-on between it and D3D12.
+//
+// The whole difference is which loader answers. Windows resolves a bare-name
+// LoadLibrary against modules already loaded BY BASE NAME, so whichever file
+// called _nvngx.dll is loaded first owns that name for the process -- which is
+// why copying the previous driver's copy beside a game executable fixes it, and
+// why doing that by hand is only reliable if nothing loaded it first. This add-on
+// attaches before the game's DLSS initialises, so it can make that choice
+// itself: find a loader that does not answer DLSSNR.Available, load it by full
+// path, and every later resolution of the name gets that one.
+//
+// Deliberately narrow. It does nothing unless all three hold: nothing has loaded
+// an _nvngx.dll yet, the snippet beside the game is one measured to fault, and
+// the driver store still holds a loader without the new route. A newer snippet
+// makes it stand down on its own, which is the behaviour wanted when NVIDIA
+// fixes this. This is the fallback -- ngx_loader=2 -- and it needs the previous
+// driver to still be on disk, which a clean install or a DDU pass removes; the
+// default closes the route in memory instead and needs nothing.
+static wchar_t g_ngx_loader_pref[MAX_PATH];
+
+
+// The default answer: close the loader's own route to feature 18 in memory.
+//
+// _nvngx.dll carries a 19-entry table of feature id -> snippet name in writable
+// data. Entries 0..17 are byte-identical between 1656 and 1664; entry 18 is the
+// only difference in the whole table -- 1656 points it at L"" and 1664 at
+// L"dlssnr". NGXSecureLoadFeature loads nothing and returns 0xBAD00001 when the
+// name is empty, so putting an empty string back into that one slot reproduces
+// 1656's behaviour exactly, in this process only, with nothing on disk touched
+// and no old driver needed. The neural add-on then drives feature 18 itself the
+// way it did before the driver update, which is the path that works.
+//
+// The table is found by pattern, never by address: entry 1 must read "dlss",
+// entry 11 "dlssg" and entry 18 "dlssnr". A driver that grows, reorders or moves
+// the table simply fails to match, and this logs and does nothing.
+static bool NgxNameIs(const BYTE *base, size_t image, const void *p, const wchar_t *want)
+{
+    const BYTE *s = static_cast<const BYTE *>(p);
+    if (s < base || s >= base + image) return false;
+    const size_t room = static_cast<size_t>(base + image - s) / sizeof(wchar_t);
+    const size_t n    = wcslen(want);
+    if (room <= n) return false;
+    return wcsncmp(reinterpret_cast<const wchar_t *>(s), want, n + 1) == 0;
+}
+
+static bool PatchNgxFeatureTable(HMODULE ngx)
+{
+    BYTE *base = reinterpret_cast<BYTE *>(ngx);
+    if (base == nullptr) return false;
+
+    const IMAGE_DOS_HEADER *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    const IMAGE_NT_HEADERS *nt =
+        reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    const size_t image = nt->OptionalHeader.SizeOfImage;
+    const IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i)
+    {
+        if ((sec[i].Characteristics & IMAGE_SCN_MEM_WRITE) == 0) continue;
+        void **p   = reinterpret_cast<void **>(base + sec[i].VirtualAddress);
+        void **end = reinterpret_cast<void **>(base + sec[i].VirtualAddress +
+                                               sec[i].Misc.VirtualSize);
+        for (; p + 19 <= end; ++p)
+        {
+            if (!NgxNameIs(base, image, p[1],  L"dlss"))   continue;
+            if (!NgxNameIs(base, image, p[11], L"dlssg"))  continue;
+            if (!NgxNameIs(base, image, p[18], L"dlssnr")) continue;
+
+            DWORD old = 0;
+            if (!VirtualProtect(&p[18], sizeof(void *), PAGE_READWRITE, &old))
+            {
+                Log("[bridge] the loader's feature table is at %p but could not be made "
+                    "writable (%lu), so the driver keeps its own route to neural rendering.",
+                    (void *)p, GetLastError());
+                return false;
+            }
+            // The empty string has to live inside the loader, not in this
+            // add-on: ReShade can unload an add-on while the process runs on,
+            // and the loader stays mapped, so a pointer into our .rdata would
+            // dangle and the next NGX init would fault reading it. The
+            // terminator of the loader's own "dlssnr" is an empty string at a
+            // permanent address, and NgxNameIs has just proved it is in-image.
+            p[18] = static_cast<wchar_t *>(p[18]) + wcslen(L"dlssnr");
+            g_ngx_route_closed = true;
+            VirtualProtect(&p[18], sizeof(void *), old, &old);
+            Log("[bridge] the driver's route to neural rendering is closed for this process: "
+                "entry 18 of the loader's feature table at %p named \"dlssnr\" and now names "
+                "nothing, which is what the previous driver had there. The DLSS 5 add-on "
+                "drives that feature itself, as it did before the driver update. Nothing on "
+                "disk is changed and no other feature is touched. Set ngx_loader=1 in "
+                "dlss5-bridge.cfg to leave the driver's route alone.", (void *)p);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Where the process would find NGX if nothing interfered. NVIDIA's own SDK
+// reads this key, so it names the loader the game is going to get.
+static bool DriverNgxLoaderPath(wchar_t *out, size_t cch)
+{
+    wchar_t dir[MAX_PATH] = {};
+    DWORD   cb = sizeof(dir);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore",
+                     L"FullPath", RRF_RT_REG_SZ, nullptr, dir, &cb) != ERROR_SUCCESS ||
+        dir[0] == 0)
+        return false;
+    _snwprintf_s(out, cch, _TRUNCATE, L"%ls\\_nvngx.dll", dir);
+    return GetFileAttributesW(out) != INVALID_FILE_ATTRIBUTES;
+}
+
+
+static void PreferWorkingNgxLoader()
+{
+    if (g_cfg.ngx_loader == 1) return;
+
+    char nrver[48] = "";
+    const bool snippet_old = NrSnippetIsOlderThanLoader(nrver, sizeof(nrver));
+    // The snippet beside the game is the whole question. It was tempting to also
+    // require a neural add-on this add-on has measured, and that was wrong: the
+    // fault is between the driver's loader and the snippet, with no add-on
+    // between them, so gating on one add-on's sha256 would have left every other
+    // build -- including the next release of the one measured -- back on the
+    // faulting route with nothing in the log to say why. Nothing is lost by
+    // being broad: a process that never asks for feature 18 never reads that
+    // entry, so closing it there costs nothing.
+    if (g_cfg.ngx_loader != 2 && !snippet_old) return;
+
+    if (g_cfg.ngx_loader != 2)
+    {
+        // The loader the process is going to use anyway, patched in place. It
+        // does not matter whether something else loaded it first.
+        HMODULE ngx = GetModuleHandleW(L"_nvngx.dll");
+        wchar_t path[MAX_PATH] = {};
+        if (ngx == nullptr && DriverNgxLoaderPath(path, _countof(path)))
+            ngx = LoadLibraryW(path);
+        if (ngx == nullptr)
+        {
+            Log("[bridge] no NGX loader is loaded and none is registered, so there is nothing "
+                "to adjust; the driver will bring its own in later.");
+            return;
+        }
+        if (!PatchNgxFeatureTable(ngx))
+            Log("[bridge] this NGX loader has no \"dlssnr\" entry in its feature table, so it "
+                "does not drive neural rendering itself and there is nothing to close. Set "
+                "ngx_loader=2 if the session still faults inside the snippet.");
+        return;
+    }
+
+    if (GetModuleHandleW(L"_nvngx.dll") != nullptr)
+    {
+        Log("[bridge] an NGX loader was already loaded before this add-on could choose one, so "
+            "the choice is not this add-on's to make in this process.");
+        return;
+    }
+
+    wchar_t dir[MAX_PATH] = {};
+    if (GetSystemDirectoryW(dir, MAX_PATH) == 0) return;
+    wcscat_s(dir, L"\\DriverStore\\FileRepository\\");
+
+    wchar_t pattern[MAX_PATH];
+    _snwprintf_s(pattern, _countof(pattern), _TRUNCATE, L"%lsnv_dispi.inf_*", dir);
+
+    wchar_t best[MAX_PATH] = {};
+    char    best_ver[48]   = "";
+    int     seen_new = 0, seen_old = 0;
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) continue;
+            wchar_t cand[MAX_PATH];
+            _snwprintf_s(cand, _countof(cand), _TRUNCATE, L"%ls%ls\\_nvngx.dll", dir, fd.cFileName);
+            if (GetFileAttributesW(cand) == INVALID_FILE_ATTRIBUTES) continue;
+
+            char ver[48] = "";
+            FileVersionString(cand, ver, sizeof(ver));
+            if (FileContainsAscii(cand, "DLSSNR.Available")) { ++seen_new; continue; }
+            ++seen_old;
+            // The newest of the ones without the new route, so the pick is as
+            // close to this driver as it can be while still taking the old path.
+            if (best[0] == 0 || strcmp(ver, best_ver) > 0)
+            { wcscpy_s(best, cand); strcpy_s(best_ver, ver); }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    if (seen_new == 0 && g_cfg.ngx_loader != 2)
+    {
+        // Nothing here drives the neural snippet, so nothing to avoid.
+        return;
+    }
+    if (best[0] == 0)
+    {
+        Log("[bridge] the snippet beside this game is %s, which this driver's loader faults on, "
+            "and the driver store holds no older loader to fall back to -- a driver cleanup "
+            "removes the previous one. A newer nvngx_dlssnr.dll is the fix.",
+            nrver[0] != 0 ? nrver : "an older build");
+        return;
+    }
+    if (LoadLibraryW(best) == nullptr)
+    {
+        Log("[bridge] %ls would not load (error %lu), so the loader is left as the driver "
+            "chooses it.", best, GetLastError());
+        return;
+    }
+    wcscpy_s(g_ngx_loader_pref, best);
+    Log("[bridge] NGX loader chosen by this add-on: %ls, version %s. The driver's own is %s and "
+        "drives neural rendering itself, which the %s snippet beside this game faults on; this "
+        "one leaves that route alone. Windows resolves _nvngx.dll by name against what is already "
+        "loaded, so this is now the one the whole process gets. Set ngx_loader=1 in "
+        "dlss5-bridge.cfg to leave the choice to the driver.",
+        best, best_ver[0] != 0 ? best_ver : "unknown",
+        seen_new == 1 ? "newer" : "newer still", nrver[0] != 0 ? nrver : "older");
 }
 
 static void NoteSnippetVersion(const wchar_t *leaf, const char *ver)
@@ -3597,6 +3950,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // Which file those values came from, before anything acts on them. A
         // session that never opens a D3D12 session still gets this line.
         CfgSayWhich();
+        // Before anything can reach NGX, and after the file inventory that
+        // recorded which snippets are beside the game and the config that can
+        // switch this off. Whoever loads a file called _nvngx.dll first owns
+        // that name for the process, so this is the only moment the choice
+        // exists. See the note above the function for what it is choosing
+        // between and why it usually chooses nothing.
+        PreferWorkingNgxLoader();
         // After the config, never before it: stage=0 has to switch this off too,
         // and the value is not known until the file has been read.
         SynthRegisterEvents();

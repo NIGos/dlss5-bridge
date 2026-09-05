@@ -113,6 +113,7 @@ not re-read until the game's DLSS goes quiet.
 | `ofa_perf` | 20 | Optical flow effort, NVIDIA's own values: `5` slow, `10` medium, `20` fast. |
 | `mv_sign_x`, `mv_sign_y` | 0 | Force the motion-vector sign (`1`, `-1`); `0` uses the provider's convention or the engine's measurement. Diagnostic. |
 | `vk_present` | 0 | How the substitute's result reaches a Vulkan back buffer: `0` copies where the image allows it and draws it otherwise, `1` copies only, `2` draws always. |
+| `vk_sync` | 0 | How the substitute's Vulkan transport orders itself against the private D3D12 device: `0` parks the game's queue on a Vulkan event while a worker thread runs the optical flow and the evaluate, `1` waits the queue idle on the CPU instead, `2` pipelines. `1` costs a full CPU-GPU serialisation every frame and is the fallback if the park misbehaves on a driver. `2` runs one frame's evaluate while the game renders the next, so the wait the game's queue reaches is on work that started a frame earlier rather than on work that starts when it gets there -- at the price of showing the result one present later, which is about 17 ms at 60 fps and 33 at 30, and one more Output texture. That texture is the back buffer's own size and format, so it is width x height x bytes per texel: 8.3 MB at 1920x1080 and 24.6 MB at 3840x1600 for a 4-byte format, double each on an RGBA16F back buffer. |
 | `stage` | 3 | How much runs: `0` inert, `1` input copies, `2` plus depth conversion, `3` everything. Below `3` the substitute does not evaluate; below `2` the Vulkan mirror records nothing. |
 | `mode` | 2 | `0` never writes to the game, `1` transport only, `2` the full path. |
 | `skip_game` | 1 | Skip the game's own DLSS evaluate while the bridge is delivering; its result would be overwritten. |
@@ -122,7 +123,9 @@ not re-read until the game's DLSS goes quiet.
 | `pixels` | 0 | `1` reads pixels back to the CPU on frames 2 to 4. Diagnostic; stalls the GPU. |
 | `dred` | 1 | Ask D3D12 to record what the GPU was executing, so a device reset can be explained. Read when the session opens. |
 | `skip_exe` | 1 | `1` hooks the executable's own NGX exports only if no library exports them within a minute, so a game's image is not patched at startup. `0` hooks at once, `2` never. |
-| `unwrap` | 1 | Hand NGX the D3D12 device underneath ReShade's proxy. `0` keeps the proxy. A neural add-on build measured to need the proxy overrides `1` automatically. If an unmeasured build reports active and changes nothing, try `0`. |
+| `unwrap` | 1 | Hand NGX the D3D12 device underneath ReShade's proxy. `0` keeps the proxy. A neural add-on build measured to need the proxy, and ReShade loaded as `d3d12.dll`, both override `1` automatically -- so on those `0` is already in force and changes nothing. `2` strips the proxy anyway, which is the value to try when a session that should work does not. |
+| `ngx_loader` | 0 | What to do about an NVIDIA driver whose NGX loader drives neural rendering into a snippet that faults (32.0.16.1664 and 1686 with `nvngx_dlssnr.dll` 310.8.0.0): `0` closes that route in memory at attach, so the DLSS 5 add-on drives the feature itself as it did on 32.0.16.1656; `1` leaves the driver alone; `2` loads the previous driver's loader instead, if the driver store still holds one. Applies only when a snippet measured to fault is beside the game. |
+| `unwrap_list` | 0 | `1` hands NGX the command list underneath ReShade's proxy. Diagnostic. |
 | `probe` | 0 | `1` runs a standalone NGX D3D12 probe at attach and logs the result. Diagnostic. |
 | `hash_out` | 1 | Once per feature build, 60 frames in, read the input and the output back and log a hash of the output, the mean of each channel of both, and the brightness ratio out/in. One readback per build; `0` disables. D3D11 bridge only. |
 
@@ -180,6 +183,13 @@ Dead Redemption 2 (Vulkan) and Skyrim Special Edition (D3D11). Every release is
 run through [ngxGym](https://github.com/NIGos/ngxGym), a synthetic DLSS host
 that exercises both backends, mode changes, contract faults and the substitute
 contract against real NGX, without a game.
+
+NVIDIA drivers 32.0.16.1664 and 1686 route neural rendering (NGX feature 18) into
+`nvngx_dlssnr.dll` itself, and the only build of that snippet in circulation,
+310.8.0.0, faults inside D3D12 on that route: with the DLSS 5 add-on present the
+game terminated or stopped presenting. The add-on closes that route in the
+loaded `_nvngx.dll` at attach -- one pointer, in memory, nothing on disk -- and
+the DLSS 5 add-on drives the feature as it did on 32.0.16.1656. See `ngx_loader`.
 
 Reported working by users:
 
