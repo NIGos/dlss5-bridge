@@ -189,6 +189,10 @@ struct BridgeCfg
     // leaves everything else alone, 1 does nothing, 2 loads the previous
     // driver's loader instead. See PreferWorkingNgxLoader.
     int ngx_loader;
+    // 1 builds the mirrored feature at the render region the game declares on
+    // each evaluate (DLSS.Render.Subrect.Dimensions) rather than at the size it
+    // created the feature with. Off by default; see the note where it applies.
+    int shape;
 };
 
 // auto is not a fourth point on a scale with the other three, so this is stored
@@ -206,7 +210,7 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0, 0, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0, 0, 0, 0 };
 
 // synth_after answers one question and used to answer two. It is still the
 // opt-in for synthesising a contract in a game that has never called DLSS --
@@ -494,6 +498,7 @@ static void CfgReload()
         else if (_stricmp(key, "vk_present")  == 0) next.vk_present  = (val >= 0 && val <= 2) ? val : 0;
         else if (_stricmp(key, "unwrap_list") == 0) next.unwrap_list = (val >= 0 && val <= 1) ? val : 0;
         else if (_stricmp(key, "ngx_loader")  == 0) next.ngx_loader  = (val >= 0 && val <= 2) ? val : 0;
+        else if (_stricmp(key, "shape")       == 0) next.shape       = val == 1 ? 1 : 0;
         else if (_stricmp(key, "vk_sync")     == 0) next.vk_sync     = (val >= 0 && val <= 2) ? val : 0;
         // Only the sign is taken, because only the sign is unknown: the
         // magnitude is the back buffer size and this add-on measures that. A
@@ -538,7 +543,8 @@ static void CfgReload()
                          (next.vk_present != g_cfg.vk_present) ||
                          (next.vk_sync != g_cfg.vk_sync) ||
                          (next.unwrap_list != g_cfg.unwrap_list) ||
-                         (next.ngx_loader != g_cfg.ngx_loader);
+                         (next.ngx_loader != g_cfg.ngx_loader) ||
+                         (next.shape != g_cfg.shape);
     // The first read reports whatever it found, changed or not. Until now the echo
     // fired only on a difference from the built-in defaults, so a session running on
     // defaults had no config line at all -- and "no config line" then meant either
@@ -3969,6 +3975,41 @@ static bool BridgeCreateShapeOf(const NVSDK_NGX_Handle *handle, unsigned int *w,
     return false;
 }
 
+// The block this add-on handed to the D3D12 evaluate, read back from it. On a
+// refusal the class of error is known and the parameter is not: PSO2 (#8)
+// answered 0xBAD00005 three times and the log named nothing it could have been.
+static void DumpSentParams()
+{
+    static const char *kU[] = {
+        "Width", "Height", "OutWidth", "OutHeight",
+        "DLSS.Render.Subrect.Dimensions.Width", "DLSS.Render.Subrect.Dimensions.Height",
+        "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y",
+        "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y",
+        "DLSS.Input.MV.Subrect.Base.X", "DLSS.Input.MV.Subrect.Base.Y",
+        "DLSS.Output.Subrect.Base.X", "DLSS.Output.Subrect.Base.Y",
+        "DLSS.Enable.Output.Subrects", "DLSS.Feature.Create.Flags", "PerfQualityValue", "Reset",
+    };
+    static const char *kF[] = {
+        "MV.Scale.X", "MV.Scale.Y", "Jitter.Offset.X", "Jitter.Offset.Y", "Sharpness",
+        "DLSS.Pre.Exposure", "DLSS.Exposure.Scale",
+    };
+    if (g_bridge.params == nullptr) return;
+    Log("[bridge]   the block sent to D3D12, as it reads back (feature %ux%u -> %ux%u):",
+        g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h);
+    for (size_t i = 0; i < _countof(kU); ++i)
+    {
+        unsigned int v = 0;
+        if (g_bridge.params->Get(kU[i], &v) == NGX_SUCCESS) Log("[bridge]     %-40s = %u", kU[i], v);
+        else Log("[bridge]     %-40s   not set", kU[i]);
+    }
+    for (size_t i = 0; i < _countof(kF); ++i)
+    {
+        float v = 0.0f;
+        if (g_bridge.params->Get(kF[i], &v) == NGX_SUCCESS) Log("[bridge]     %-40s = %f", kF[i], v);
+        else Log("[bridge]     %-40s   not set", kF[i]);
+    }
+}
+
 static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter *gp)
 {
     BridgeRescueStalledQueue();
@@ -4098,6 +4139,35 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
                     gw, gh, gow, goh, cw, ch, cow, coh);
             }
             gw = cw; gh = ch; gow = cow; goh = coh;
+        }
+    }
+
+    // shape=1: the render region the game declares for THIS evaluate, rather
+    // than the size the feature was created with. Phantasy Star Online 2 (#8)
+    // creates 3840x2160 -> 3840x2160 and then evaluates a 2560x1440 region based
+    // at 640,360 inside those textures: the game's own D3D11 feature accepts the
+    // block and the mirrored D3D12 one answers 0xBAD00005. The bases are
+    // mirrored below as the game states them, so the copies stay whole-texture
+    // and the region is placed where the game placed it. Off by default until
+    // measured in a game: a title that moves its region every frame would
+    // rebuild every frame, and the storm guard below stands the bridge aside.
+    if (g_cfg.shape == 1 && InterlockedCompareExchange(&g_source, 0, 0) == SRC_MIRROR)
+    {
+        unsigned int sw = 0, sh = 0;
+        gp->Get("DLSS.Render.Subrect.Dimensions.Width", &sw);
+        gp->Get("DLSS.Render.Subrect.Dimensions.Height", &sh);
+        if (sw != 0 && sh != 0 && sw <= d[SLOT_COLOR].Width && sh <= d[SLOT_COLOR].Height &&
+            (sw != gw || sh != gh))
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                Log("[bridge] shape=1: the feature follows the game's render region, %ux%u, "
+                    "rather than the %ux%u it was created with. Said once; the rebuild "
+                    "lines show the rest.", sw, sh, gw, gh);
+            }
+            gw = sw; gh = sh;
         }
     }
 
@@ -4538,6 +4608,7 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     else if (re != NGX_SUCCESS)
     {
         Log("[bridge] evaluate failed with result 0x%08X, %s", re, NgxResultName(re));
+        DumpSentParams();
         BridgeFail("evaluate");
     }
     else
