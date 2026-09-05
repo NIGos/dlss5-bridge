@@ -193,6 +193,9 @@ struct BridgeCfg
     // each evaluate (DLSS.Render.Subrect.Dimensions) rather than at the size it
     // created the feature with. Off by default; see the note where it applies.
     int shape;
+    // Diagnostic: hold the private D3D12 queue for this many ms, once, at the
+    // 60th submission. 0 is off. See the stall fields in bridge.h.
+    int stall_test;
 };
 
 // auto is not a fourth point on a scale with the other three, so this is stored
@@ -210,7 +213,7 @@ static int ParseSourceWord(const char *w, int fallback)
     return fallback;   // an unreadable value is not a request to change anything
 }
 
-static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0, 0, 0, 0 };
+static BridgeCfg g_cfg = { 2, -1, 1, 0, 0, 3, 1, 1, 1, 1, CFG_SRC_AUTO, 0, 1, 0, 0, 0, 2, 20, 0, 0, 0, 0, 0, 0 };
 
 // synth_after answers one question and used to answer two. It is still the
 // opt-in for synthesising a contract in a game that has never called DLSS --
@@ -367,7 +370,7 @@ static bool BridgeWillDeliver()
 {
     return g_source == SRC_MIRROR &&
            g_cfg.skip_game != 0 && g_cfg.mode == 2 && g_cfg.stage >= 3 &&
-           !g_bridge.disabled && g_bridge.session_ready && g_bridge.frame_ready &&
+           !g_bridge.disabled && !g_bridge.stalled && g_bridge.session_ready && g_bridge.frame_ready &&
            !g_bridge.partial_output && g_bridge.frames_done > 0;
 }
 
@@ -499,6 +502,7 @@ static void CfgReload()
         else if (_stricmp(key, "unwrap_list") == 0) next.unwrap_list = (val >= 0 && val <= 1) ? val : 0;
         else if (_stricmp(key, "ngx_loader")  == 0) next.ngx_loader  = (val >= 0 && val <= 2) ? val : 0;
         else if (_stricmp(key, "shape")       == 0) next.shape       = val == 1 ? 1 : 0;
+        else if (_stricmp(key, "stall_test")  == 0) next.stall_test  = val > 0 ? val : 0;
         else if (_stricmp(key, "vk_sync")     == 0) next.vk_sync     = (val >= 0 && val <= 2) ? val : 0;
         // Only the sign is taken, because only the sign is unknown: the
         // magnitude is the back buffer size and this add-on measures that. A
@@ -544,7 +548,8 @@ static void CfgReload()
                          (next.vk_sync != g_cfg.vk_sync) ||
                          (next.unwrap_list != g_cfg.unwrap_list) ||
                          (next.ngx_loader != g_cfg.ngx_loader) ||
-                         (next.shape != g_cfg.shape);
+                         (next.shape != g_cfg.shape) ||
+                         (next.stall_test != g_cfg.stall_test);
     // The first read reports whatever it found, changed or not. Until now the echo
     // fired only on a difference from the built-in defaults, so a session running on
     // defaults had no config line at all -- and "no config line" then meant either
@@ -1308,6 +1313,7 @@ static void BridgeFail(const char *what)
 
 static bool   BeginCommands();
 static UINT64 EndCommands();
+static void   BridgeEnterStall(UINT64 done, UINT64 wanted, const char *who);
 
 // Defined with the frame path below; BridgeHashOutput records one copy and
 // needs both, and it sits above them so it can be called from the evaluate.
@@ -2712,6 +2718,13 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
         if (fh != nullptr) CloseHandle(fh);
         if (FAILED(hr) || g_bridge.fence11 == nullptr)
         { Log("[bridge] shared fence setup failed 0x%08X", hr); goto fail; }
+        // Signalled by the queue only, never from the CPU, so it can be read
+        // after fence12 has been pushed forward by hand. See BridgeRescueStalledQueue.
+        if (FAILED(g_bridge.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                               reinterpret_cast<void **>(&g_bridge.fence_progress))) ||
+            FAILED(g_bridge.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                               reinterpret_cast<void **>(&g_bridge.stall_fence))))
+        { Log("[bridge] the progress fence could not be created"); goto fail; }
 
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4),
                                        reinterpret_cast<void **>(&g_bridge.ctx4))) ||
@@ -3449,20 +3462,35 @@ static bool BeginCommands()
 {
     const int slot = g_bridge.frame_slot;
     const UINT64 retire = g_bridge.alloc_fence[slot];
-    if (retire != 0 && g_bridge.fence12->GetCompletedValue() < retire)
+    // The progress fence, where there is one: fence12 is pushed forward from
+    // the CPU when a stall releases the game, and an allocator handed back on
+    // that evidence would be reset under work the GPU is still executing.
+    ID3D12Fence *truth = g_bridge.fence_progress != nullptr ? g_bridge.fence_progress
+                                                            : g_bridge.fence12;
+    if (retire != 0 && truth->GetCompletedValue() < retire)
     {
-        g_bridge.fence12->SetEventOnCompletion(retire, g_bridge.fence_event);
         // This blocks the thread the game renders on, so it has to give up long
-        // before a render-thread watchdog would fire. A missed frame is
-        // recoverable; a thirty-second stall is the game being killed.
-        if (WaitForSingleObject(g_bridge.fence_event, 2000) != WAIT_OBJECT_0 ||
-            g_bridge.fence12->GetCompletedValue() < retire)
+        // before a render-thread watchdog would fire. Half a second is the same
+        // budget the rescue gives the game's own wait, and a timeout here is the
+        // same stall seen from the render thread rather than from the game's
+        // queue: stand aside and let the queue catch up, do not stop.
+        //
+        // Until the value is reached or the deadline passes, not one wake: the
+        // event is auto-reset, and a completion nobody was waiting for leaves it
+        // signalled, so the next wait returns at once with the value still
+        // short. Read as a verdict, that was a second stall 51 ms after the
+        // first had resumed, in ngxGym's stall-resume.
+        const ULONGLONG deadline = GetTickCount64() + 500;
+        while (truth->GetCompletedValue() < retire)
         {
-            Log("[bridge] the GPU did not retire allocator slot %d within 2 s.", slot);
-            Log("  Something downstream is not completing. Stopping rather than");
-            Log("  stalling the render thread any further.");
-            BridgeDisable("the GPU stopped completing work");
-            return false;
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline)
+            {
+                BridgeEnterStall(truth->GetCompletedValue(), retire, "the render thread");
+                return false;
+            }
+            truth->SetEventOnCompletion(retire, g_bridge.fence_event);
+            WaitForSingleObject(g_bridge.fence_event, static_cast<DWORD>(deadline - now));
         }
     }
     if (g_bridge.alloc[slot] == nullptr) return false;
@@ -3592,6 +3620,49 @@ static bool BridgeDeviceLost()
     return true;
 }
 
+// Release the game and stand aside, rather than stop for good. Baldur's Gate 3
+// on a 4060 Ti (#16) ran 1200 frames and then the private queue completed
+// nothing for half a second, once; the device was not removed and the game
+// carried on, so the work was slow, not dead. Stopping on that turned every
+// such hiccup into "DLSS 5 gets disabled after a minute". Now the game's wait
+// is released from the CPU, its own DLSS runs meanwhile, and delivery resumes
+// when the progress fence shows the queue has caught up with everything that
+// was submitted. A queue that never does is still stopped, from
+// BridgeFrameInner, four seconds on. Two callers: the rescue, which watches
+// the game's wait, and BeginCommands, which is the render thread's own wait
+// for an allocator and used to stop the bridge by itself after two seconds.
+static void BridgeEnterStall(UINT64 done, UINT64 wanted, const char *who)
+{
+    if (g_bridge.stalled) return;
+    // Six in a minute is a GPU that is not keeping up; six in three hours is a
+    // GPU that hiccups, which is what this exists to survive.
+    const ULONGLONG t = GetTickCount64();
+    if (t - g_bridge.stall_last > 60000) g_bridge.stalls = 0;
+    g_bridge.stall_last = t;
+    ++g_bridge.stalls;
+    Log("[bridge] the D3D12 side has completed nothing for 500 ms while %s waits on", who);
+    Log("  fence %llu (completed %llu). Releasing the game's wait from the CPU so it can",
+        wanted, done);
+    Log("  present again, and standing aside until the D3D12 side catches up: its work");
+    Log("  is still queued, and the neural pass runs inside it. The game's own DLSS runs");
+    Log("  meanwhile. Stall %d in the last minute.", g_bridge.stalls);
+    if (g_bridge.pending_out != 0) g_bridge.fence12->Signal(g_bridge.pending_out);
+    g_bridge.stalled       = true;
+    g_bridge.stall_since   = GetTickCount64();
+    // Everything submitted so far, not only what the game waits on: the
+    // allocators behind the newest value are what BeginCommands must not reuse.
+    // Submitted, not taken: fence_value is already one ahead on the frame that
+    // stalls inside BeginCommands, and that value is never signalled.
+    g_bridge.stall_release = g_bridge.last_submitted;
+    g_bridge.pending_out   = 0;
+    if (g_bridge.stalls > 5)
+    {
+        Log("[bridge] six stalls in one minute: this GPU is not keeping up with this work, "
+            "and a stutter every few seconds is worse than no neural pass.");
+        BridgeDisable("the D3D12 side keeps stalling");
+    }
+}
+
 static void BridgeRescueStalledQueue()
 {
     // Once the bridge has stopped there is nothing left to rescue, and without
@@ -3600,8 +3671,20 @@ static void BridgeRescueStalledQueue()
     if (g_bridge.fence12 == nullptr) return;
     if (BridgeDeviceLost()) return;
 
-    const UINT64 done = g_bridge.fence12->GetCompletedValue();
     const ULONGLONG now = GetTickCount64();
+    if (g_bridge.stall_release_at != 0 && now >= g_bridge.stall_release_at)
+    {
+        g_bridge.stall_release_at = 0;
+        g_bridge.stall_fence->Signal(g_bridge.stall_target);
+        Log("[bridge] stall_test: the hold is released.");
+    }
+
+    // The progress fence, not fence12: the stall below pushes fence12 forward
+    // from the CPU to release the game, and after that fence12 no longer says
+    // what the GPU has done.
+    const UINT64 done = g_bridge.fence_progress != nullptr
+                            ? g_bridge.fence_progress->GetCompletedValue()
+                            : g_bridge.fence12->GetCompletedValue();
 
     // The only honest measure of "the GPU stopped completing" is that the
     // completed value has stopped moving. Being a frame or two behind is
@@ -3622,12 +3705,7 @@ static void BridgeRescueStalledQueue()
     if (g_bridge.pending_out == 0 || done >= g_bridge.pending_out) return;
     if (now - g_bridge.pending_since < 500) return;
 
-    Log("[bridge] the D3D12 side has completed nothing for 500 ms while the game's");
-    Log("  queue waits on fence %llu (completed %llu). Releasing that wait from the",
-        g_bridge.pending_out, done);
-    Log("  CPU so the game can present again. The neural pass runs inside that work,");
-    Log("  so whatever stopped is there rather than in the transport.");
-    BridgeDisable("the D3D12 side stopped completing");
+    BridgeEnterStall(done, g_bridge.pending_out, "the game's queue");
 }
 
 // Submits, then records which fence value retires the allocator just used.
@@ -3635,10 +3713,24 @@ static UINT64 EndCommands()
 {
     g_bridge.list->Close();
     ID3D12CommandList *lists[] = { g_bridge.list };
+    // stall_test: once, at the 60th submission, the queue is made to wait on a
+    // fence nothing signals for that many milliseconds. Every submission behind
+    // it stops completing, which is the shape of #16, produced on purpose.
+    if (g_cfg.stall_test > 0 && !g_bridge.stall_test_done && g_bridge.fence_value >= 60 &&
+        g_bridge.stall_fence != nullptr)
+    {
+        g_bridge.stall_test_done  = true;
+        g_bridge.stall_target     = 1;
+        g_bridge.stall_release_at = GetTickCount64() + static_cast<ULONGLONG>(g_cfg.stall_test);
+        g_bridge.queue->Wait(g_bridge.stall_fence, g_bridge.stall_target);
+        Log("[bridge] stall_test: the D3D12 queue is held for %d ms from here.", g_cfg.stall_test);
+    }
     g_bridge.queue->ExecuteCommandLists(1, lists);
 
     const UINT64 v = ++g_bridge.fence_value;
     g_bridge.queue->Signal(g_bridge.fence12, v);
+    if (g_bridge.fence_progress != nullptr) g_bridge.queue->Signal(g_bridge.fence_progress, v);
+    g_bridge.last_submitted = v;
     g_bridge.alloc_fence[g_bridge.frame_slot] = v;
     g_bridge.frame_slot = (g_bridge.frame_slot + 1) % Bridge::kFrames;
     return v;
@@ -4014,6 +4106,35 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
 {
     BridgeRescueStalledQueue();
     if (g_bridge.disabled || !g_bridge.session_ready || gp == nullptr) return;
+
+    // Standing aside after a stall: nothing is recorded or copied until the
+    // progress fence reaches the value the game was released from. The game's
+    // own DLSS runs on these frames (BridgeWillDeliver says no), so the picture
+    // stays live.
+    if (g_bridge.stalled)
+    {
+        const UINT64 done = g_bridge.fence_progress != nullptr
+                                ? g_bridge.fence_progress->GetCompletedValue() : 0;
+        const ULONGLONG now = GetTickCount64();
+        if (done >= g_bridge.stall_release)
+        {
+            g_bridge.stalled = false;
+            Log("[bridge] the D3D12 side caught up after %llu ms; delivering again. The "
+                "game's own DLSS was on screen meanwhile.", now - g_bridge.stall_since);
+        }
+        else if (now - g_bridge.stall_since > 4000)
+        {
+            Log("[bridge] the D3D12 side has not caught up 4 s after the stall: fence %llu "
+                "wanted, %llu completed.", g_bridge.stall_release, done);
+            BridgeDisable("the D3D12 side never caught up after a stall");
+            return;
+        }
+        else
+        {
+            ++g_bridge.frames_done;
+            return;
+        }
+    }
 
     if (g_bridge.paused_until != 0)
     {
@@ -4476,7 +4597,9 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     g_bridge.queue->Wait(g_bridge.fence12, v_in);
     if (!BeginCommands())
     {
-        BridgeFail("command list");
+        // A stall is not a failure: the frame is skipped and the game's own DLSS
+        // takes it, which is what BridgeWillDeliver now answers.
+        if (!g_bridge.stalled) BridgeFail("command list");
         for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
         dev11->Release();
         return;

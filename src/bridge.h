@@ -174,6 +174,27 @@ struct Bridge
     UINT64    last_completed;   // to tell a stalled GPU from a busy one
     UINT64    pending_out;
     ULONGLONG pending_since;
+    // A stall survived rather than fatal; see BridgeRescueStalledQueue. The
+    // progress fence is signalled by the queue only, never from the CPU, so it
+    // still says what the GPU has really done after fence12 has been pushed
+    // forward by hand to release the game.
+    ID3D12Fence *fence_progress;
+    bool         stalled;
+    ULONGLONG    stall_since;
+    UINT64       stall_release;
+    // The newest value the queue has actually been asked to signal. fence_value
+    // runs ahead of it: a frame takes v_in before BeginCommands, and a frame
+    // that stalls there never submits, so its value is never reached.
+    UINT64       last_submitted;
+    int          stalls;
+    ULONGLONG    stall_last;   // when the last one began; the count is per minute
+    // stall_test in dlss5-bridge.cfg: one wait the queue is given at the 60th
+    // submission and released from the CPU that many milliseconds later. It is
+    // how the survival above is measured; nothing else uses it.
+    ID3D12Fence *stall_fence;
+    UINT64       stall_target;
+    ULONGLONG    stall_release_at;
+    bool         stall_test_done;
     int  consecutive_fails;
 
     ID3D12Device              *dev12;
