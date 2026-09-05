@@ -2236,6 +2236,89 @@ static ID3D11Texture2D *GameTexture(const NVSDK_NGX_Parameter *p, const char *ke
     return tex;  // caller releases
 }
 
+// D3D12_ERROR_INVALID_REDIST, 0x887E0003: D3D12 refuses every device in the
+// process, because the executable declares an Agility SDK -- exported
+// D3D12SDKVersion and D3D12SDKPath -- and the D3D12Core.dll that declaration
+// names cannot be validated. A D3D11 game never notices: this add-on's private
+// device is the first thing in the process to ask. Tainted Grail: The Fall of
+// Avalon (#24), a Unity title, showed exactly this on a 4090 with a D3D12 folder
+// that had already been renamed away, which changes nothing when the declared
+// path is the executable's own folder. So say what is declared and what is at
+// the path, and the report carries its own answer.
+static void ExplainInvalidRedist()
+{
+    HMODULE exe = GetModuleHandleW(nullptr);
+    const UINT *ver = reinterpret_cast<const UINT *>(GetProcAddress(exe, "D3D12SDKVersion"));
+    const char *const *pp = reinterpret_cast<const char *const *>(GetProcAddress(exe, "D3D12SDKPath"));
+    const char *path = pp != nullptr && *pp != nullptr ? *pp : nullptr;
+
+    if (ver == nullptr && path == nullptr)
+    {
+        Log("[bridge]   0x887E0003 is D3D12_ERROR_INVALID_REDIST: the process's D3D12 SDK "
+            "configuration is invalid. This executable exports neither D3D12SDKVersion nor "
+            "D3D12SDKPath, so the declaration comes from somewhere else in the process.");
+    }
+    else
+    {
+        Log("[bridge]   0x887E0003 is D3D12_ERROR_INVALID_REDIST: the executable declares an "
+            "Agility SDK -- D3D12SDKVersion %u, D3D12SDKPath \"%s\" -- and D3D12 could not "
+            "validate the D3D12Core.dll that names. A D3D11 game never notices; this add-on's "
+            "private device is the first thing in the process to ask.",
+            ver != nullptr ? *ver : 0u, path != nullptr ? path : "(not exported)");
+
+        // The path is relative to the executable's folder, by Microsoft's rule.
+        wchar_t core[MAX_PATH] = {};
+        GetModuleFileNameW(exe, core, MAX_PATH);
+        wchar_t *sl = wcsrchr(core, (wchar_t)92);
+        if (sl != nullptr)
+        {
+            wchar_t rel[MAX_PATH] = {};
+            MultiByteToWideChar(CP_ACP, 0, path != nullptr ? path : ".\\", -1, rel, MAX_PATH);
+            const size_t rl = wcslen(rel);
+            const bool slashed = rl > 0 && (rel[rl - 1] == (wchar_t)92 || rel[rl - 1] == L'/');
+            _snwprintf_s(sl + 1, MAX_PATH - (sl + 1 - core), _TRUNCATE, L"%ls%lsD3D12Core.dll",
+                         rel, slashed || rl == 0 ? L"" : L"\\");
+
+            if (GetFileAttributesW(core) == INVALID_FILE_ATTRIBUTES)
+            {
+                Log("[bridge]   %ls is MISSING. That alone produces this error. Verifying the "
+                    "game's files is the first thing to try; a tool that removed or moved it "
+                    "does exactly this.", core);
+            }
+            else
+            {
+                char fv[48] = "";
+                FileVersionString(core, fv, sizeof(fv));
+                // The redist exports the version it implements; the loader compares
+                // it with the executable's. Mapped without running it, read, unmapped.
+                unsigned int exported = 0;
+                HMODULE m = LoadLibraryExW(core, nullptr, DONT_RESOLVE_DLL_REFERENCES);
+                if (m != nullptr)
+                {
+                    const UINT *cv = reinterpret_cast<const UINT *>(GetProcAddress(m, "D3D12SDKVersion"));
+                    if (cv != nullptr) exported = *cv;
+                    FreeLibrary(m);
+                }
+                Log("[bridge]   %ls is present: file version %s, exports D3D12SDKVersion %u%s. "
+                    "Verifying the game's files is the first thing to try; a copy another tool "
+                    "replaced does exactly this.", core, fv[0] != 0 ? fv : "unknown", exported,
+                    ver != nullptr && exported != *ver ? " -- which does NOT match the executable's declaration" : "");
+            }
+        }
+    }
+
+    HMODULE loaded = GetModuleHandleW(L"D3D12Core.dll");
+    if (loaded != nullptr)
+    {
+        wchar_t lp[MAX_PATH] = {};
+        GetModuleFileNameW(loaded, lp, MAX_PATH);
+        char lv[48] = "";
+        FileVersionString(lp, lv, sizeof(lv));
+        Log("[bridge]   D3D12Core.dll already in the process: %ls, file version %s.", lp,
+            lv[0] != 0 ? lv : "unknown");
+    }
+}
+
 static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Log("");
@@ -2379,7 +2462,11 @@ static bool BridgeInitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             goto fail;
         }
         if (FAILED(hr) || g_bridge.dev12 == nullptr)
-        { Log("[bridge] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
+        {
+            Log("[bridge] D3D12CreateDevice failed 0x%08X", hr);
+            if (hr == static_cast<HRESULT>(0x887E0003)) ExplainInvalidRedist();
+            goto fail;
+        }
 
         // The D3D11 synthetic transport comes through here rather than through
         // Synth12Open, so the bootstrap has to be at both call sites. A game with

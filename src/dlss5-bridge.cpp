@@ -1529,6 +1529,7 @@ static volatile bool g_scan_pending;
 // used inside it: the session opener asks whether the neural snippet beside this
 // game is one the driver's own loader faults on. See the note on the definition.
 static bool NrSnippetIsOlderThanLoader(char *ver_out, size_t ver_n);
+static bool FileVersionString(const wchar_t *path, char *out, size_t n);
 
 // Set once the loader's route to feature 18 has been closed in memory; the
 // capability probe uses it so it does not warn about a fault that can no longer
