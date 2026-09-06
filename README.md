@@ -1,5 +1,14 @@
 # DLSS 5 Bridge
 
+**v1.4.13-pre1 — targeted test for [BG3 split screen (#12)](https://github.com/NIGos/dlss5-bridge/issues/12).**
+Based on v1.4.12, this build fixes D3D11 partial-output copy-back at nonzero
+output origins: processing one atlas region must not overwrite its neighbour.
+The spatial defect is reproduced in ngxGym; complete BG3 split-screen neural
+rendering and temporal quality are not yet verified. This is a prerelease.
+Before replacing the add-on, back up its DLL and configuration. Set the first
+line of `dlss5-bridge.cfg` to `# dlss5-bridge keep` to preserve your settings
+across the version change. Install only one bridge DLL at a time.
+
 **DLSS 5 Neural Rendering for DirectX 11 games, Vulkan games, and, as an
 option, games that have no DLSS at all, through NVIDIA Optical Flow, at lower
 quality.**
