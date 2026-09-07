@@ -1,10 +1,12 @@
 # DLSS 5 Bridge
 
-**v1.4.13-pre1 — targeted test for [BG3 split screen (#12)](https://github.com/NIGos/dlss5-bridge/issues/12).**
-Based on v1.4.12, this build fixes D3D11 partial-output copy-back at nonzero
-output origins: processing one atlas region must not overwrite its neighbour.
-The spatial defect is reproduced in ngxGym; complete BG3 split-screen neural
-rendering and temporal quality are not yet verified. This is a prerelease.
+**v1.4.13-pre2 — Vulkan Frame Generation test for [Endfield (#27)](https://github.com/NIGos/dlss5-bridge/issues/27).**
+The Bridge now leaves the Frame Generation DLL untouched. This fixes a reproduced
+Vulkan FG initialization failure in ngxGym, including with FG 310.9 and neural
+rendering active. Actual FG/MFG output in Endfield still needs confirmation.
+This prerelease also retains pre1's D3D11 partial-output copy-back fix for
+[BG3 split screen (#12)](https://github.com/NIGos/dlss5-bridge/issues/12);
+complete BG3 split-screen neural rendering and temporal quality remain unverified.
 Before replacing the add-on, back up its DLL and configuration. Set the first
 line of `dlss5-bridge.cfg` to `# dlss5-bridge keep` to preserve your settings
 across the version change. Install only one bridge DLL at a time.
