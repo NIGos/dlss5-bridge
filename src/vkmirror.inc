@@ -534,6 +534,7 @@ static void VkmRefuse(const char *why)
 
 static DWORD WINAPI VkmWorkerProc(LPVOID)
 {
+    PollYield poll_yield;
     for (;;)
     {
         WaitForSingleObject(g_vkm.wake, INFINITE);
@@ -554,10 +555,11 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
         }
 
         // Poll rather than wait: a VkEvent signalled by the GPU has no waitable
-        // Win32 handle behind it. SwitchToThread first so a fast frame costs no
-        // sleep quantum, Sleep(1) after the first millisecond so a slow one does
+        // Win32 handle behind it. PollYield bounds the initial spin and uses a
+        // local high-resolution timer for subsequent polls so a slow frame does
         // not burn a core.
         const int slot = static_cast<int>(g_vkm.cur);
+        poll_yield.Start();
         const ULONGLONG t0 = GetTickCount64();
         bool seen = false;
         for (;;)
@@ -565,7 +567,7 @@ static DWORD WINAPI VkmWorkerProc(LPVOID)
             if (g_svk.EvStatus(g_svk.dev, g_vkm.ev_in[slot]) == kSVkEventSet) { seen = true; break; }
             const ULONGLONG waited = GetTickCount64() - t0;
             if (waited > kVkmSeeCopiesMs) break;
-            if (waited == 0) SwitchToThread(); else Sleep(1);
+            poll_yield.Pause();
         }
 
         if (seen)

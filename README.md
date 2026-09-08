@@ -1,9 +1,11 @@
 # DLSS 5 Bridge
 
-**v1.4.13-pre2 â€” Vulkan Frame Generation test for [Endfield (#27)](https://github.com/NIGos/dlss5-bridge/issues/27).**
-The Bridge now leaves the Frame Generation DLL untouched. This fixes a reproduced
-Vulkan FG initialization failure in ngxGym, including with FG 310.9 and neural
-rendering active. Actual FG/MFG output in Endfield still needs confirmation.
+**v1.4.13-pre3 — Vulkan mirror polling test for [Endfield (#27)](https://github.com/NIGos/dlss5-bridge/issues/27).**
+The Vulkan mirror and synthetic OFA workers now use a high-resolution timer
+between event checks. Repeated ngxGym tests showed less polling CPU time and
+shorter waits; the effect on Endfield's reported FPS loss still needs testing.
+The original polling remains the fallback if the timer is unavailable or fails.
+This build retains pre2's FG initialization fix, confirmed by the Endfield reporter.
 This prerelease also retains pre1's D3D11 partial-output copy-back fix for
 [BG3 split screen (#12)](https://github.com/NIGos/dlss5-bridge/issues/12);
 complete BG3 split-screen neural rendering and temporal quality remain unverified.

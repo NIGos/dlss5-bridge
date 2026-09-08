@@ -1,3 +1,4 @@
+#include "poll-yield.hpp"
 // Implementation of the D3D11 -> D3D12 NGX bridge described in bridge.h.
 
 static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
