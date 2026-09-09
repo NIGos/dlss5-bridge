@@ -10,7 +10,8 @@ retrofit immutability. Existing releases retain their original status.
    maintainer; this is a recorded review and CI check, not independent approval.
    Run the relevant Gym checks for code changes; the hosted build does not test
    games or GPU behavior. Confirm that the binary version and intended release
-   tag agree.
+   tag agree. Compare the source against the release being replaced: a
+   prerelease may contain fixes on a separate branch that are not yet on `main`.
 2. Use the successful **Build and verify** run for the exact merged commit on
    `main`, including its **Attest main build** job. Download that run's
    `dlss5-bridge-COMMIT_SHA` artifact into a clean staging folder. It contains the
@@ -73,10 +74,13 @@ Use a current GitHub CLI with these commands. Specify the full GitHub host and
 repository, even when running from another checkout. These are native GitHub
 release attestations; no locally generated signing key is required.
 
-Repository controls also prevent force-pushing/deleting `main` and moving or
-deleting `v*` tags. Normal commits and new tags are allowed. Review pull requests
-and CI results before applying changes; workflow tokens default to read-only,
-and external contributor workflows need approval.
+Repository controls require a pull request and the successful **Build and
+verifier checks** check from GitHub Actions before merging into `main`. The
+branch must be up to date and review conversations resolved. Required human
+approvals are zero, so the sole maintainer can merge their own checked pull
+request. There are no bypass actors. Force-pushing/deleting `main` and moving
+or deleting `v*` tags are also blocked; new tags remain allowed. Workflow tokens
+default to read-only, and external contributor workflows need approval.
 
 Sources: [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
 [release verification](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/verify-release-integrity),
