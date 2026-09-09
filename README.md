@@ -35,7 +35,10 @@ Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://githu
 remains the stable release. `main` contains the cumulative 1.4.13 prerelease
 changes and the [D3D11 depth/MV conversion fix](https://github.com/NIGos/dlss5-bridge/pull/34).
 The latest published test build is
-[v1.4.13-pre3](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre3).
+[v1.4.13-pre4](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre4),
+which includes those changes and is the first release with verified GitHub
+Actions build provenance. It is still unsigned; follow the
+[download verification instructions](VERIFYING-DOWNLOADS.md) before loading it.
 BG3 split-screen rendering and coexistence with its Vulkan FG mod remain open
 issues. The Endfield reporter found no FPS improvement from pre3.
 
