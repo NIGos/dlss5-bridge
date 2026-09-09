@@ -42,9 +42,10 @@ the Bridge's private device, and clears obsolete hooks when an NGX module unload
 Pre5 includes all pre4 changes and has verified GitHub Actions build provenance.
 It is still unsigned; follow the
 [download verification instructions](VERIFYING-DOWNLOADS.md) before loading it.
-BG3 split-screen rendering remains open. A [BG3 reporter confirmed SR/mirror/FG
-coexistence with pre4](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5607261784);
-visual neural-output confirmation is still pending. The Endfield mirror slowdown
+BG3 split-screen rendering remains open. The [BG3 FG reporter](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5609017168)
+confirmed neural output, but also tested local hook changes and newer Streamline
+files; flickering/ghosting and general hook coexistence remain under investigation.
+The Endfield mirror slowdown
 remains unresolved; the FG startup fix does not establish an FPS improvement.
 
 Some neural add-ons support additional graphics APIs directly. Whether you need
