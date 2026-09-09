@@ -31,13 +31,13 @@ development:
 
 Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://github.com/NIGos/dlss5-bridge/releases).
 
-**Release status (7 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
-is the stable release and the code on `main`.
-[v1.4.13-pre2](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre2)
-adds a Vulkan Frame Generation initialization fix and retains pre1's D3D11
-partial-output fix for BG3 split screen. Both defects are reproduced in
-[ngxGym](https://github.com/NIGos/ngxGym); actual FG/MFG output in Endfield and
-complete BG3 split-screen rendering still need in-game confirmation.
+**Release status (9 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
+remains the stable release. `main` contains the cumulative 1.4.13 prerelease
+changes and the [D3D11 depth/MV conversion fix](https://github.com/NIGos/dlss5-bridge/pull/34).
+The latest published test build is
+[v1.4.13-pre3](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre3).
+BG3 split-screen rendering and coexistence with its Vulkan FG mod remain open
+issues. The Endfield reporter found no FPS improvement from pre3.
 
 Some neural add-ons support additional graphics APIs directly. Whether you need
 this bridge depends on the add-on build and the game. See the compatibility
@@ -226,8 +226,10 @@ not a claim that all current models need it.
 Additional reports, scoped to the tested setups:
 
 - [Endfield Vulkan, v1.4.12](https://github.com/NIGos/dlss5-bridge/issues/17#issuecomment-5553000888):
-  the reporter confirmed correct neural rendering. FG/MFG is a separate
-  [#27](https://github.com/NIGos/dlss5-bridge/issues/27) issue under test in pre2.
+  the reporter confirmed correct neural rendering. In
+  [#27](https://github.com/NIGos/dlss5-bridge/issues/27), pre2 restored FG in the
+  reported setup; the mirror slowdown remains open, with no FPS improvement
+  reported from pre3.
 - [BG3 D3D11 with neural-upstream v0.3.0](https://github.com/NIGos/dlss5-bridge/issues/26):
   reported working on RTX 4090 / driver 616.64. Not locally verified.
 - [Linux/Proton, D3D11 substitute](https://github.com/NIGos/dlss5-bridge/issues/22):
@@ -274,10 +276,12 @@ driver or another add-on can still crash the game or produce an incorrect image.
 - **HDR on the substitute path.** The input may already include the game's
   tone mapping and UI. With neural rendering this can alter colors across the
   whole view. A general solution that preserves the game's presentation is
-  still under investigation; no universal HDR fix is in the stable or pre2 build.
-- **FG and split screen.** v1.4.13-pre2 fixes reproduced FG initialization and
-  D3D11 partial-output defects. Endfield's generated frames and BG3's complete
-  split-screen neural output still need in-game confirmation.
+  still under investigation; no universal HDR fix is included.
+- **FG and split screen.** The 1.4.13 prereleases fix reproduced Vulkan FG
+  initialization and D3D11 partial-output defects. BG3's complete split-screen
+  neural output remains unresolved ([#12](https://github.com/NIGos/dlss5-bridge/issues/12)).
+  A separate hook conflict with BG3's Vulkan FG mod also remains open
+  ([#28](https://github.com/NIGos/dlss5-bridge/issues/28)).
 - **Substitute before the game's DLSS.** This order has caused faults in tested
   neural add-on builds when native DLSS first appears. Prefer the native DLSS
   route and leave the substitute off in games that provide it.
@@ -301,7 +305,7 @@ driver or another add-on can still crash the game or produce an incorrect image.
   substitute both follow it.
 - **Partial D3D11 output.** Stable v1.4.12 copies a partial result at 0,0;
   this can overwrite the wrong region when the game supplies a nonzero output
-  origin. Pre1 and pre2 preserve the declared origin. The original evaluate
+  origin. The 1.4.13 prereleases preserve the declared origin. The original evaluate
   is retained on partial-output frames to preserve the surrounding texture.
 - Verbose logging is always on.
 
