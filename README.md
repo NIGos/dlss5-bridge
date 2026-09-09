@@ -5,6 +5,7 @@
 > Get DLSS 5 Bridge from [this repository's GitHub releases](https://github.com/NIGos/dlss5-bridge/releases).
 > That site serves a separate ZIP we have not verified. A user has reported a possible infection;
 > malware has **not** been confirmed. Please do not run files from that site. See [#30](https://github.com/NIGos/dlss5-bridge/issues/30).
+> [Verify your download before loading it](VERIFYING-DOWNLOADS.md): official SHA-256 values and an optional PowerShell checker.
 
 **A bridge for DLSS 5 Neural Rendering add-ons in DirectX 11 and Vulkan games,
 with an optional optical-flow path for games without DLSS.**
