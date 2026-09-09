@@ -6,3 +6,4 @@
 *.ilk
 *.log
 *.cfg
+/src/dlss5-bridge.addon64

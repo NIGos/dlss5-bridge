@@ -1,30 +1,25 @@
 # DLSS 5 Bridge
 
-**v1.4.13-pre3 � Vulkan mirror polling test for [Endfield (#27)](https://github.com/NIGos/dlss5-bridge/issues/27).**
-The Vulkan mirror and synthetic OFA workers now use a high-resolution timer
-between event checks. Repeated ngxGym tests showed less polling CPU time and
-shorter waits; the effect on Endfield's reported FPS loss still needs testing.
-The original polling remains the fallback if the timer is unavailable or fails.
-This build retains pre2's FG initialization fix, confirmed by the Endfield reporter.
-This prerelease also retains pre1's D3D11 partial-output copy-back fix for
-[BG3 split screen (#12)](https://github.com/NIGos/dlss5-bridge/issues/12);
-complete BG3 split-screen neural rendering and temporal quality remain unverified.
-Before replacing the add-on, back up its DLL and configuration. Set the first
-line of `dlss5-bridge.cfg` to `# dlss5-bridge keep` to preserve your settings
-across the version change. Install only one bridge DLL at a time.
+> [!WARNING]
+> **Unofficial download site:** `dlss5bridge.com` is not operated or endorsed by this project.
+> Get DLSS 5 Bridge from [this repository's GitHub releases](https://github.com/NIGos/dlss5-bridge/releases).
+> Its ZIP contains an unofficial `.exe` installer. [Hybrid Analysis](https://hybrid-analysis.com/sample/5c3cc8dec5827d57f4cfe0968415eeb44ed3f865253bccbca95689989e462837/6aa123764f15cef3a90c2e95)
+> classifies it as **Malicious** and records attempts to add Microsoft Defender exclusions for other executables.
+> **Do not run installers from that site.** A user's reported compromise has not been independently verified;
+> see [#30](https://github.com/NIGos/dlss5-bridge/issues/30).
+> [Verify your download before loading it](VERIFYING-DOWNLOADS.md): official SHA-256 values and an optional PowerShell checker.
 
-**DLSS 5 Neural Rendering for DirectX 11 games, Vulkan games, and, as an
-option, games that have no DLSS at all, through NVIDIA Optical Flow, at lower
-quality.**
+**A bridge for DLSS 5 Neural Rendering add-ons in DirectX 11 and Vulkan games,
+with an optional optical-flow path for games without DLSS.**
 
-A ReShade add-on. The DLSS 5 neural rendering add-on only works where a game
-runs DLSS on DirectX 12. This bridge gives it that: it mirrors a DirectX 11 or
-Vulkan game's own DLSS onto a private DirectX 12 session, and for a game
-without DLSS it can build a substitute one from ReShade's depth and the
-driver's motion vectors. Nothing in the game is modified.
+A ReShade add-on that mirrors a DirectX 11 or Vulkan game's DLSS onto a private
+DirectX 12 session, where a compatible neural rendering add-on can process it.
+For games without DLSS, it can build substitute inputs from ReShade's depth
+and NVIDIA Optical Flow, or a ReShade motion-vector shader. The game's files
+are not patched.
 
-This bridge does not do neural rendering itself. It needs the separate **DLSS 5
-Neural Rendering add-on** (RenoDX's `renodx-dlss5.addon64`), distributed in
+This bridge does not do neural rendering itself. It needs a separate compatible
+**DLSS 5 Neural Rendering add-on**, such as RenoDX's `renodx-dlss5.addon64`, distributed in
 [its Discord channel](https://discord.com/channels/1408098019194310818/1542647972695904317),
 together with its `nvngx_dlssnr.dll`. The bridge only gives that add-on a
 place to work.
@@ -36,42 +31,49 @@ development:
 
 Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://github.com/NIGos/dlss5-bridge/releases).
 
-**Status.** Newer builds of the DLSS 5 add-on reach DirectX 11 and DirectX 9
-on their own; the builds that do not still need this bridge, and it is kept
-working for them. Issues are read and fixed, and releases continue. Every
-release is run through [ngxGym](https://github.com/NIGos/ngxGym) on D3D11 and
-Vulkan before it is published.
+**Release status (7 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
+is the stable release and the code on `main`.
+[v1.4.13-pre2](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre2)
+adds a Vulkan Frame Generation initialization fix and retains pre1's D3D11
+partial-output fix for BG3 split screen. Both defects are reproduced in
+[ngxGym](https://github.com/NIGos/ngxGym); actual FG/MFG output in Endfield and
+complete BG3 split-screen rendering still need in-game confirmation.
+
+Some neural add-ons support additional graphics APIs directly. Whether you need
+this bridge depends on the add-on build and the game. See the compatibility
+notes below; support for NGX D3D12 calls alone does not guarantee compatibility.
 
 ## What it does
 
 The DLSS 5 add-on is not modified. It receives genuine NGX D3D12 calls on a
 private D3D12 device, and its result is copied back into the game's output.
-Three routes, chosen automatically:
+Three routes; the substitute is off by default:
 
 | Route | Game | Contract |
 | --- | --- | --- |
-| **D3D11 bridge** | DirectX 11 with DLSS | The game's own, mirrored per frame: Color, Depth and MotionVectors copied into shared textures, evaluated on D3D12, copied back. Every size, offset and scalar comes from the game's parameter block. |
+| **D3D11 bridge** | DirectX 11 with DLSS | The game's Color, Depth and MotionVectors are copied into shared textures, evaluated on D3D12 and copied back. The bridge follows the supplied dimensions, regions and parameters, with defaults for missing values. |
 | **Vulkan mirror** | Vulkan with DLSS | The game's own, mirrored the same way through imported D3D12 textures. `vk_mirror=1`, the default. |
-| **Substitute contract** | Any game with no DLSS, or with its DLSS switched off | DLAA at back-buffer size, built from ReShade's depth and the NVIDIA driver's optical flow. `synth=1`, off by default. |
+| **Substitute contract** | Games without DLSS that expose usable depth and motion inputs through ReShade | DLAA at back-buffer size, using NVIDIA Optical Flow or a ReShade motion-vector shader. Requires `synth=1`; availability depends on the API, driver and inputs. |
 
-The game's own DLSS always wins. The substitute takes the session only when
-the game is not asking, and hands it back on the game's next call.
+With `source=auto`, the game's own DLSS takes priority. Prefer that route when
+the game has DLSS. The substitute can also run while the game's DLSS is off,
+but switching between the two has limitations described below.
 
 The substitute is a real DLSS feature fed approximated inputs, and it shows:
 text softens and dense foliage smears. It is an option, not a default.
 
 ## Requirements
 
-An NVIDIA GPU and driver with D3D12 support. In the game folder, beside the
-executable:
+An NVIDIA GPU and driver that support DLSS, plus a neural add-on and model
+compatible with that GPU. D3D12 support alone is not sufficient. Required files:
 
 | File | From |
 | --- | --- |
-| `dxgi.dll` — ReShade 6.0 or newer **with add-on support** | reshade.me, full version |
-| A DLSS 5 Neural Rendering add-on (`renodx-dlss5.addon64`) | [its Discord channel](https://discord.com/channels/1408098019194310818/1542647972695904317). Any add-on that hooks the NGX D3D12 entry points is driven the same way |
+| ReShade 6.0 or newer **with full add-on support** | [reshade.me](https://reshade.me/). Install for the game's rendering API: D3D11 uses a local proxy DLL; Vulkan uses ReShade's Vulkan layer. A local `dxgi.dll` is not the Vulkan installation method. |
+| A compatible neural rendering add-on, such as `renodx-dlss5.addon64` | [its Discord channel](https://discord.com/channels/1408098019194310818/1542647972695904317). Use one neural consumer at a time; see compatibility notes below. |
 | `nvngx_dlssnr.dll` | shipped with that add-on |
 | `dlss5-bridge.addon64` | this project |
-| `nvngx_dlss.dll` 3.1.13 or newer | the game, if it has DLSS. **Required only with `synth=1`**, and then also in a game without DLSS: the driver store carries no super-resolution snippet, and the substitute is DLAA, which older snippets accept and degrade. Below 3.x the bridge refuses and names the version. |
+| `nvngx_dlss.dll` | Use the game's existing DLSS for the native mirror. For the substitute path, supply version **3.1.13 or newer** beside the executable, even in a game without DLSS. The driver alone does not supply the required SR snippet there. |
 
 The neural add-on's own toggle has to be on, in its panel or in `ReShade.ini`.
 
@@ -84,9 +86,18 @@ proxy for a build that needs it.
 
 ## Install
 
-Copy `dlss5-bridge.addon64` next to ReShade. On first run it writes
-`dlss5-bridge.cfg` with working defaults; nothing needs configuring. To remove
-the add-on, delete the file.
+**Download `dlss5-bridge.addon64` only from [our GitHub releases](https://github.com/NIGos/dlss5-bridge/releases).**
+Bridge has no installer and never asks you to disable antivirus protection or
+add exclusions. ReShade has its own legitimate installer, available separately
+from [reshade.me](https://reshade.me/). [Verify the Bridge file](VERIFYING-DOWNLOADS.md)
+before putting it in the game folder.
+
+Install ReShade for the correct API, then copy `dlss5-bridge.addon64` and the
+neural add-on's files into its add-on search location, normally beside the
+game executable. On first run the Bridge writes `dlss5-bridge.cfg` with defaults
+for games using their own DLSS. Games without DLSS need the opt-in below.
+Keep only one Bridge DLL installed; back up old DLLs outside the game folder.
+To remove the Bridge, delete its `.addon64` file.
 
 The settings file's first line is the version that wrote it. A different version
 replaces the file with its own defaults on first run and says so in the log;
@@ -97,18 +108,20 @@ keeps a file across versions.
 game's executable that such a game does not bring: the DLSS 5 add-on and its
 `nvngx_dlssnr.dll`, and a **`nvngx_dlss.dll` of version 3.1.13 or newer**,
 copied by hand from any game that has DLSS. The NVIDIA driver does not supply
-that file, and NGX looks for it only in the executable's folder. Then turn on
-the panel switch, or set `synth=1`. If the file is missing, the panel and the
-log say so and name it.
+that file in the game's folder. Open ReShade's overlay and, in **DLSS 5 Bridge**,
+enable **Replace DLSS when the game isn't using its own** (or set `synth=1`).
+Enable neural rendering in the separate neural add-on's panel too. Optical flow
+is selected by default; the Bridge panel shows whether usable depth and motion
+inputs are available. If the DLSS DLL is missing, the panel and log name it.
 
 **Upgrading from 1.1.0 or earlier:** the files were called
 `dlss5-dx11-bridge.addon64` and `dlss5-dx11-bridge.cfg`. Delete the old
 `.addon64` — ReShade loads both, and the older one ends up on screen. The old
 `.cfg` is read where no current one exists.
 
-Nothing on disk is patched. In memory, 14 bytes at each of three entry points
-in every module exporting the NGX D3D11 API are replaced and restored around
-each call; `vk_mirror=1` adds four entry points per module.
+The Bridge hooks supported NGX entry points in memory. Hook selection has guards
+for unsupported exports; it does not patch every export indiscriminately.
+The prerelease additionally leaves the Frame Generation DLL untouched.
 
 ## Configuration
 
@@ -121,24 +134,24 @@ not re-read until the game's DLSS goes quiet.
 | `vk_mirror` | 1 | Hook the Vulkan NGX entry points and mirror a Vulkan game's own DLSS. Read once at launch. Depth aspects carried: `D32_SFLOAT`, `D32_SFLOAT_S8_UINT`, `D24_UNORM_S8_UINT`; a 16-bit aspect is refused by name. |
 | `synth` | 0 | Allow the substitute contract, for a game with no DLSS and for a game whose DLSS is switched off. One switch in the panel. |
 | `synth_after` | 0 | With `synth=1`, seconds of silence from the game before a substitute is built for a game that has never asked. `0` is the default 10 s. A delay, not an opt-in. |
-| `source` | `auto` | `auto` lets the game's DLSS win and falls back to the substitute; `mirror` and `synth` pin one; `off` disables both. |
+| `source` | `auto` | `auto` prioritizes the game's DLSS and permits the substitute when `synth=1`; `mirror` and `synth` pin one; `off` disables both processing paths. |
 | `ofa_grid` | 2 | Grid of the driver's optical flow engine on the substitute path: `1`, `2`, `4`, or `0` to use a ReShade motion-vector shader instead. |
 | `ofa_perf` | 20 | Optical flow effort, NVIDIA's own values: `5` slow, `10` medium, `20` fast. |
 | `mv_sign_x`, `mv_sign_y` | 0 | Force the motion-vector sign (`1`, `-1`); `0` uses the provider's convention or the engine's measurement. Diagnostic. |
 | `vk_present` | 0 | How the substitute's result reaches a Vulkan back buffer: `0` copies where the image allows it and draws it otherwise, `1` copies only, `2` draws always. |
 | `vk_sync` | 0 | How the substitute's Vulkan transport orders itself against the private D3D12 device: `0` parks the game's queue on a Vulkan event while a worker thread runs the optical flow and the evaluate, `1` waits the queue idle on the CPU instead, `2` pipelines. `1` costs a full CPU-GPU serialisation every frame and is the fallback if the park misbehaves on a driver. `2` runs one frame's evaluate while the game renders the next, so the wait the game's queue reaches is on work that started a frame earlier rather than on work that starts when it gets there -- at the price of showing the result one present later, which is about 17 ms at 60 fps and 33 at 30, and one more Output texture. That texture is the back buffer's own size and format, so it is width x height x bytes per texel: 8.3 MB at 1920x1080 and 24.6 MB at 3840x1600 for a 4-byte format, double each on an RGBA16F back buffer. |
-| `stage` | 3 | How much runs: `0` inert, `1` input copies, `2` plus depth conversion, `3` everything. Below `3` the substitute does not evaluate; below `2` the Vulkan mirror records nothing. |
+| `stage` | 3 | Processing level: `0` disables processing but leaves hooks installed. D3D11: `1` input copies, `2` plus depth conversion, `3` full processing. The substitute needs `3`; the Vulkan mirror records from `2` and copies results back at `3` with `mode=2`. |
 | `mode` | 2 | `0` never writes to the game, `1` transport only, `2` the full path. |
-| `skip_game` | 1 | Skip the game's own DLSS evaluate while the bridge is delivering; its result would be overwritten. |
+| `skip_game` | 1 | D3D11 only: skip the game's DLSS evaluate when the bridge can replace its full output. Vulkan always forwards the game's evaluate. |
 | `flags` | -1 | `DLSS.Feature.Create.Flags`. `-1` copies the game's value. `107` is treated as unset (an old default); use `108` to force that pattern. |
 | `subrects` | 1 | Fallback for `DLSS.Enable.Output.Subrects` when the game sets none. D3D11 bridge only. |
 | `reset_every` | 0 | `1` sets the NGX Reset flag every frame. Diagnostic. |
 | `pixels` | 0 | `1` reads pixels back to the CPU on frames 2 to 4. Diagnostic; stalls the GPU. |
 | `dred` | 1 | Ask D3D12 to record what the GPU was executing, so a device reset can be explained. Read when the session opens. |
 | `skip_exe` | 1 | `1` hooks the executable's own NGX exports only if no library exports them within a minute, so a game's image is not patched at startup. `0` hooks at once, `2` never. |
-| `unwrap` | 1 | Hand NGX the D3D12 device underneath ReShade's proxy. `0` keeps the proxy. A neural add-on build measured to need the proxy, and ReShade loaded as `d3d12.dll`, both override `1` automatically -- so on those `0` is already in force and changes nothing. `2` strips the proxy anyway, which is the value to try when a session that should work does not. |
+| `unwrap` | 1 | Hand NGX the D3D12 device underneath ReShade's proxy. `0` keeps the proxy. A neural add-on build measured to need the proxy, and ReShade loaded as `d3d12.dll`, both override `1` automatically. `2` forces unwrapping despite those checks; use only for a targeted diagnostic. See the Linux reports below for cases needing `0`. |
 | `ngx_loader` | 0 | What to do about an NVIDIA driver whose NGX loader drives neural rendering into a snippet that faults (32.0.16.1664 and 1686 with `nvngx_dlssnr.dll` 310.8.0.0): `0` closes that route in memory at attach, so the DLSS 5 add-on drives the feature itself as it did on 32.0.16.1656; `1` leaves the driver alone; `2` loads the previous driver's loader instead, if the driver store still holds one. Applies only when a snippet measured to fault is beside the game. |
-| `shape` | 0 | `1` builds the mirrored feature at the render region the game declares on each evaluate (`DLSS.Render.Subrect.Dimensions`) rather than at the size it created the feature with, and rebuilds when that region changes. For a game that creates one size and renders a smaller region inside it (Phantasy Star Online 2, #8). Diagnostic until measured. |
+| `shape` | 0 | `1` builds the mirrored feature at the render region the game declares on each evaluate (`DLSS.Render.Subrect.Dimensions`) and rebuilds when that region changes. Confirmed by the PSO2 reporter to fix `0xBAD00005` in [#8](https://github.com/NIGos/dlss5-bridge/issues/8#issuecomment-5552628561). Leave at `0` unless needed. |
 | `stall_test` | 0 | Holds the private D3D12 queue for this many milliseconds, once, at the 60th submission, to exercise the stall path. Diagnostic. |
 | `unwrap_list` | 0 | `1` hands NGX the command list underneath ReShade's proxy. Diagnostic. |
 | `probe` | 0 | `1` runs a standalone NGX D3D12 probe at attach and logs the result. Diagnostic. |
@@ -158,7 +171,7 @@ The panel writes single lines into `dlss5-bridge.cfg` and reads the file back
 like any other edit. There is no save, reload or reset: deleting the file
 restores the defaults on the next launch.
 
-The panel needs ReShade 6.0.0 to 6.8.0. A ReShade built without its overlay,
+The panel has compatibility handling for ReShade 6.0.0 through 6.8.0. A ReShade built without its overlay,
 or the "Release Signed" build, has no panel; the log says so and nothing else
 is affected.
 
@@ -179,16 +192,18 @@ relative to the input, and a timing line:
 the widest and narrowest frame interval in the window. *d3d12 N/M* is how far
 the D3D12 side runs behind; a few is ordinary pipelining.
 
-The transport itself costs nothing measurable; the neural pass on the GPU is
-the cost, and it depends on scene, resolution, GPU and the neural add-on's
-settings. To measure it in place: `stage=0`, read a timing line, `stage=3`,
-read another, without moving.
+The bridge adds texture copies, synchronization and, on the substitute path,
+motion estimation, as well as the neural pass. Their cost depends on the API,
+scene, resolution, GPU and settings. This CPU timing includes waits and does
+not establish whether a game is CPU- or GPU-limited. Compare the same scene
+and settings in separate runs; Vulkan configuration changes may require a restart.
 
 ## Reporting a problem
 
 A screenshot of the panel with Details ticked answers the first questions.
-Past that, attach `dlss5-bridge.log`. Please name the game, the API, and what
-was on screen. Reports from titles not listed below are useful even when
+Past that, attach fresh `dlss5-bridge.log` and `ReShade.log` files. Please name
+the game, API, Bridge version, GPU/driver, neural add-on/model build, and whether
+DLSS, FG/MFG and HDR were enabled. Reports from titles not listed below are useful even when
 everything works.
 
 ## Compatibility
@@ -200,13 +215,29 @@ that exercises both backends, mode changes, contract faults and the substitute
 contract against real NGX, without a game.
 
 NVIDIA drivers 32.0.16.1664 and 1686 route neural rendering (NGX feature 18) into
-`nvngx_dlssnr.dll` itself, and the only build of that snippet in circulation,
-310.8.0.0, faults inside D3D12 on that route: with the DLSS 5 add-on present the
+`nvngx_dlssnr.dll` itself. The 310.8.0.0 build tested with those drivers
+faulted inside D3D12 on that route: with the DLSS 5 add-on present the
 game terminated or stopped presenting. The add-on closes that route in the
 loaded `_nvngx.dll` at attach -- one pointer, in memory, nothing on disk -- and
 the DLSS 5 add-on drives the feature as it did on 32.0.16.1656. See `ngx_loader`.
+Other model builds exist; this is a workaround for the identified combination,
+not a claim that all current models need it.
 
-Reported working by users:
+Additional reports, scoped to the tested setups:
+
+- [Endfield Vulkan, v1.4.12](https://github.com/NIGos/dlss5-bridge/issues/17#issuecomment-5553000888):
+  the reporter confirmed correct neural rendering. FG/MFG is a separate
+  [#27](https://github.com/NIGos/dlss5-bridge/issues/27) issue under test in pre2.
+- [BG3 D3D11 with neural-upstream v0.3.0](https://github.com/NIGos/dlss5-bridge/issues/26):
+  reported working on RTX 4090 / driver 616.64. Not locally verified.
+- [Linux/Proton, D3D11 substitute](https://github.com/NIGos/dlss5-bridge/issues/22):
+  users report success with NapXDD's addon-dlssnr-linux and `unwrap=0` on RTX
+  4080 and 5070. Hardware optical flow was unavailable in those reports; they
+  used ReShade motion-vector shaders. This does not establish compatibility
+  for other neural add-ons or the Vulkan mirror. ReShade's descriptor-handle
+  fix is tracked in [PR #435](https://github.com/crosire/reshade/pull/435).
+
+Other titles reported working by users (not a guarantee for every build or mode):
 
 | Title | Engine | DLSS from |
 | --- | --- | --- |
@@ -220,30 +251,39 @@ Reported working by users:
 | S.T.A.L.K.E.R. Anomaly | X-Ray | an upscaler injector mod (SSS24) |
 | Assetto Corsa | kunOS | Custom Shaders Patch (Preview 338 or later) |
 
-Nothing targets a particular game: every module exporting the NGX API is
-hooked, and every size, format and offset is read from the caller's parameter
-block. DLSS supplied by a mod is picked up the same way as DLSS built into the
-game.
+Tainted Grail also has an open, setup-specific device-creation report in
+[#24](https://github.com/NIGos/dlss5-bridge/issues/24).
+
+The bridge follows the game's NGX inputs rather than requiring a game-specific
+integration. DLSS supplied by a mod can be picked up like built-in DLSS;
+compatibility still depends on the supplied inputs and the other add-ons.
 
 ## Known limits
 
-If anything goes wrong the bridge disables itself and the game renders on its
-own. It never leaves a broken frame on screen deliberately.
+The Bridge attempts to stand down on detected failures, but failures in a
+driver or another add-on can still crash the game or produce an incorrect image.
 
-- **Two NGX sessions.** The game's DLSS runs once and the bridge's runs once;
-  with `skip_game=1` only the bridge's does. One NGX call runs at a time in the
-  process, so a mirrored frame's evaluate can wait for the game's.
-- **Exposure texture.** A game that drives DLSS from an exposure texture is
-  carried when the texture is a single-component 32-bit float; any other shape
-  is refused with its format named. `flags` with `AutoExposure` (`0x40`) added
-  lets DLSS compute its own exposure in that case.
-- **Substitute before the game's DLSS.** A substitute armed before a game's own
-  DLSS first appears faults inside the neural add-on when the game then asks,
-  and the mirror stands down for the session. Leave `synth_after` at its
-  default in a game that has DLSS; the mirror-first order is the one that works.
-- **Substitute depth must be back-buffer sized.** Smaller depth means the game
-  is upscaling itself, which is the mirror's case, and resampled depth would be
-  invented data. The Vulkan substitute reads depth with a compute pass that
+- **Two NGX sessions.** Vulkan runs the game's DLSS and the mirrored DLSS.
+  D3D11 can skip the original with `skip_game=1` when replacing the full output.
+  The Bridge serializes its intercepted NGX calls with its private work, which
+  can introduce waits.
+- **Vulkan exposure texture.** v1.4.12 carries both `R16_SFLOAT` and
+  `R32_SFLOAT`, and supports different input/output color formats. Unsupported
+  exposure contracts are logged and left to the game's own DLSS; changing
+  exposure flags is not an equivalent fix.
+- **HDR on the substitute path.** The input may already include the game's
+  tone mapping and UI. With neural rendering this can alter colors across the
+  whole view. A general solution that preserves the game's presentation is
+  still under investigation; no universal HDR fix is in the stable or pre2 build.
+- **FG and split screen.** v1.4.13-pre2 fixes reproduced FG initialization and
+  D3D11 partial-output defects. Endfield's generated frames and BG3's complete
+  split-screen neural output still need in-game confirmation.
+- **Substitute before the game's DLSS.** This order has caused faults in tested
+  neural add-on builds when native DLSS first appears. Prefer the native DLSS
+  route and leave the substitute off in games that provide it.
+- **Substitute depth must be back-buffer sized.** A smaller or otherwise
+  mismatched depth buffer does not meet the substitute's requirements.
+  The Vulkan substitute reads depth with a compute pass that
   needs `VK_KHR_push_descriptor`; a driver without it is refused by name.
 - **Optical flow on Vulkan** runs on a private D3D11 device with two textures of
   its own, because the driver refuses to open the transport's D3D12 textures as
@@ -259,18 +299,18 @@ own. It never leaves a broken frame on screen deliberately.
   change on their own, as IsHDR does when a game switches HDR on. On Vulkan a
   display change also recreates ReShade's runtime; the mirror and the
   substitute both follow it.
-- **A result smaller than the texture holding it** is written at 0,0 and the
-  rest of the texture is left alone, which is what the game's own DLSS does
-  with the same block. Games padded for dynamic resolution allocate this way;
-  the game's own evaluate is not skipped on those frames.
+- **Partial D3D11 output.** Stable v1.4.12 copies a partial result at 0,0;
+  this can overwrite the wrong region when the game supplies a nonzero output
+  origin. Pre1 and pre2 preserve the declared origin. The original evaluate
+  is retained on partial-output frames to preserve the surrounding texture.
 - Verbose logging is always on.
 
 ## Related
 
 [dlss5-d3d12-fix](https://github.com/NIGos/dlss5-d3d12-fix) addresses a
 different failure of the same neural add-on: a DirectX 12 game whose DLSS output
-carries a mip chain. If the add-on's panel says STANDBY/FAILED rather than
-waiting for the game's DLSS, that is the one to use.
+carries a mip chain. Check that project's diagnosis before using it;
+STANDBY/FAILED alone does not identify that problem.
 
 ## Building
 

@@ -1,0 +1,86 @@
+name: Build and verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verifier checks
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Windows PowerShell 5.1
+        run: powershell.exe -NoProfile -File tools/Test-Verify-Bridge.ps1
+      - name: PowerShell 7
+        run: pwsh -NoProfile -File tools/Test-Verify-Bridge.ps1
+      - name: Build addon
+        shell: cmd
+        run: call src\build.cmd
+      - name: Record build and checksums
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $commit -cne $env:GITHUB_SHA) {
+            throw 'The checkout does not match the workflow commit.'
+          }
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item -LiteralPath src/dlss5-bridge.addon64 -Destination dist/
+          $addon = Get-Item -LiteralPath dist/dlss5-bridge.addon64
+          @(
+            "Repository: $env:GITHUB_REPOSITORY"
+            "Commit: $commit"
+            "Ref: $env:GITHUB_REF"
+            "Workflow run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "File version: $($addon.VersionInfo.FileVersion)"
+            "Bytes: $($addon.Length)"
+          ) | Set-Content -LiteralPath dist/BUILD-INFO.txt -Encoding utf8
+          Get-FileHash -LiteralPath dist/dlss5-bridge.addon64, dist/BUILD-INFO.txt -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content -LiteralPath dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content -LiteralPath dist/BUILD-INFO.txt, dist/SHA256SUMS.txt
+      - name: Upload build
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dlss5-bridge-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+
+  attest:
+    name: Attest main build
+    needs: build
+    if: >-
+      github.repository == 'NIGos/dlss5-bridge' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download this run's build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: dist
+          merge-multiple: true
+      - name: Attest addon provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
