@@ -1,0 +1,25 @@
+name: Download verifier checks
+
+on:
+  push:
+    branches: [main]
+    paths: ['tools/**', '.github/**', 'VERIFYING-DOWNLOADS.md']
+  pull_request:
+    paths: ['tools/**', '.github/**', 'VERIFYING-DOWNLOADS.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Windows PowerShell 5.1
+        run: powershell.exe -NoProfile -File tools/Test-Verify-Bridge.ps1
+      - name: PowerShell 7
+        run: pwsh -NoProfile -File tools/Test-Verify-Bridge.ps1

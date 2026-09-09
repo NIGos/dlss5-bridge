@@ -59,6 +59,21 @@ above; weakening execution policy is not required for verification.
 
 ## What this protects
 
+For a **new immutable release**, GitHub also provides a cryptographically
+verifiable release attestation. With a current GitHub CLI, replace `TAG` and
+the file path with the actual release and your local addon:
+
+```powershell
+gh release verify TAG --repo github.com/NIGos/dlss5-bridge
+gh release verify-asset TAG 'C:\path\dlss5-bridge.addon64' --repo github.com/NIGos/dlss5-bridge
+```
+
+Both commands must succeed. These commands do not apply to the older mutable
+releases in the table above, or to GitHub's automatically generated source archives.
+Immutability was enabled on 9 September 2026 for future releases; it does not
+retroactively authenticate older releases. The PowerShell checker remains a
+SHA-256/size comparison, and does not claim to verify an attestation.
+
 The trusted reference is this GitHub repository and its HTTPS API. A hash
 copied from the same untrusted download site does not establish authenticity.
 This check covers the selected file only: it does not validate other files
