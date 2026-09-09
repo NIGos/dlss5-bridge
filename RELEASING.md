@@ -3,7 +3,16 @@
 Release immutability is enabled. **Upload every final asset to a draft before
 publishing.** After publication, assets and the release tag cannot be replaced.
 Use a new version for a correction; do not delete/recreate an old release to
-retrofit immutability. Existing releases retain their original status.
+retrofit immutability.
+
+Check an existing release's actual `immutable` status before and after editing
+it. In this repository, updating the published notes on 9 September 2026
+finalized immutability for **v1.4.12, v1.4.13-pre1, v1.4.13-pre2, v1.4.13-pre3
+and v1.3.0**, without replacing their tags or binaries. Their release attestations
+were verified. Do not assume an older release will remain mutable after an edit:
+confirm its tag and complete asset list first. This locks the existing files;
+it does not create provenance for their historical builds. New releases must
+still be complete drafts before publication.
 
 1. Prepare the release through a pull request. Review the diff and require the
    build and verification checks to pass before merging. The project has one
@@ -63,7 +72,7 @@ always verify and publish the artifact from the selected successful run.
 
 ## Verify the published release
 
-For the actual newly published tag, replace `TAG` and the local path:
+For the intended immutable release, replace `TAG` and the local path:
 
 ```powershell
 gh release verify TAG --repo github.com/NIGos/dlss5-bridge

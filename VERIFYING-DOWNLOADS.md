@@ -63,22 +63,30 @@ above; weakening execution policy is not required for verification.
 
 ## Verify an immutable release
 
-For a **new immutable release**, GitHub also provides a cryptographically
-verifiable release attestation. With a current GitHub CLI, replace `TAG` and
-the file path with the actual release and your local addon:
+**All five releases in the table above are now immutable and have verified
+release attestations.** Their notes were updated on 9 September 2026, which
+finalized immutability for these existing releases. Their original tags,
+publication dates and addon hashes were preserved.
+
+With a current GitHub CLI, replace `TAG` and the file path with the intended
+release and your local addon:
 
 ```powershell
 gh release verify TAG --repo github.com/NIGos/dlss5-bridge
 gh release verify-asset TAG 'C:\path\dlss5-bridge.addon64' --repo github.com/NIGos/dlss5-bridge
 ```
 
-Both commands must succeed. These commands do not apply to the older mutable
-releases in the table above, or to GitHub's automatically generated source archives.
-Immutability was enabled on 9 September 2026 for future releases; it does not
-retroactively authenticate older releases. The PowerShell checker remains a
-SHA-256/size comparison, and does not claim to verify an attestation.
+Both commands must succeed. For any release outside the table, check its actual
+immutability status; these commands do not apply to mutable releases or GitHub's
+automatically generated source archives. The attestation authenticates the files
+now locked to that release, without proving how the older binaries were built.
+The PowerShell checker remains a SHA-256/size comparison and does not verify an
+attestation.
 
 ## Verify where a CI build came from
+
+The five releases above **do not have CI build provenance**. Their release
+attestations do not add it retroactively.
 
 For releases that provide GitHub Actions build provenance, the release notes
 identify the source commit and build run. With a current GitHub CLI, replace

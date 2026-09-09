@@ -34,20 +34,22 @@ use a trusted device to secure affected accounts and seek incident-response help
 
 ## Release integrity
 
-Release immutability was enabled on **9 September 2026**. It applies to future
-releases: their published assets and associated tags are locked, and GitHub
-generates a release attestation. Earlier releases are not retroactively made
-immutable. Check the release's actual status instead of assuming from its version.
+Release immutability was enabled on **9 September 2026**. The existing releases
+**v1.4.12, v1.4.13-pre1, v1.4.13-pre2, v1.4.13-pre3 and v1.3.0** were also made
+immutable that day when their notes were updated with a download warning.
+Their original tags, publication dates and addon files were preserved, and their
+release attestations were verified. Their assets and associated tags are now
+locked. Check any other release's actual status instead of assuming from its version.
 
 The attestation identifies what GitHub published for this repository and tag.
 It is not an independent audit of the source or proof that a binary is harmless.
 Build provenance is a separate attestation that links a file to the source
-commit and GitHub Actions workflow that produced it. Neither kind is an
-Authenticode publisher signature. Follow the verification instructions for the
-specific release; older releases do not gain these attestations retroactively.
-Current legacy binaries are unsigned with Authenticode. We do not use a
-self-signed certificate or an internal integrity badge as a substitute for
-publisher authentication.
+commit and GitHub Actions workflow that produced it. The five releases above
+have release attestations, but **no CI build provenance or Authenticode publisher
+signature**. Locking their existing files does not establish how they were
+originally built. Follow the verification instructions for the specific release.
+We do not use a self-signed certificate or an internal integrity badge as a
+substitute for publisher authentication.
 
 Maintainers must follow [the release procedure](RELEASING.md). Protect the
 maintainer's GitHub account with strong two-factor authentication or a passkey,
