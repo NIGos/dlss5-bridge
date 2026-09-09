@@ -28,6 +28,7 @@ These values were checked against downloaded official GitHub assets on
 | Release | Asset bytes | SHA-256 of `dlss5-bridge.addon64` |
 | --- | ---: | --- |
 | [v1.4.12 — stable](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12) | 508928 | `4f2acecc1026ae89ac0b92767be66ceea2662ad0ef88710b89c7da7840d548d4` |
+| [v1.4.13-pre5](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre5) | 530944 | `100fa93e597df0803a7edff24d89b47dbbaee11fd3a06d26ce8107e317a66b71` |
 | [v1.4.13-pre4](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre4) | 513024 | `710e5354c42ae3491c9523576c82805d0c42383836525f3d3d02a31ffa9f9d2f` |
 | [v1.4.13-pre3](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre3) | 508928 | `3dc81b261377c936c22cf8589d96cb0be8b18b8de90d1cea5ba83e9bca763717` |
 | [v1.4.13-pre2](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre2) | 508928 | `2a3e8b74df4fb837841eeebb456cda9cff67ad5b782b14a7b886d90d8d4c333b` |
@@ -51,7 +52,7 @@ From the folder containing that script, run:
 .\Verify-Bridge.ps1 -Path 'C:\Users\YourName\Downloads\dlss5-bridge.addon64' -ReleaseTag v1.4.12
 ```
 
-For another release, supply its tag explicitly, for example `v1.4.13-pre4`.
+For another release, supply its tag explicitly, for example `v1.4.13-pre5`.
 If PowerShell blocks the downloaded script, use the manual hash comparison
 above; weakening execution policy is not required for verification.
 
@@ -64,8 +65,8 @@ above; weakening execution policy is not required for verification.
 
 ## Verify an immutable release
 
-**All six releases in the table above are immutable and have verified release
-attestations.** Pre4 was published as an immutable release. The five older
+**All seven releases in the table above are immutable and have verified release
+attestations.** Pre4 and pre5 were published as immutable releases. The five older
 releases became immutable when their notes were updated on 9 September 2026;
 their original tags, publication dates and addon hashes were preserved.
 
@@ -86,19 +87,23 @@ attestation.
 
 ## Verify where a CI build came from
 
-**v1.4.13-pre4 is the first release with GitHub Actions build provenance.**
-Its addon comes from the official build workflow on a GitHub-hosted runner.
-The source is [efc5cac43adac2cca98a163afacee5ac1b16917e](https://github.com/NIGos/dlss5-bridge/commit/efc5cac43adac2cca98a163afacee5ac1b16917e),
-from [build run 34342819589](https://github.com/NIGos/dlss5-bridge/actions/runs/34342819589).
+**Pre4 and pre5 have GitHub Actions build provenance.** Their addons come from
+the official build workflow on GitHub-hosted runners; pre4 was the first release
+published this way.
+
+| Release | Source commit | Build run |
+| --- | --- | --- |
+| pre5 | [c37b670b4ce98fd412c52867666018c1f4d02745](https://github.com/NIGos/dlss5-bridge/commit/c37b670b4ce98fd412c52867666018c1f4d02745) | [34406985478](https://github.com/NIGos/dlss5-bridge/actions/runs/34406985478) |
+| pre4 | [efc5cac43adac2cca98a163afacee5ac1b16917e](https://github.com/NIGos/dlss5-bridge/commit/efc5cac43adac2cca98a163afacee5ac1b16917e) | [34342819589](https://github.com/NIGos/dlss5-bridge/actions/runs/34342819589) |
 
 The five older releases in the table (**v1.4.12, pre1, pre2, pre3 and v1.3.0**)
 **do not have CI build provenance**. Their release attestations do not add it
 retroactively.
 
-To verify pre4 with a current GitHub CLI, replace only the file path:
+To verify pre5 with a current GitHub CLI, replace only the file path:
 
 ```powershell
-gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest efc5cac43adac2cca98a163afacee5ac1b16917e --deny-self-hosted-runners
+gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest c37b670b4ce98fd412c52867666018c1f4d02745 --deny-self-hosted-runners
 ```
 
 This checks that the file was attested by the named build workflow for that

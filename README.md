@@ -34,14 +34,13 @@ Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://githu
 **Release status (9 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
 remains the stable release. `main` contains the cumulative 1.4.13 prerelease
 changes and the [D3D11 depth/MV conversion fix](https://github.com/NIGos/dlss5-bridge/pull/34).
-The next test build, pre5, also fixes a Vulkan Frame Generation startup failure
+The latest test build, [v1.4.13-pre5](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre5),
+also fixes a Vulkan Frame Generation startup failure
 reported in [Endfield](https://github.com/NIGos/dlss5-bridge/issues/27#issuecomment-5606803978):
 it supplies the command buffer's device when NGX cannot infer one alongside
 the Bridge's private device, and clears obsolete hooks when an NGX module unloads.
-The latest published test build is
-[v1.4.13-pre4](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre4),
-which includes those changes and is the first release with verified GitHub
-Actions build provenance. It is still unsigned; follow the
+Pre5 includes all pre4 changes and has verified GitHub Actions build provenance.
+It is still unsigned; follow the
 [download verification instructions](VERIFYING-DOWNLOADS.md) before loading it.
 BG3 split-screen rendering remains open. A [BG3 reporter confirmed SR/mirror/FG
 coexistence with pre4](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5607261784);
