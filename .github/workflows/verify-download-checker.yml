@@ -27,6 +27,9 @@ jobs:
       - name: Build addon
         shell: cmd
         run: call src\build.cmd
+      - name: D3D11 conversion pixels (WARP)
+        shell: cmd
+        run: call tests\build-d3d11-conversion-test.cmd --warp
       - name: Record build and checksums
         shell: pwsh
         run: |
