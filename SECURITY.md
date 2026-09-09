@@ -41,10 +41,16 @@ Their original tags, publication dates and addon files were preserved, and their
 release attestations were verified. Their assets and associated tags are now
 locked. Check any other release's actual status instead of assuming from its version.
 
-The attestation identifies what GitHub published for this repository and tag.
+**v1.4.13-pre4** was published as an immutable release with both a release
+attestation and GitHub Actions build provenance. It is the first release whose
+download can also be verified against the source commit and official build
+workflow that produced it. It remains unsigned: build provenance is not an
+Authenticode publisher signature.
+
+The release attestation identifies what GitHub published for this repository and tag.
 It is not an independent audit of the source or proof that a binary is harmless.
 Build provenance is a separate attestation that links a file to the source
-commit and GitHub Actions workflow that produced it. The five releases above
+commit and GitHub Actions workflow that produced it. The five older releases
 have release attestations, but **no CI build provenance or Authenticode publisher
 signature**. Locking their existing files does not establish how they were
 originally built. Follow the verification instructions for the specific release.
