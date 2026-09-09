@@ -1,5 +1,11 @@
 # DLSS 5 Bridge
 
+> [!WARNING]
+> **Unofficial download site:** `dlss5bridge.com` is not operated or endorsed by this project.
+> Get DLSS 5 Bridge from [this repository's GitHub releases](https://github.com/NIGos/dlss5-bridge/releases).
+> That site serves a separate ZIP we have not verified. A user has reported a possible infection;
+> malware has **not** been confirmed. Please do not run files from that site. See [#30](https://github.com/NIGos/dlss5-bridge/issues/30).
+
 **A bridge for DLSS 5 Neural Rendering add-ons in DirectX 11 and Vulkan games,
 with an optional optical-flow path for games without DLSS.**
 
