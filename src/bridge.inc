@@ -1,3 +1,4 @@
+#include "poll-yield.hpp"
 // Implementation of the D3D11 -> D3D12 NGX bridge described in bridge.h.
 
 static NVSDK_NGX_Result SafeEvaluateGuarded(PFN_D3D12EvaluateFeature fn,
@@ -4413,6 +4414,17 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     // was what left House Party (#8, pull request #9) with no neural rendering
     // in any gameplay scene: its allocations are padded for dynamic resolution,
     // 5120x2048 for a 5120x1440 display, so every frame was "partial".
+    unsigned int output_x = 0, output_y = 0;
+    gp->Get("DLSS.Output.Subrect.Base.X", &output_x);
+    gp->Get("DLSS.Output.Subrect.Base.Y", &output_y);
+    if (output_x > d[SLOT_OUTPUT].Width || output_y > d[SLOT_OUTPUT].Height ||
+        gow > d[SLOT_OUTPUT].Width - output_x || goh > d[SLOT_OUTPUT].Height - output_y)
+    {
+        BridgeDisable("the output region exceeds its texture; no output is copied back");
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
     const bool partial = (gow != d[SLOT_OUTPUT].Width) || (goh != d[SLOT_OUTPUT].Height);
     g_bridge.partial_output = partial;
     // Only for the game's own contract. The substitute's block is written by
@@ -4431,10 +4443,10 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     {
         g_bridge.partial_reported = true;
         Log("[bridge] the game asks for a %ux%u result inside a %ux%u texture. The "
-            "region at 0,0 is written and the rest of the texture left as it is, "
+            "region at %u,%u is written and the rest of the texture left as it is, "
             "which is what the game's own DLSS does with the same block. The game's "
             "own evaluate is not skipped on these frames.",
-            gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height);
+            gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height, output_x, output_y);
     }
 
     bool shape_changed = (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
@@ -4789,11 +4801,12 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             if (g_bridge.partial_output)
             {
                 // The region only. See the note above the partial test.
-                D3D11_BOX box = { 0, 0, 0,
-                                  g_bridge.ngx_out_w < d[SLOT_OUTPUT].Width  ? g_bridge.ngx_out_w : d[SLOT_OUTPUT].Width,
-                                  g_bridge.ngx_out_h < d[SLOT_OUTPUT].Height ? g_bridge.ngx_out_h : d[SLOT_OUTPUT].Height,
-                                  1 };
-                ctx->CopySubresourceRegion(g[SLOT_OUTPUT], 0, 0, 0, 0, g_bridge.tex11[SLOT_OUTPUT], 0, &box);
+                // NGX wrote at the game's output base, not necessarily 0,0.
+                // Copying the origin can overwrite the other split-screen view.
+                D3D11_BOX box = { output_x, output_y, 0,
+                                  output_x + g_bridge.ngx_out_w,
+                                  output_y + g_bridge.ngx_out_h, 1 };
+                ctx->CopySubresourceRegion(g[SLOT_OUTPUT], 0, output_x, output_y, 0, g_bridge.tex11[SLOT_OUTPUT], 0, &box);
             }
             else
                 ctx->CopyResource(g[SLOT_OUTPUT], g_bridge.tex11[SLOT_OUTPUT]);

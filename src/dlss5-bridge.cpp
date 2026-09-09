@@ -61,7 +61,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.12"
+#define BRIDGE_VERSION "1.4.13-pre4"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -2674,6 +2674,16 @@ static int HookNewNgxModules()
         GetModuleFileNameW(mods[i], path, MAX_PATH);
         const wchar_t *leaf = wcsrchr(path, L'\\');
         leaf = leaf ? leaf + 1 : path;
+
+        // FG exports the generic NGX names too, but cannot carry SR calls.
+        // Patching its implementation makes Vulkan FG creation return
+        // FAIL_PlatformError; leave the shared loader hooked, not this snippet.
+        if (_wcsicmp(leaf, L"nvngx_dlssg.dll") == 0)
+        {
+            Log("  leaving %ls untouched: Frame Generation is not an SR entry point.", leaf);
+            RememberRejected(mods[i]);
+            continue;
+        }
 
         // A game that links the NGX client statically exports these from its own
         // executable, and hooking them writes into the game's code section. The
