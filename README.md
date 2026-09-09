@@ -3,8 +3,10 @@
 > [!WARNING]
 > **Unofficial download site:** `dlss5bridge.com` is not operated or endorsed by this project.
 > Get DLSS 5 Bridge from [this repository's GitHub releases](https://github.com/NIGos/dlss5-bridge/releases).
-> That site serves a separate ZIP we have not verified. A user has reported a possible infection;
-> malware has **not** been confirmed. Please do not run files from that site. See [#30](https://github.com/NIGos/dlss5-bridge/issues/30).
+> Its ZIP contains an unofficial `.exe` installer. [Hybrid Analysis](https://hybrid-analysis.com/sample/5c3cc8dec5827d57f4cfe0968415eeb44ed3f865253bccbca95689989e462837/6aa00630e0516cd4fc0acc39)
+> classifies it as **Malicious** and records attempts to add Microsoft Defender exclusions for other executables.
+> **Do not run installers from that site.** A user's reported compromise has not been independently verified;
+> see [#30](https://github.com/NIGos/dlss5-bridge/issues/30).
 > [Verify your download before loading it](VERIFYING-DOWNLOADS.md): official SHA-256 values and an optional PowerShell checker.
 
 **A bridge for DLSS 5 Neural Rendering add-ons in DirectX 11 and Vulkan games,
