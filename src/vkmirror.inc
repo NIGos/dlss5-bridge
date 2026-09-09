@@ -334,6 +334,46 @@ static VkMirror g_vkm;
 // frames -- which is exactly what the two-ReShades check below tests.
 static reshade::api::effect_runtime *g_vkm_rt;
 
+// A legacy FG create names a command buffer but no device. ReShade knows its
+// owner at allocation time; an effect runtime may belong to another VkDevice.
+// Only allocation/free and FG creation touch this table, never draw/evaluate.
+static std::mutex g_vkm_cmd_mutex;
+static std::unordered_map<uint64_t, uint64_t> g_vkm_cmd_devices;
+
+static void OnVkmInitCommandList(reshade::api::command_list *cmd)
+{
+    auto *dev = cmd->get_device();
+    if (dev->get_api() != reshade::api::device_api::vulkan) return;
+    std::lock_guard<std::mutex> lock(g_vkm_cmd_mutex);
+    g_vkm_cmd_devices[cmd->get_native()] = dev->get_native();
+}
+
+static void OnVkmDestroyCommandList(reshade::api::command_list *cmd)
+{
+    if (cmd->get_device()->get_api() != reshade::api::device_api::vulkan) return;
+    std::lock_guard<std::mutex> lock(g_vkm_cmd_mutex);
+    g_vkm_cmd_devices.erase(cmd->get_native());
+}
+
+static void OnVkmDestroyDevice(reshade::api::device *dev)
+{
+    if (dev->get_api() != reshade::api::device_api::vulkan) return;
+    const uint64_t native = dev->get_native();
+    std::lock_guard<std::mutex> lock(g_vkm_cmd_mutex);
+    // A command pool can be destroyed without individual command-list events.
+    for (auto it = g_vkm_cmd_devices.begin(); it != g_vkm_cmd_devices.end(); )
+        if (it->second == native) it = g_vkm_cmd_devices.erase(it);
+        else ++it;
+}
+
+static void *VkmCommandDevice(void *cmd)
+{
+    std::lock_guard<std::mutex> lock(g_vkm_cmd_mutex);
+    const auto it = g_vkm_cmd_devices.find(reinterpret_cast<uintptr_t>(cmd));
+    return it != g_vkm_cmd_devices.end()
+        ? reinterpret_cast<void *>(static_cast<uintptr_t>(it->second)) : nullptr;
+}
+
 // A runtime arrives. On Vulkan this happens again after every swapchain change,
 // so it is also where the stand-down VkmShutdown raised is lifted -- the mirror
 // rebuilds itself on the next evaluate.
@@ -497,6 +537,9 @@ static void VkmRegisterEvents()
     }
     reg(reshade::addon_event::init_effect_runtime,    reinterpret_cast<void *>(&OnVkmInitRuntime));
     reg(reshade::addon_event::destroy_effect_runtime, reinterpret_cast<void *>(&OnVkmDestroyRuntime));
+    reg(reshade::addon_event::init_command_list,      reinterpret_cast<void *>(&OnVkmInitCommandList));
+    reg(reshade::addon_event::destroy_command_list,   reinterpret_cast<void *>(&OnVkmDestroyCommandList));
+    reg(reshade::addon_event::destroy_device,         reinterpret_cast<void *>(&OnVkmDestroyDevice));
     Log("[vkmirror] vk_mirror=1: the Vulkan NGX entry points will be hooked and a Vulkan "
         "game's own DLSS contract mirrored onto the private D3D12 session.");
 }
@@ -1971,8 +2014,29 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
     // worker is inside its own evaluate is the same two-threads-in-one-NGX shape.
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
     EnterCriticalSection(&g_hook_cs);
+    // NGX requires CreateFeature1 when multiple devices are active. The private
+    // D3D12 session makes legacy Vulkan FG device inference ambiguous (#27).
+    // Use the command buffer's observed owner, not the last presenting runtime.
+    // Unknown owners/exports and every other feature retain the original path.
+    void *vkdev = feature_id == 11 ? VkmCommandDevice(cmd) : nullptr;
+    Hook *named = nullptr;
+    if (vkdev != nullptr)
+        for (LONG i = 0; i < g_layer_count && i < kMaxLayers; ++i)
+            if (&g_layer[i].vk_create == &h && g_layer[i].mod != nullptr &&
+                g_layer[i].vk_create1.target != nullptr)
+            { named = &g_layer[i].vk_create1; break; }
     HookRemove(h);
-    NVSDK_NGX_Result r = fwd(cmd, feature_id, p, out);
+    NVSDK_NGX_Result r;
+    if (named != nullptr)
+    {
+        Log("[vkmirror] creating Frame Generation through CreateFeature1 with the "
+            "command buffer's VkDevice %p.", vkdev);
+        HookRemove(*named);
+        r = reinterpret_cast<PFN_VkCreate1>(named->target)(vkdev, cmd, feature_id, p, out);
+        HookRestore(*named);
+    }
+    else
+        r = fwd(cmd, feature_id, p, out);
     HookRestore(h);
     LeaveCriticalSection(&g_hook_cs);
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);

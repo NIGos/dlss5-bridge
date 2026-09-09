@@ -58,10 +58,12 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.13-pre4"
+#define BRIDGE_VERSION "1.4.13-pre5"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -2746,13 +2748,14 @@ static int HookNewNgxModules()
         // Slots used to be handed out forward only, so every unload and reload
         // of an NGX module burned one permanently and a long session could run
         // out of a table it was no longer using. ForgetUnloadedLayer nulls mod,
-        // which is what makes a slot free: HookInstall overwrites a slot whole
-        // and LAYER_DETOURS binds by index, so reuse is safe.
+        // which is what makes a slot free. Reset every hook before reuse: the
+        // replacement module may not export all the old module's entry points.
         LONG slot = g_layer_count;
         for (LONG k = 0; k < g_layer_count; ++k)
             if (g_layer[k].mod == nullptr) { slot = k; break; }
 
         Layer &L = g_layer[slot];
+        L = {};
         L.mod = mods[i];
 
         Log("NGX layer %ld: %ls (base=%p)", slot, path, static_cast<void *>(mods[i]));
@@ -3518,8 +3521,7 @@ static void ForgetUnloadedLayer(const void *base)
     {
         if (g_layer[i].mod == nullptr ||
             static_cast<const void *>(g_layer[i].mod) != base) continue;
-        g_layer[i].eval.active = g_layer[i].eval_c.active = g_layer[i].create.active = false;
-        g_layer[i].mod = nullptr;
+        g_layer[i] = {};
         Log("NGX layer %ld has been unloaded; its hooks are dropped rather than "
             "called into or written back to memory that is gone.", i);
     }

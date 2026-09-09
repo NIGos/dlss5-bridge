@@ -30,6 +30,9 @@ jobs:
       - name: D3D11 conversion pixels (WARP)
         shell: cmd
         run: call tests\build-d3d11-conversion-test.cmd --warp
+      - name: Vulkan FG device routing (CPU)
+        shell: cmd
+        run: call tests\build-vulkan-fg-device-test.cmd
       - name: Record build and checksums
         shell: pwsh
         run: |
