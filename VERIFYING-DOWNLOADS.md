@@ -5,6 +5,10 @@ as the source for both the addon and these instructions. `dlss5bridge.com` is
 not operated or endorsed by this project. A matching filename or version
 number does not establish where a file came from.
 
+The Bridge download is **`dlss5-bridge.addon64`**. We do not distribute a Bridge
+installer or ask you to disable antivirus protection or add exclusions.
+ReShade's installer is a separate download from [reshade.me](https://reshade.me/).
+
 **Check before copying the addon into the game folder or starting the game.**
 Verification does not require loading the addon, running an installer, or
 administrator privileges.
@@ -57,7 +61,7 @@ above; weakening execution policy is not required for verification.
   GitHub rate limits, missing releases and missing digests also fail verification;
   none is treated as a successful check.
 
-## What this protects
+## Verify an immutable release
 
 For a **new immutable release**, GitHub also provides a cryptographically
 verifiable release attestation. With a current GitHub CLI, replace `TAG` and
@@ -73,6 +77,27 @@ releases in the table above, or to GitHub's automatically generated source archi
 Immutability was enabled on 9 September 2026 for future releases; it does not
 retroactively authenticate older releases. The PowerShell checker remains a
 SHA-256/size comparison, and does not claim to verify an attestation.
+
+## Verify where a CI build came from
+
+For releases that provide GitHub Actions build provenance, the release notes
+identify the source commit and build run. With a current GitHub CLI, replace
+`COMMIT_SHA` with that full commit SHA and supply the downloaded addon's path:
+
+```powershell
+gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest COMMIT_SHA --deny-self-hosted-runners
+```
+
+This checks that the file was attested by the named build workflow for that
+source commit on a GitHub-hosted runner. Release verification above answers a
+different question: whether the file matches what was published for a specific
+immutable release. Use both checks for a release that provides both attestations.
+These checks read the file without loading it. A missing or failed attestation
+does not count as verified; older releases were not built with this workflow.
+See the [GitHub CLI documentation](https://cli.github.com/manual/gh_attestation_verify)
+for the verification options.
+
+## What this protects
 
 The trusted reference is this GitHub repository and its HTTPS API. A hash
 copied from the same untrusted download site does not establish authenticity.

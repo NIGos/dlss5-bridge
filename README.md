@@ -86,6 +86,12 @@ proxy for a build that needs it.
 
 ## Install
 
+**Download `dlss5-bridge.addon64` only from [our GitHub releases](https://github.com/NIGos/dlss5-bridge/releases).**
+Bridge has no installer and never asks you to disable antivirus protection or
+add exclusions. ReShade has its own legitimate installer, available separately
+from [reshade.me](https://reshade.me/). [Verify the Bridge file](VERIFYING-DOWNLOADS.md)
+before putting it in the game folder.
+
 Install ReShade for the correct API, then copy `dlss5-bridge.addon64` and the
 neural add-on's files into its add-on search location, normally beside the
 game executable. On first run the Bridge writes `dlss5-bridge.cfg` with defaults

@@ -5,6 +5,11 @@ Downloads are published on its [Releases page](https://github.com/NIGos/dlss5-br
 The domain `dlss5bridge.com` is not owned, operated or endorsed by this project.
 See [#30](https://github.com/NIGos/dlss5-bridge/issues/30) for the reported incident.
 
+Bridge is distributed as **`dlss5-bridge.addon64`**, without a Bridge installer.
+It never asks users to disable antivirus protection or add exclusions. ReShade
+has its own legitimate installer at [reshade.me](https://reshade.me/), separate
+from the Bridge download.
+
 Follow [Verify a Bridge download](VERIFYING-DOWNLOADS.md) before loading a file.
 A filename, version number, copied project page or in-game badge does not prove
 authenticity. A hash match checks the selected file, not other files in a package.
@@ -36,6 +41,10 @@ immutable. Check the release's actual status instead of assuming from its versio
 
 The attestation identifies what GitHub published for this repository and tag.
 It is not an independent audit of the source or proof that a binary is harmless.
+Build provenance is a separate attestation that links a file to the source
+commit and GitHub Actions workflow that produced it. Neither kind is an
+Authenticode publisher signature. Follow the verification instructions for the
+specific release; older releases do not gain these attestations retroactively.
 Current legacy binaries are unsigned with Authenticode. We do not use a
 self-signed certificate or an internal integrity badge as a substitute for
 publisher authentication.
