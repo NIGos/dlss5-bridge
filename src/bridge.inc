@@ -1470,7 +1470,8 @@ static bool BridgeBlitDepth(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D1
     ctx->CSSetShader(g_bridge.depth_cs, nullptr, 0);
     ctx->CSSetShaderResources(0, 1, &g_bridge.depth_srv);
     ctx->CSSetUnorderedAccessViews(0, 1, &g_bridge.depth_uav, &keep);
-    ctx->Dispatch((g_bridge.width + 7) / 8, (g_bridge.height + 7) / 8, 1);
+    ctx->Dispatch((g_bridge.slot_w[SLOT_DEPTH] + 7) / 8,
+                  (g_bridge.slot_h[SLOT_DEPTH] + 7) / 8, 1);
 
     // Unbind before restoring, so the shared texture is not left bound as a UAV
     // while the game's own views go back on the same slots.
@@ -1599,7 +1600,8 @@ static bool BridgeBlitMV(ID3D11DeviceContext *ctx, ID3D11Device *dev11, ID3D11Te
     ctx->CSSetShader(g_bridge.mv_cs, nullptr, 0);
     ctx->CSSetShaderResources(0, 1, &g_bridge.mv_srv);
     ctx->CSSetUnorderedAccessViews(0, 1, &g_bridge.mv_uav, &keep);
-    ctx->Dispatch((g_bridge.width + 7) / 8, (g_bridge.height + 7) / 8, 1);
+    ctx->Dispatch((g_bridge.slot_w[SLOT_MV] + 7) / 8,
+                  (g_bridge.slot_h[SLOT_MV] + 7) / 8, 1);
 
     ID3D11ShaderResourceView  *no_srv = nullptr;
     ID3D11UnorderedAccessView *no_uav = nullptr;
@@ -4552,6 +4554,16 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     ctx->CopyResource(g_bridge.tex11[SLOT_COLOR], g[SLOT_COLOR]);
     if (g_bridge.mv_converted) BridgeBlitMV(ctx, dev11, g[SLOT_MV]);
 
+    // MV conversion can disable the bridge and release its mirrors. Stop before
+    // exposure handling can recreate mirrors for a disabled bridge.
+    if (g_bridge.disabled)
+    {
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
+    }
+    if (!g_bridge.mv_converted) ctx->CopyResource(g_bridge.tex11[SLOT_MV], g[SLOT_MV]);
+
     // Mirrored per frame like the rest: it is 1x1 in every report so far, and a
     // stale exposure is as wrong as none.
     {
@@ -4577,17 +4589,6 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
         }
     }
 
-    // BridgeDisable is the one shutdown routine and releases every mirror, so
-    // anything that can reach it from inside this frame leaves the rest of the
-    // frame with null textures to barrier and copy. Checking the flag once at
-    // the top is no longer enough now that it can be set from here.
-    if (g_bridge.disabled)
-    {
-        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
-        dev11->Release();
-        return;
-    }
-    else                       ctx->CopyResource(g_bridge.tex11[SLOT_MV], g[SLOT_MV]);
     if (g_cfg.stage >= 2 && g_bridge.depth_converted)
         BridgeBlitDepth(ctx, dev11, g[SLOT_DEPTH]);
 
