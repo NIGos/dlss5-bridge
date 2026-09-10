@@ -63,7 +63,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.13-pre5"
+#define BRIDGE_VERSION "1.4.13-pre6"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -2330,7 +2330,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     }
 
     Breadcrumb("forwarding the game's DLSS evaluate");
-    const bool suppress = BridgeWillDeliver();
+    const bool suppress = BridgeWillDeliver(handle);
 
     NVSDK_NGX_Result r = NGX_SUCCESS;
     if (!suppress)

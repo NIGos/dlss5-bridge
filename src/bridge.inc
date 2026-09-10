@@ -367,12 +367,18 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
 // flags below still read healthy while the frames behind them were produced by
 // somebody else, and skipping the game on that evidence leaves the last mirrored
 // image on screen under live audio and live input.
-static bool BridgeWillDeliver()
+static bool BridgeWillDeliver(const NVSDK_NGX_Handle *handle)
 {
-    return g_source == SRC_MIRROR &&
+    EnterCriticalSection(&g_bridge_cs);
+    bool known = false;
+    for (const auto &history : g_bridge.histories)
+        if (history.feature != nullptr && history.game == handle) known = true;
+    const bool deliver = known && g_source == SRC_MIRROR &&
            g_cfg.skip_game != 0 && g_cfg.mode == 2 && g_cfg.stage >= 3 &&
            !g_bridge.disabled && !g_bridge.stalled && g_bridge.session_ready && g_bridge.frame_ready &&
            !g_bridge.partial_output && g_bridge.frames_done > 0;
+    LeaveCriticalSection(&g_bridge_cs);
+    return deliver;
 }
 
 // The add-on was called dlss5-dx11-bridge up to and including 1.1.0 -- the rename
@@ -2212,11 +2218,21 @@ static void BridgeReleaseTextures()
         if (g_bridge.tex12[i]  != nullptr) { g_bridge.tex12[i]->Release();  g_bridge.tex12[i]  = nullptr; }
         if (g_bridge.shared[i] != nullptr) { CloseHandle(g_bridge.shared[i]); g_bridge.shared[i] = nullptr; }
     }
-    if (g_bridge.feature != nullptr && g_bridge.release_feature != nullptr)
+    bool current_owned = false;
+    for (auto &history : g_bridge.histories)
+    {
+        if (history.feature != nullptr)
+        {
+            if (history.feature == g_bridge.feature) current_owned = true;
+            if (g_bridge.release_feature != nullptr) g_bridge.release_feature(history.feature);
+        }
+        history = {};
+    }
+    if (!current_owned && g_bridge.feature != nullptr && g_bridge.release_feature != nullptr)
     {
         g_bridge.release_feature(g_bridge.feature);
-        g_bridge.feature = nullptr;
     }
+    g_bridge.feature = nullptr;
     g_bridge.frame_ready = false;
 }
 
@@ -2938,6 +2954,11 @@ static bool MakeSharedPair(ID3D11Device *dev11, ID3D11Device1 *dev1, int i,
 // upscaling mode the Output texture is larger than the inputs, and the rendered
 // area is smaller than the texture that holds it.
 static void CopyUIntParam(const NVSDK_NGX_Parameter *src, const char *key, unsigned int fallback);
+static bool BridgeCreatedUInt(const char *key, unsigned int *value);
+static bool BridgeCreateUInt(const NVSDK_NGX_Parameter *gp, const char *key, unsigned int *value)
+{
+    return BridgeCreatedUInt(key, value) || (gp != nullptr && gp->Get(key, value) == NGX_SUCCESS);
+}
 
 // One field, three meanings: g_cfg.flags carries the user's forced value, -1 for
 // "copy whoever is driving", and 107 for the default this add-on shipped before
@@ -3008,6 +3029,8 @@ static unsigned int ResolveCreateFlags(const NVSDK_NGX_Parameter *gp, FlagsFrom 
     *from = FLAGS_NONE;
     return 107u;
 }
+
+static bool BridgeCreateViewFeature(const DXGI_FORMAT *fmt, const NVSDK_NGX_Parameter *gp);
 
 static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
                                  const NVSDK_NGX_Parameter *gp)
@@ -3160,6 +3183,12 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     }
     dev1->Release();
     if (!ok) { BridgeReleaseTextures(); return false; }
+    return BridgeCreateViewFeature(fmt, gp);
+}
+
+static bool BridgeCreateViewFeature(const DXGI_FORMAT *fmt, const NVSDK_NGX_Parameter *gp)
+{
+    const UINT w = g_bridge.width, h = g_bridge.height;
     // The feature is created with the game's own render and output sizes, not
     // with the texture sizes: in an upscaling mode those are not the same thing.
     g_bridge.params->Set("Width", g_bridge.render_w);
@@ -3170,15 +3199,16 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // for, and it was hardcoded to 2. That is Baldur's Gate 3's own answer
     // again -- the same mistake as the create flags, in the line above them.
     // Assetto Corsa and Gallipoli both ask for 1 and were given 2.
-    if (gp != nullptr) CopyUIntParam(gp, "PerfQualityValue", 2u);
-    else               g_bridge.params->Set("PerfQualityValue", 2);
+    unsigned int quality = 2;
+    BridgeCreateUInt(gp, "PerfQualityValue", &quality);
+    g_bridge.params->Set("PerfQualityValue", quality);
     {
         unsigned int q = 0, asked_q = 0;
         g_bridge.params->Get("PerfQualityValue", &q);
         static const char *kQ[] = { "MaxPerf", "Balanced", "MaxQuality",
                                     "UltraPerformance", "UltraQuality", "DLAA" };
         const bool have_q =
-            gp != nullptr && gp->Get("PerfQualityValue", &asked_q) == NGX_SUCCESS;
+            BridgeCreateUInt(gp, "PerfQualityValue", &asked_q);
         Log("[bridge] quality preset %u (%s), %s", q,
             q < _countof(kQ) ? kQ[q] : "unknown",
             have_q ? "copied from the game" : "the game set none, so 2 is used");
@@ -3201,7 +3231,9 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     const bool old_default = (g_cfg.flags == 107);
 
     FlagsFrom          flags_from = FLAGS_NONE;
-    const unsigned int resolved   = ResolveCreateFlags(gp, &flags_from);
+    unsigned int resolved = ResolveCreateFlags(gp, &flags_from);
+    if ((g_cfg.flags == -1 || old_default) && BridgeCreatedUInt("DLSS.Feature.Create.Flags", &resolved))
+        flags_from = FLAGS_GAME;
     const bool         copying    = (flags_from == FLAGS_GAME);
 
     g_bridge.params->Set("DLSS.Feature.Create.Flags", resolved);
@@ -3210,7 +3242,7 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         g_bridge.params->Get("DLSS.Feature.Create.Flags", &used);
         unsigned int asked = 0;
         const bool have_asked =
-            gp != nullptr && gp->Get("DLSS.Feature.Create.Flags", &asked) == NGX_SUCCESS;
+            BridgeCreateUInt(gp, "DLSS.Feature.Create.Flags", &asked);
 
         if (have_asked) LogCreateFlags("the game's create", asked);
         LogCreateFlags(kFlagsFromLabel[flags_from], used);
@@ -3258,11 +3290,9 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
     // Mirror the game's own answer where it gave one. Deus Ex: Mankind Divided
     // asks for 0 here while BG3 asks for 1, and forcing either on the other is
     // inventing part of a contract that is meant to be copied.
-    if (gp != nullptr)
-        CopyUIntParam(gp, "DLSS.Enable.Output.Subrects",
-                      static_cast<unsigned int>(g_cfg.subrects));
-    else
-        g_bridge.params->Set("DLSS.Enable.Output.Subrects", g_cfg.subrects);
+    unsigned int output_subrects = static_cast<unsigned int>(g_cfg.subrects);
+    BridgeCreateUInt(gp, "DLSS.Enable.Output.Subrects", &output_subrects);
+    g_bridge.params->Set("DLSS.Enable.Output.Subrects", output_subrects);
     // The render preset picks which DLSS model weights run, and the D3D12 feature
     // was getting NGX's default while the game's own D3D11 feature ran whatever
     // it asked for -- so the two sides upscaled with different models and the
@@ -3287,9 +3317,9 @@ static bool BridgeBuildResources(ID3D11Device *dev11, const DXGI_FORMAT *fmt,
         for (const char *k : preset_keys)
         {
             unsigned int v = 0;
-            if (gp->Get(k, &v) != NGX_SUCCESS) continue;
+            const bool present = BridgeCreateUInt(gp, k, &v);
             g_bridge.params->Set(k, v);
-            if (!g_bridge.presets_reported)
+            if (present && !g_bridge.presets_reported)
                 Log("[bridge] %s = %u, copied from the game", k, v);
         }
         g_bridge.presets_reported = true;
@@ -4004,13 +4034,35 @@ static bool BridgeEnsureExposure(ID3D11Device *dev11, ID3D11Texture2D *src)
 // frame path; both under g_bridge_cs. Eight entries, oldest replaced: a game
 // holds one or two live handles and NGX reuses freed addresses, which is why a
 // create at a known address replaces its entry rather than adding one.
-struct BridgeCreateShape { const NVSDK_NGX_Handle *handle; unsigned int w, h, ow, oh; };
+static const char *kBridgeCreateKeys[] = {
+    "DLSS.Feature.Create.Flags", "PerfQualityValue", "DLSS.Enable.Output.Subrects",
+    "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+    "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+    "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality",
+};
+struct BridgeCreateShape {
+    const NVSDK_NGX_Handle *handle;
+    unsigned int w, h, ow, oh;
+    unsigned int values[_countof(kBridgeCreateKeys)], present;
+};
 static BridgeCreateShape        g_create_shape[8];
 static int                      g_create_shape_next;
 static const NVSDK_NGX_Handle  *g_eval_handle;   // the evaluate being mirrored, set by its hook
 
+static bool BridgeCreatedUInt(const char *key, unsigned int *value)
+{
+    if (g_source != SRC_MIRROR || g_eval_handle == nullptr) return false;
+    for (const auto &shape : g_create_shape)
+        if (shape.handle == g_eval_handle)
+            for (unsigned i = 0; i < _countof(kBridgeCreateKeys); ++i)
+                if ((shape.present & (1u << i)) && strcmp(key, kBridgeCreateKeys[i]) == 0)
+                { *value = shape.values[i]; return true; }
+    return false;
+}
+
 static void BridgeNoteCreate(const NVSDK_NGX_Handle *handle, const NVSDK_NGX_Parameter *p)
 {
+    if (handle == nullptr) return;
     unsigned int w = 0, h = 0, ow = 0, oh = 0;
     if (p != nullptr)
     {
@@ -4029,7 +4081,6 @@ static void BridgeNoteCreate(const NVSDK_NGX_Handle *handle, const NVSDK_NGX_Par
                 "so the contract comes from the evaluate. Not a fault: not every engine "
                 "states it there.", w, h, ow, oh);
         }
-        return;
     }
     EnterCriticalSection(&g_bridge_cs);
     int slot = -1;
@@ -4037,6 +4088,10 @@ static void BridgeNoteCreate(const NVSDK_NGX_Handle *handle, const NVSDK_NGX_Par
         if (g_create_shape[i].handle == handle) slot = i;
     if (slot < 0) slot = g_create_shape_next++ % static_cast<int>(_countof(g_create_shape));
     g_create_shape[slot] = { handle, w, h, ow, oh };
+    if (p != nullptr)
+        for (unsigned i = 0; i < _countof(kBridgeCreateKeys); ++i)
+            if (p->Get(kBridgeCreateKeys[i], &g_create_shape[slot].values[i]) == NGX_SUCCESS)
+                g_create_shape[slot].present |= 1u << i;
     // The game replacing its feature invalidates the mirror's, whatever the
     // shape: the create flags can change with nothing else -- IsHDR when a game
     // switches its HDR on -- and until now only a size or format change
@@ -4063,6 +4118,8 @@ static bool BridgeCreateShapeOf(const NVSDK_NGX_Handle *handle, unsigned int *w,
     for (int i = 0; i < static_cast<int>(_countof(g_create_shape)); ++i)
         if (g_create_shape[i].handle == handle)
         {
+            if (!g_create_shape[i].w || !g_create_shape[i].h || !g_create_shape[i].ow || !g_create_shape[i].oh)
+                return false;
             *w = g_create_shape[i].w;   *h = g_create_shape[i].h;
             *ow = g_create_shape[i].ow; *oh = g_create_shape[i].oh;
             return true;
@@ -4103,6 +4160,47 @@ static void DumpSentParams()
         if (g_bridge.params->Get(kF[i], &v) == NGX_SUCCESS) Log("[bridge]     %-40s = %f", kF[i], v);
         else Log("[bridge]     %-40s   not set", kF[i]);
     }
+}
+
+// Under g_bridge_cs. Textures and queue stay shared; NGX's temporal state does not.
+static bool BridgeSelectHistory(const NVSDK_NGX_Parameter *gp)
+{
+    const auto *owner = g_source == SRC_MIRROR ? g_eval_handle : nullptr;
+    int free_slot = -1;
+    for (int i = 0; i < static_cast<int>(_countof(g_bridge.histories)); ++i)
+    {
+        const auto &history = g_bridge.histories[i];
+        if (history.feature != nullptr && history.game == owner)
+        {
+            g_bridge.feature = history.feature;
+            return true;
+        }
+        if (history.feature == nullptr && free_slot < 0) free_slot = i;
+    }
+    // ponytail: bounded like the create registry; additional views keep native DLSS.
+    // A future larger registry should retire histories on the game's ReleaseFeature.
+    if (free_slot < 0)
+    {
+        static bool reported = false;
+        if (!reported) { reported = true; Log("[bridge] all eight temporal histories are in use; additional game features keep their own DLSS."); }
+        return false;
+    }
+    // A resource build already created the first feature. Additional views need
+    // another feature only once, without reallocating the transport or resetting peers.
+    if (free_slot != 0)
+    {
+        g_bridge.feature = nullptr;
+        if (!BridgeCreateViewFeature(g_bridge.fmt, gp))
+        {
+            BridgeFail("view feature creation");
+            return false;
+        }
+    }
+    if (g_bridge.feature == nullptr) return false;
+    g_bridge.histories[free_slot] = { owner, g_bridge.feature };
+    Log("[bridge] temporal history: game=%p private=%p slot=%d",
+        static_cast<const void *>(owner), static_cast<void *>(g_bridge.feature), free_slot);
+    return true;
 }
 
 static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter *gp)
@@ -4525,6 +4623,13 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             dev11->Release();
             return;
         }
+    }
+
+    if (g_cfg.stage >= 3 && !BridgeSelectHistory(gp))
+    {
+        for (int i = 0; i < SLOT_COUNT; ++i) g[i]->Release();
+        dev11->Release();
+        return;
     }
 
     // If the game alternates its Color and Output textures, writing the result

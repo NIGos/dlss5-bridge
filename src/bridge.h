@@ -237,6 +237,10 @@ struct Bridge
 
     NVSDK_NGX_Parameter *params;
     NVSDK_NGX_Handle    *feature;
+    // One temporal history per game feature, sharing the ordered transport.
+    // Invalidated together when the resource shape or create contract changes.
+    struct History { const NVSDK_NGX_Handle *game; NVSDK_NGX_Handle *feature; };
+    History histories[8];
 
     // The exposure texture is kept apart from the slot array rather than made a
     // fifth slot: every SLOT_COUNT loop dereferences its entry unconditionally,
