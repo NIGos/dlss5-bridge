@@ -25,8 +25,8 @@ cd /d "%~dp0"
 rc /nologo version.rc
 if errorlevel 1 exit /b 1
 
-cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /Ireshade /LD ^
-   dlss5-bridge.cpp version.res ^
+cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /Ireshade /Iminhook\include /Iminhook\src /LD ^
+   dlss5-bridge.cpp minhook.c version.res ^
    /Fe:dlss5-bridge.addon64 ^
    /link /DLL user32.lib advapi32.lib bcrypt.lib
 if errorlevel 1 exit /b 1
