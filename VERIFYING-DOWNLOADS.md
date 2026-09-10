@@ -23,11 +23,12 @@ Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\Users\YourName\Downloads\dlss5-b
 
 Compare the whole hash, ignoring letter case, with the matching release below.
 These values were checked against downloaded official GitHub assets on
-9 September 2026. **The tag must match the release you intended to download.**
+10 September 2026. **The tag must match the release you intended to download.**
 
 | Release | Asset bytes | SHA-256 of `dlss5-bridge.addon64` |
 | --- | ---: | --- |
 | [v1.4.12 — stable](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12) | 508928 | `4f2acecc1026ae89ac0b92767be66ceea2662ad0ef88710b89c7da7840d548d4` |
+| [v1.4.13-pre6](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre6) | 533504 | `11278e8afbcf81cd545e64d0fe8339ae830f5636d33fa998554076a96eef8a93` |
 | [v1.4.13-pre5](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre5) | 530944 | `100fa93e597df0803a7edff24d89b47dbbaee11fd3a06d26ce8107e317a66b71` |
 | [v1.4.13-pre4](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre4) | 513024 | `710e5354c42ae3491c9523576c82805d0c42383836525f3d3d02a31ffa9f9d2f` |
 | [v1.4.13-pre3](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre3) | 508928 | `3dc81b261377c936c22cf8589d96cb0be8b18b8de90d1cea5ba83e9bca763717` |
@@ -65,8 +66,8 @@ above; weakening execution policy is not required for verification.
 
 ## Verify an immutable release
 
-**All seven releases in the table above are immutable and have verified release
-attestations.** Pre4 and pre5 were published as immutable releases. The five older
+**All eight releases in the table above are immutable and have verified release
+attestations.** Pre4, pre5 and pre6 were published as immutable releases. The five older
 releases became immutable when their notes were updated on 9 September 2026;
 their original tags, publication dates and addon hashes were preserved.
 
@@ -87,7 +88,7 @@ attestation.
 
 ## Verify where a CI build came from
 
-**Pre4 and pre5 have GitHub Actions build provenance.** Their addons come from
+**Pre4, pre5 and pre6 have GitHub Actions build provenance.** Their addons come from
 the official build workflow on GitHub-hosted runners; pre4 was the first release
 published this way.
 
