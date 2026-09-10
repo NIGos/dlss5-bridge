@@ -31,7 +31,7 @@ development:
 
 Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://github.com/NIGos/dlss5-bridge/releases).
 
-**Release status (9 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
+**Release status (10 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
 remains the stable release. `main` contains the cumulative 1.4.13 prerelease
 changes and the [D3D11 depth/MV conversion fix](https://github.com/NIGos/dlss5-bridge/pull/34).
 The latest test build, [v1.4.13-pre5](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre5),
@@ -42,9 +42,14 @@ the Bridge's private device, and clears obsolete hooks when an NGX module unload
 Pre5 includes all pre4 changes and has verified GitHub Actions build provenance.
 It is still unsigned; follow the
 [download verification instructions](VERIFYING-DOWNLOADS.md) before loading it.
-BG3 split-screen rendering remains open. The [BG3 FG reporter](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5609017168)
+On `main`, distinct D3D11 DLSS features now keep separate temporal histories,
+including same-sized split-screen views. Background Gym tests reproduce the
+shared-history defect in pre5 and pass with the correction; confirmation in BG3
+is still needed. BG3 split-screen rendering remains open. The [BG3 FG reporter](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5609017168)
 confirmed neural output, but also tested local hook changes and newer Streamline
 files; flickering/ghosting and general hook coexistence remain under investigation.
+The [Endfield reporter](https://github.com/NIGos/dlss5-bridge/issues/27#issuecomment-5609207523)
+confirmed DLAA + MFG 4x + neural rendering working together on pre5.
 The Endfield mirror slowdown
 remains unresolved; the FG startup fix does not establish an FPS improvement.
 

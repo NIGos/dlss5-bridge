@@ -33,6 +33,9 @@ jobs:
       - name: Vulkan FG device routing (CPU)
         shell: cmd
         run: call tests\build-vulkan-fg-device-test.cmd
+      - name: D3D11 temporal history ownership (CPU)
+        shell: cmd
+        run: call tests\build-d3d11-histories-test.cmd
       - name: Record build and checksums
         shell: pwsh
         run: |
