@@ -53,7 +53,7 @@ From the folder containing that script, run:
 .\Verify-Bridge.ps1 -Path 'C:\Users\YourName\Downloads\dlss5-bridge.addon64' -ReleaseTag v1.4.12
 ```
 
-For another release, supply its tag explicitly, for example `v1.4.13-pre5`.
+For another release, supply its tag explicitly, for example `v1.4.13-pre6`.
 If PowerShell blocks the downloaded script, use the manual hash comparison
 above; weakening execution policy is not required for verification.
 
@@ -94,6 +94,7 @@ published this way.
 
 | Release | Source commit | Build run |
 | --- | --- | --- |
+| pre6 | [cff6cf4da7b084dae3f870fcc60e0ef019c32944](https://github.com/NIGos/dlss5-bridge/commit/cff6cf4da7b084dae3f870fcc60e0ef019c32944) | [34502430264](https://github.com/NIGos/dlss5-bridge/actions/runs/34502430264) |
 | pre5 | [c37b670b4ce98fd412c52867666018c1f4d02745](https://github.com/NIGos/dlss5-bridge/commit/c37b670b4ce98fd412c52867666018c1f4d02745) | [34406985478](https://github.com/NIGos/dlss5-bridge/actions/runs/34406985478) |
 | pre4 | [efc5cac43adac2cca98a163afacee5ac1b16917e](https://github.com/NIGos/dlss5-bridge/commit/efc5cac43adac2cca98a163afacee5ac1b16917e) | [34342819589](https://github.com/NIGos/dlss5-bridge/actions/runs/34342819589) |
 
@@ -101,10 +102,10 @@ The five older releases in the table (**v1.4.12, pre1, pre2, pre3 and v1.3.0**)
 **do not have CI build provenance**. Their release attestations do not add it
 retroactively.
 
-To verify pre5 with a current GitHub CLI, replace only the file path:
+To verify pre6 with a current GitHub CLI, replace only the file path:
 
 ```powershell
-gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest c37b670b4ce98fd412c52867666018c1f4d02745 --deny-self-hosted-runners
+gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest cff6cf4da7b084dae3f870fcc60e0ef019c32944 --deny-self-hosted-runners
 ```
 
 This checks that the file was attested by the named build workflow for that
