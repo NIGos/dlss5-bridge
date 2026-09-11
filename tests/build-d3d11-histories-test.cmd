@@ -18,8 +18,8 @@ if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 if not exist build mkdir build
 if errorlevel 1 exit /b 1
-cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /I..\src\reshade ^
-   /Fo:build\ /Fe:build\d3d11-histories.exe d3d11-histories.cpp ^
+cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /I..\src\reshade /I..\src\minhook\include /I..\src\minhook\src ^
+   /Fo:build\ /Fe:build\d3d11-histories.exe d3d11-histories.cpp ..\src\minhook.c ^
    /link user32.lib advapi32.lib bcrypt.lib
 if errorlevel 1 exit /b 1
 if /i "%~1"=="--build-only" exit /b 0

@@ -36,6 +36,9 @@ jobs:
       - name: D3D11 temporal history ownership (CPU)
         shell: cmd
         run: call tests\build-d3d11-histories-test.cmd
+      - name: Hook concurrency and lifecycle (CPU)
+        shell: cmd
+        run: call tests\build-hook-concurrency-test.cmd
       - name: Record build and checksums
         shell: pwsh
         run: |

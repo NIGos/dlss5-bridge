@@ -1765,12 +1765,9 @@ typedef NVSDK_NGX_Result (*PFN_VkCreate1)(void *, void *, int, NVSDK_NGX_Paramet
 // g_ngx_cs OUTSIDE g_hook_cs, always in that order, so the pair is never taken
 // the other way round anywhere. The worker takes g_ngx_cs alone.
 #define VKM_FORWARD(call)                        \
+    TrampolineCallGuard call_guard_;             \
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs); \
-    EnterCriticalSection(&g_hook_cs);            \
-    HookRemove(h);                               \
     NVSDK_NGX_Result r_ = (call);                \
-    HookRestore(h);                              \
-    LeaveCriticalSection(&g_hook_cs);            \
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs); \
     return r_;
 
@@ -1778,7 +1775,8 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
                                           const NVSDK_NGX_Handle *handle,
                                           const NVSDK_NGX_Parameter *p, void *cb)
 {
-    auto fwd = reinterpret_cast<PFN_VkEvaluate>(h.target);
+    TrampolineCallGuard call_guard;
+    auto fwd = reinterpret_cast<PFN_VkEvaluate>(h.original ? h.original : h.target);
 
     // Nested: the layer above already handled this frame and is calling down
     // through NGX's own plumbing.
@@ -1856,11 +1854,7 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
     // could no longer be inside NGX at once. Order as everywhere else: g_ngx_cs
     // outside g_hook_cs, never the reverse.
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-    EnterCriticalSection(&g_hook_cs);
-    HookRemove(h);
     NVSDK_NGX_Result r = fwd(cmd, handle, p, cb);
-    HookRestore(h);
-    LeaveCriticalSection(&g_hook_cs);
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     if (n <= 5) Log("--- Vulkan EvaluateFeature #%ld returned %d ---", n, r);
@@ -1990,7 +1984,8 @@ static void VkmNoteGameCreate(int feature_id, NVSDK_NGX_Result r,
 static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
                                         NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
-    auto fwd = reinterpret_cast<PFN_VkCreate>(h.target);
+    TrampolineCallGuard call_guard;
+    auto fwd = reinterpret_cast<PFN_VkCreate>(h.original ? h.original : h.target);
     if (g_nest > 0) { VKM_FORWARD(fwd(cmd, feature_id, p, out)) }
     NestGuard nest;
 
@@ -2013,7 +2008,6 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
     // section as its evaluate -- see the note there. A create running while the
     // worker is inside its own evaluate is the same two-threads-in-one-NGX shape.
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-    EnterCriticalSection(&g_hook_cs);
     // NGX requires CreateFeature1 when multiple devices are active. The private
     // D3D12 session makes legacy Vulkan FG device inference ambiguous (#27).
     // Use the command buffer's observed owner, not the last presenting runtime.
@@ -2025,20 +2019,16 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
             if (&g_layer[i].vk_create == &h && g_layer[i].mod != nullptr &&
                 g_layer[i].vk_create1.target != nullptr)
             { named = &g_layer[i].vk_create1; break; }
-    HookRemove(h);
     NVSDK_NGX_Result r;
     if (named != nullptr)
     {
         Log("[vkmirror] creating Frame Generation through CreateFeature1 with the "
             "command buffer's VkDevice %p.", vkdev);
-        HookRemove(*named);
-        r = reinterpret_cast<PFN_VkCreate1>(named->target)(vkdev, cmd, feature_id, p, out);
-        HookRestore(*named);
+        auto fwd1 = reinterpret_cast<PFN_VkCreate1>(named->original ? named->original : named->target);
+        r = fwd1(vkdev, cmd, feature_id, p, out);
     }
     else
         r = fwd(cmd, feature_id, p, out);
-    HookRestore(h);
-    LeaveCriticalSection(&g_hook_cs);
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     Log("=== Vulkan CreateFeature #%ld returned %d, handle=%p ===", n, r,
@@ -2073,7 +2063,8 @@ static NVSDK_NGX_Result ForwardVkCreate(Hook &h, void *cmd, int feature_id,
 static NVSDK_NGX_Result ForwardVkCreate1(Hook &h, void *dev, void *cmd, int feature_id,
                                          NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
-    auto fwd = reinterpret_cast<PFN_VkCreate1>(h.target);
+    TrampolineCallGuard call_guard;
+    auto fwd = reinterpret_cast<PFN_VkCreate1>(h.original ? h.original : h.target);
     if (g_nest > 0) { VKM_FORWARD(fwd(dev, cmd, feature_id, p, out)) }
     NestGuard nest;
 
@@ -2098,11 +2089,7 @@ static NVSDK_NGX_Result ForwardVkCreate1(Hook &h, void *dev, void *cmd, int feat
     // section as its evaluate -- see the note there. A create running while the
     // worker is inside its own evaluate is the same two-threads-in-one-NGX shape.
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-    EnterCriticalSection(&g_hook_cs);
-    HookRemove(h);
     NVSDK_NGX_Result r = fwd(dev, cmd, feature_id, p, out);
-    HookRestore(h);
-    LeaveCriticalSection(&g_hook_cs);
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     Log("=== Vulkan CreateFeature1 #%ld returned %d, handle=%p ===", n, r,

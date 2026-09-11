@@ -1,7 +1,6 @@
 @echo off
 setlocal
-rem Build and run the production D3D11 conversion test. No NGX or game is used.
-rem --warp selects software D3D11; --build-only skips execution.
+rem Hook concurrency, in-flight draining, module unload and reload test.
 if defined VCVARS goto toolchain_found
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" (
@@ -20,10 +19,10 @@ cd /d "%~dp0"
 if not exist build mkdir build
 if errorlevel 1 exit /b 1
 cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /I..\src\reshade /I..\src\minhook\include /I..\src\minhook\src ^
-   /Fo:build\ /Fe:build\d3d11-conversion.exe d3d11-conversion.cpp ..\src\minhook.c ^
-   /link user32.lib advapi32.lib bcrypt.lib d3d11.lib
+   /Fo:build\ /Fe:build\hook-concurrency-test.exe hook-concurrency-test.cpp ..\src\minhook.c ^
+   /link user32.lib advapi32.lib bcrypt.lib
 if errorlevel 1 exit /b 1
 if /i "%~1"=="--build-only" exit /b 0
 cd build
-d3d11-conversion.exe %*
+hook-concurrency-test.exe
 exit /b %ERRORLEVEL%
