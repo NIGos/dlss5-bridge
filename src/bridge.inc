@@ -4197,7 +4197,8 @@ static bool BridgeSelectHistory(const NVSDK_NGX_Parameter *gp)
         }
     }
     if (g_bridge.feature == nullptr) return false;
-    g_bridge.histories[free_slot] = { owner, g_bridge.feature };
+    g_bridge.histories[free_slot] = { owner, g_bridge.feature,
+        g_bridge.render_w, g_bridge.render_h, g_bridge.ngx_out_w, g_bridge.ngx_out_h };
     Log("[bridge] temporal history: game=%p private=%p slot=%d",
         static_cast<const void *>(owner), static_cast<void *>(g_bridge.feature), free_slot);
     return true;
@@ -4547,8 +4548,16 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             gow, goh, d[SLOT_OUTPUT].Width, d[SLOT_OUTPUT].Height, output_x, output_y);
     }
 
-    bool shape_changed = (gw != g_bridge.render_w)  || (gh != g_bridge.render_h) ||
-                         (gow != g_bridge.ngx_out_w) || (goh != g_bridge.ngx_out_h);
+    // Feature dimensions belong to a view, not to the shared allocation. Two
+    // views can use different subrect heights in the same atlas (BG3 dialogs).
+    // Rebuild for a changed contract of the SAME view, never just for switching
+    // between two already valid contracts. New views get their feature below.
+    bool shape_changed = false;
+    const auto *owner = g_source == SRC_MIRROR ? g_eval_handle : nullptr;
+    for (const auto &history : g_bridge.histories)
+        if (history.feature != nullptr && history.game == owner)
+            shape_changed = history.w != gw || history.h != gh ||
+                            history.ow != gow || history.oh != goh;
     // Every slot's own size, not only Color's and Output's. Depth or motion
     // vectors changing size on their own used to move nothing here.
     for (int i = 0; i < SLOT_COUNT && !shape_changed; ++i)
@@ -4624,6 +4633,9 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
             return;
         }
     }
+
+    g_bridge.render_w = gw; g_bridge.render_h = gh;
+    g_bridge.ngx_out_w = gow; g_bridge.ngx_out_h = goh;
 
     if (g_cfg.stage >= 3 && !BridgeSelectHistory(gp))
     {
@@ -4745,6 +4757,12 @@ static void BridgeFrameInner(ID3D11DeviceContext *ctx, const NVSDK_NGX_Parameter
     g_bridge.params->Set("MotionVectors", g_bridge.tex12[SLOT_MV]);
     if (g_bridge.exp12 != nullptr)
         g_bridge.params->Set("ExposureTexture", g_bridge.exp12);
+    // The parameter block is shared too; consumers must see this view's
+    // contract rather than whichever view was created last.
+    g_bridge.params->Set("Width", g_bridge.render_w);
+    g_bridge.params->Set("Height", g_bridge.render_h);
+    g_bridge.params->Set("OutWidth", g_bridge.ngx_out_w);
+    g_bridge.params->Set("OutHeight", g_bridge.ngx_out_h);
     // Mirror the game's own subrect description rather than inventing one. In an
     // upscaling preset the rendered area is a corner of a larger texture, and
     // guessing it is what made DLSS Quality produce a soft, effect-free image.
