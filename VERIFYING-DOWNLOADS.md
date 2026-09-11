@@ -23,11 +23,12 @@ Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\Users\YourName\Downloads\dlss5-b
 
 Compare the whole hash, ignoring letter case, with the matching release below.
 These values were checked against downloaded official GitHub assets on
-10 September 2026. **The tag must match the release you intended to download.**
+9–11 September 2026. **The tag must match the release you intended to download.**
 
 | Release | Asset bytes | SHA-256 of `dlss5-bridge.addon64` |
 | --- | ---: | --- |
 | [v1.4.12 — stable](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12) | 508928 | `4f2acecc1026ae89ac0b92767be66ceea2662ad0ef88710b89c7da7840d548d4` |
+| [v1.4.13-pre7](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre7) | 534016 | `f16a12f0e1e33645de60e2854f0129032e26298ae054d865604fddfe2ba2f964` |
 | [v1.4.13-pre6](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre6) | 533504 | `11278e8afbcf81cd545e64d0fe8339ae830f5636d33fa998554076a96eef8a93` |
 | [v1.4.13-pre5](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre5) | 530944 | `100fa93e597df0803a7edff24d89b47dbbaee11fd3a06d26ce8107e317a66b71` |
 | [v1.4.13-pre4](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre4) | 513024 | `710e5354c42ae3491c9523576c82805d0c42383836525f3d3d02a31ffa9f9d2f` |
@@ -53,7 +54,7 @@ From the folder containing that script, run:
 .\Verify-Bridge.ps1 -Path 'C:\Users\YourName\Downloads\dlss5-bridge.addon64' -ReleaseTag v1.4.12
 ```
 
-For another release, supply its tag explicitly, for example `v1.4.13-pre6`.
+For another release, supply its tag explicitly, for example `v1.4.13-pre7`.
 If PowerShell blocks the downloaded script, use the manual hash comparison
 above; weakening execution policy is not required for verification.
 
@@ -66,8 +67,8 @@ above; weakening execution policy is not required for verification.
 
 ## Verify an immutable release
 
-**All eight releases in the table above are immutable and have verified release
-attestations.** Pre4, pre5 and pre6 were published as immutable releases. The five older
+**All nine releases in the table above are immutable and have verified release
+attestations.** Pre4, pre5, pre6 and pre7 were published as immutable releases. The five older
 releases became immutable when their notes were updated on 9 September 2026;
 their original tags, publication dates and addon hashes were preserved.
 
@@ -88,12 +89,13 @@ attestation.
 
 ## Verify where a CI build came from
 
-**Pre4, pre5 and pre6 have GitHub Actions build provenance.** Their addons come from
+**Pre4, pre5, pre6 and pre7 have GitHub Actions build provenance.** Their addons come from
 the official build workflow on GitHub-hosted runners; pre4 was the first release
 published this way.
 
 | Release | Source commit | Build run |
 | --- | --- | --- |
+| pre7 | [b990798dfeda712d5b2b155650be11d92a38c2ee](https://github.com/NIGos/dlss5-bridge/commit/b990798dfeda712d5b2b155650be11d92a38c2ee) | [34618968352](https://github.com/NIGos/dlss5-bridge/actions/runs/34618968352) |
 | pre6 | [cff6cf4da7b084dae3f870fcc60e0ef019c32944](https://github.com/NIGos/dlss5-bridge/commit/cff6cf4da7b084dae3f870fcc60e0ef019c32944) | [34502430264](https://github.com/NIGos/dlss5-bridge/actions/runs/34502430264) |
 | pre5 | [c37b670b4ce98fd412c52867666018c1f4d02745](https://github.com/NIGos/dlss5-bridge/commit/c37b670b4ce98fd412c52867666018c1f4d02745) | [34406985478](https://github.com/NIGos/dlss5-bridge/actions/runs/34406985478) |
 | pre4 | [efc5cac43adac2cca98a163afacee5ac1b16917e](https://github.com/NIGos/dlss5-bridge/commit/efc5cac43adac2cca98a163afacee5ac1b16917e) | [34342819589](https://github.com/NIGos/dlss5-bridge/actions/runs/34342819589) |
@@ -102,10 +104,10 @@ The five older releases in the table (**v1.4.12, pre1, pre2, pre3 and v1.3.0**)
 **do not have CI build provenance**. Their release attestations do not add it
 retroactively.
 
-To verify pre6 with a current GitHub CLI, replace only the file path:
+To verify pre7 with a current GitHub CLI, replace only the file path:
 
 ```powershell
-gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest cff6cf4da7b084dae3f870fcc60e0ef019c32944 --deny-self-hosted-runners
+gh attestation verify 'C:\path\dlss5-bridge.addon64' --repo NIGos/dlss5-bridge --hostname github.com --signer-workflow NIGos/dlss5-bridge/.github/workflows/verify-download-checker.yml --source-ref refs/heads/main --source-digest b990798dfeda712d5b2b155650be11d92a38c2ee --deny-self-hosted-runners
 ```
 
 This checks that the file was attested by the named build workflow for that

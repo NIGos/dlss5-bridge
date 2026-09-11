@@ -31,21 +31,24 @@ development:
 
 Releases and their notes: [github.com/NIGos/dlss5-bridge/releases](https://github.com/NIGos/dlss5-bridge/releases).
 
-**Release status (10 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
+**Release status (11 September 2026).** [v1.4.12](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.12)
 remains the stable release. `main` contains the cumulative 1.4.13 prerelease
 changes and the [D3D11 depth/MV conversion fix](https://github.com/NIGos/dlss5-bridge/pull/34).
-The latest test build, [v1.4.13-pre6](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre6),
+The latest test build, [v1.4.13-pre7](https://github.com/NIGos/dlss5-bridge/releases/tag/v1.4.13-pre7),
 also fixes a Vulkan Frame Generation startup failure
 reported in [Endfield](https://github.com/NIGos/dlss5-bridge/issues/27#issuecomment-5606803978):
 it supplies the command buffer's device when NGX cannot infer one alongside
 the Bridge's private device, and clears obsolete hooks when an NGX module unloads.
-Pre6 includes all pre5 changes and has verified GitHub Actions build provenance.
+Pre7 includes all pre6 changes and has verified GitHub Actions build provenance.
 It is still unsigned; follow the
 [download verification instructions](VERIFYING-DOWNLOADS.md) before loading it.
-Pre6 also gives distinct D3D11 DLSS features separate temporal histories,
-including same-sized split-screen views. Background Gym tests reproduce the
-shared-history defect in pre5 and pass with the correction; confirmation in BG3
-is still needed. BG3 split-screen rendering remains open. The [BG3 FG reporter](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5609017168)
+Pre6 separated D3D11 temporal histories and the BG3 reporter confirmed that
+shimmering was fixed. Pre7 additionally avoids rebuilding shared textures when
+split-screen views have different heights. The official build passes the
+unequal-height Gym test with neural rendering active; confirmation of the
+stutter/shutdown fix in BG3 is still pending. Neural rendering reaching only one
+BG3 viewport remains open ([#12](https://github.com/NIGos/dlss5-bridge/issues/12)).
+The [BG3 FG reporter](https://github.com/NIGos/dlss5-bridge/issues/28#issuecomment-5609017168)
 confirmed neural output, but also tested local hook changes and newer Streamline
 files; flickering/ghosting and general hook coexistence remain under investigation.
 The [Endfield reporter](https://github.com/NIGos/dlss5-bridge/issues/27#issuecomment-5609207523)
