@@ -497,6 +497,7 @@ struct Layer
     Hook    vk_eval_c;
     Hook    vk_create;
     Hook    vk_create1;
+    bool    pending_retirement = false;
 };
 
 // Whether the Vulkan mirror is switched on, read once at attach out of
@@ -633,7 +634,15 @@ static bool HookInstall(Hook &h, void *target, void *detour)
     st = MH_EnableHook(at);
     if (st != MH_OK)
     {
-        Log("    MH_EnableHook to %p failed with status %d", at, st);
+        for (int retry = 0; retry < 3 && st != MH_OK; ++retry)
+        {
+            Sleep(10);
+            st = MH_EnableHook(at);
+        }
+    }
+    if (st != MH_OK)
+    {
+        Log("    MH_EnableHook to %p failed with status %d (win32 error %lu)", at, st, GetLastError());
         MH_RemoveHook(at);
         h.active = false;
         h.original = nullptr;
@@ -665,13 +674,6 @@ static void HookRetire(Hook &h)
 {
     if (!h.target) return;
     h.active = false;
-    if (!WaitForInFlightTrampolineCalls(2000))
-    {
-        Log("    [hook] trampoline wait timed out for retire of %p (%ld in flight); "
-            "leaving trampoline allocated to prevent use-after-free",
-            h.target, InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0));
-        return;
-    }
     MH_RetireHook(h.target);
     h.original = nullptr;
     h.target = nullptr;
@@ -2462,6 +2464,7 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
         DumpInt(p, "DLSS.Enable.Output.Subrects");
     }
 
+
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
     NVSDK_NGX_Result r = fwd(ctx, feature_id, p, out);
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
@@ -2610,6 +2613,7 @@ static bool IsFillerStub(const void *fn)
     return true;
 }
 
+static volatile bool g_shutting_down = false;
 
 static int HookNewNgxModules()
 {
@@ -2628,6 +2632,7 @@ static int HookNewNgxModules()
     const DWORD count = needed / sizeof(HMODULE);
     for (DWORD i = 0; i < count; ++i)
     {
+        if (g_shutting_down) break;
         if (g_layer_count >= kMaxLayers)
         {
             static bool said = false;
@@ -2673,7 +2678,27 @@ static int HookNewNgxModules()
 
         bool known = AlreadyRejected(mods[i]);
         for (LONG k = 0; k < g_layer_count && !known; ++k)
-            known = (g_layer[k].mod == mods[i]);
+        {
+            if (g_layer[k].mod == mods[i])
+            {
+                if (g_layer[k].pending_retirement)
+                {
+                    WaitForInFlightTrampolineCalls(2000);
+                    HookRetire(g_layer[k].eval);
+                    HookRetire(g_layer[k].eval_c);
+                    HookRetire(g_layer[k].create);
+                    HookRetire(g_layer[k].vk_eval);
+                    HookRetire(g_layer[k].vk_eval_c);
+                    HookRetire(g_layer[k].vk_create);
+                    HookRetire(g_layer[k].vk_create1);
+                    g_layer[k] = {};
+                }
+                else
+                {
+                    known = true;
+                }
+            }
+        }
         if (known) continue;
 
         wchar_t path[MAX_PATH] = {};
@@ -3342,6 +3367,7 @@ static void WarnIfOldCopyLoaded()
 // the hooks are in, and everything it does before that is a name lookup.
 static void TryInstallHooks()
 {
+    if (g_shutting_down) return;
     // Not "once and done" any more. The game's own exports are present from the
     // start, but the feature snippet underneath only shows up when DLSS
     // initialises, so every load is another chance to find a layer.
@@ -3360,7 +3386,7 @@ static void TryInstallHooks()
     if (!TryEnterCriticalSection(&g_hook_cs)) return;
     const int added = HookNewNgxModules();
     LeaveCriticalSection(&g_hook_cs);
-    if (added == 0) return;
+    if (added == 0 || g_shutting_down) return;
 
     if (InterlockedCompareExchange(&g_hooks_installed, 1, 0) != 0) return;
 
@@ -3455,6 +3481,7 @@ static void RetractIdleNote()
 // all keeps loading DLLs.
 static void ReportIdle()
 {
+    if (g_shutting_down) return;
     if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0 &&
         g_deferred_exe == nullptr) return;
     if (g_eval_count != 0) return;
@@ -3514,6 +3541,8 @@ static void NameHookedLayerAt(const void *base, wchar_t *out, size_t cch)
                          L"NGX layer %ld, no longer a registered module", i);
 }
 
+static void TriggerHookScan();
+
 static void ForgetUnloadedLayer(const void *base)
 {
     if (base == nullptr) return;
@@ -3526,49 +3555,140 @@ static void ForgetUnloadedLayer(const void *base)
         if (g_layer[i].mod == nullptr ||
             static_cast<const void *>(g_layer[i].mod) != base) continue;
 
-        HookRetire(g_layer[i].eval);
-        HookRetire(g_layer[i].eval_c);
-        HookRetire(g_layer[i].create);
-        HookRetire(g_layer[i].vk_eval);
-        HookRetire(g_layer[i].vk_eval_c);
-        HookRetire(g_layer[i].vk_create);
-        HookRetire(g_layer[i].vk_create1);
+        // Mark hooks inactive immediately so future calls bypass the module
+        // whose memory is being unmapped.
+        g_layer[i].eval.active = false;
+        g_layer[i].eval_c.active = false;
+        g_layer[i].create.active = false;
+        g_layer[i].vk_eval.active = false;
+        g_layer[i].vk_eval_c.active = false;
+        g_layer[i].vk_create.active = false;
+        g_layer[i].vk_create1.active = false;
 
-        g_layer[i] = {};
-        Log("NGX layer %ld has been unloaded; its hooks are retired from MinHook and "
-            "dropped rather than called into or written back to memory that is gone.", i);
+        if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0)
+        {
+            // Zero calls in flight: retire hooks and clear layer immediately without waiting.
+            HookRetire(g_layer[i].eval);
+            HookRetire(g_layer[i].eval_c);
+            HookRetire(g_layer[i].create);
+            HookRetire(g_layer[i].vk_eval);
+            HookRetire(g_layer[i].vk_eval_c);
+            HookRetire(g_layer[i].vk_create);
+            HookRetire(g_layer[i].vk_create1);
+
+            g_layer[i] = {};
+            Log("NGX layer %ld has been unloaded; its hooks are retired from MinHook and "
+                "dropped rather than called into or written back to memory that is gone.", i);
+        }
+        else
+        {
+            // In-flight calls active: do NOT wait under loader lock and do NOT wipe the record.
+            // Preserves target, original pointers and MinHook entries so active callers finish safely.
+            g_layer[i].pending_retirement = true;
+            Log("NGX layer %ld has been unloaded; in-flight calls active, retirement deferred outside loader lock.", i);
+        }
+    }
+    LeaveCriticalSection(&g_hook_cs);
+
+    TriggerHookScan();
+}
+
+static volatile LONG g_worker_running = 0;
+static volatile bool g_watching_ngx = false;
+
+static void ProcessPendingRetirements()
+{
+    bool has_pending = false;
+    EnterCriticalSection(&g_hook_cs);
+    for (LONG i = 0; i < g_layer_count; ++i)
+    {
+        if (g_layer[i].pending_retirement)
+        {
+            has_pending = true;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_hook_cs);
+
+    if (!has_pending) return;
+
+    // Drain in-flight calls outside the lock with a short wait:
+    if (!WaitForInFlightTrampolineCalls(50))
+    {
+        Log("NGX layer retirement deferred; %ld in-flight calls still active.",
+            InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0));
+        return;
+    }
+
+    EnterCriticalSection(&g_hook_cs);
+    if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0)
+    {
+        for (LONG i = 0; i < g_layer_count; ++i)
+        {
+            if (!g_layer[i].pending_retirement) continue;
+
+            HookRetire(g_layer[i].eval);
+            HookRetire(g_layer[i].eval_c);
+            HookRetire(g_layer[i].create);
+            HookRetire(g_layer[i].vk_eval);
+            HookRetire(g_layer[i].vk_eval_c);
+            HookRetire(g_layer[i].vk_create);
+            HookRetire(g_layer[i].vk_create1);
+
+            g_layer[i] = {};
+            Log("NGX layer %ld retirement finalized.", i);
+        }
     }
     LeaveCriticalSection(&g_hook_cs);
 }
 
-static volatile LONG g_worker_running = 0;
-static volatile bool g_shutting_down = false;
+static HANDLE g_worker_thread = nullptr;
 
 static DWORD WINAPI HookWorkerProc(LPVOID)
 {
-    // Execute scans as long as requests arrive while outside the loader lock.
-    do {
-        if (g_shutting_down) break;
-        g_scan_pending = false;
-        TryInstallHooks();
-        ReportIdle();
-    } while (g_scan_pending && !g_shutting_down);
+    for (;;)
+    {
+        while (g_scan_pending && !g_shutting_down)
+        {
+            g_scan_pending = false;
+            ProcessPendingRetirements();
+            TryInstallHooks();
+            ReportIdle();
+        }
 
-    InterlockedExchange(&g_worker_running, 0);
+        ProcessPendingRetirements();
+
+        InterlockedExchange(&g_worker_running, 0);
+
+        if (g_scan_pending && !g_shutting_down)
+        {
+            if (InterlockedCompareExchange(&g_worker_running, 1, 0) == 0)
+            {
+                continue;
+            }
+        }
+        break;
+    }
     return 0;
 }
 
 static void TriggerHookScan()
 {
     g_scan_pending = true;
-    if (g_shutting_down) return;
+    if (!g_watching_ngx || g_shutting_down) return;
 
     if (InterlockedCompareExchange(&g_worker_running, 1, 0) == 0)
     {
+        if (g_worker_thread != nullptr)
+        {
+            CloseHandle(g_worker_thread);
+            g_worker_thread = nullptr;
+        }
+
         HANDLE t = CreateThread(nullptr, 0, HookWorkerProc, nullptr, 0, nullptr);
         if (t != nullptr)
         {
-            CloseHandle(t);
+            g_worker_thread = t;
         }
         else
         {
@@ -3595,6 +3715,7 @@ static void CALLBACK OnDllLoaded(ULONG reason, const void *data, void *)
 
 static void StartWatchingForNgx()
 {
+    g_watching_ngx = true;
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
     auto reg = nt != nullptr ? reinterpret_cast<PFN_LdrRegisterDllNotification>(
         GetProcAddress(nt, "LdrRegisterDllNotification")) : nullptr;
@@ -3610,11 +3731,22 @@ static void StartWatchingForNgx()
 
 static void StopWatchingForNgx()
 {
+    g_watching_ngx = false;
     g_shutting_down = true;
     if (g_ldr_cookie != nullptr && g_ldr_unregister != nullptr)
     {
         g_ldr_unregister(g_ldr_cookie);
         g_ldr_cookie = nullptr;
+    }
+    // Allow any active worker scan pass to complete cleanly outside loader lock:
+    for (int i = 0; i < 50 && InterlockedCompareExchange(&g_worker_running, 0, 0) != 0; ++i)
+    {
+        Sleep(1);
+    }
+    if (g_worker_thread != nullptr)
+    {
+        CloseHandle(g_worker_thread);
+        g_worker_thread = nullptr;
     }
 }
 
@@ -4092,9 +4224,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // the same stakes, on ReShade's own command buffer rather than the game's.
         SynthVkParkStop();
 
-        for (int w = 0; w < 200 && InterlockedCompareExchange(&g_worker_running, 0, 0) != 0; ++w)
-            Sleep(1);
-
         EnterCriticalSection(&g_hook_cs);
         for (LONG i = 0; i < g_layer_count; ++i)
         {
@@ -4112,17 +4241,27 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         {
             for (LONG i = 0; i < g_layer_count; ++i)
             {
-                HookRemove(g_layer[i].eval);
-                HookRemove(g_layer[i].eval_c);
-                HookRemove(g_layer[i].create);
-                HookRemove(g_layer[i].vk_eval);
-                HookRemove(g_layer[i].vk_eval_c);
-                HookRemove(g_layer[i].vk_create);
-                HookRemove(g_layer[i].vk_create1);
-                g_layer[i].eval.active = g_layer[i].eval_c.active =
-                    g_layer[i].create.active = false;
-                g_layer[i].vk_eval.active = g_layer[i].vk_eval_c.active =
-                    g_layer[i].vk_create.active = g_layer[i].vk_create1.active = false;
+                if (g_layer[i].pending_retirement)
+                {
+                    HookRetire(g_layer[i].eval);
+                    HookRetire(g_layer[i].eval_c);
+                    HookRetire(g_layer[i].create);
+                    HookRetire(g_layer[i].vk_eval);
+                    HookRetire(g_layer[i].vk_eval_c);
+                    HookRetire(g_layer[i].vk_create);
+                    HookRetire(g_layer[i].vk_create1);
+                }
+                else
+                {
+                    HookRemove(g_layer[i].eval);
+                    HookRemove(g_layer[i].eval_c);
+                    HookRemove(g_layer[i].create);
+                    HookRemove(g_layer[i].vk_eval);
+                    HookRemove(g_layer[i].vk_eval_c);
+                    HookRemove(g_layer[i].vk_create);
+                    HookRemove(g_layer[i].vk_create1);
+                }
+                g_layer[i] = {};
             }
             MH_Uninitialize();
         }

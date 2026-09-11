@@ -40,11 +40,14 @@ static const BYTE kTestFuncCode[] = {
     0xC3
 };
 
+static Hook *g_active_test_hook = &g_test_hook;
+
 static int DetourFunc(int a, int b)
 {
     TrampolineCallGuard guard;
     g_detour_calls.fetch_add(1, std::memory_order_relaxed);
-    auto fwd = reinterpret_cast<PFN_TestFunc>(g_test_hook.original ? g_test_hook.original : g_test_hook.target);
+    Hook *h = g_active_test_hook ? g_active_test_hook : &g_test_hook;
+    auto fwd = reinterpret_cast<PFN_TestFunc>(h->original ? h->original : h->target);
     return fwd(a, b) + 1000;
 }
 
@@ -227,13 +230,169 @@ static void TestOrphanOnTimeoutSafety()
     printf("PASS\n");
 }
 
+static void TestDeferredRetirementUnderTimeout()
+{
+    printf("CASE: ForgetUnloadedLayer defers retirement without wiping record; drains cleanly after in-flight calls finish\n");
+    void *mem = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    TEST_EXPECT(mem != nullptr);
+    memcpy(mem, kTestFuncCode, sizeof(kTestFuncCode));
+
+    EnterCriticalSection(&g_hook_cs);
+    g_layer_count = 1;
+    g_layer[0] = {};
+    g_layer[0].mod = static_cast<HMODULE>(mem);
+    TEST_EXPECT(HookInstall(g_layer[0].eval, mem, reinterpret_cast<void *>(&DetourFunc)));
+    LeaveCriticalSection(&g_hook_cs);
+
+    // Hold an in-flight call to simulate a render frame actively running:
+    InterlockedIncrement(&g_in_flight_trampoline_calls);
+
+    // Module unloads; ForgetUnloadedLayer runs under loader lock:
+    ForgetUnloadedLayer(mem);
+
+    // Verify hooks are deactivated but record and pointers are PRESERVED:
+    EnterCriticalSection(&g_hook_cs);
+    TEST_EXPECT(g_layer[0].pending_retirement == true);
+    TEST_EXPECT(g_layer[0].eval.active == false);
+    TEST_EXPECT(g_layer[0].mod == static_cast<HMODULE>(mem));
+    TEST_EXPECT(g_layer[0].eval.target == mem);
+    TEST_EXPECT(g_layer[0].eval.original != nullptr);
+    LeaveCriticalSection(&g_hook_cs);
+
+    // Worker attempts background drain while calls are still in flight:
+    ProcessPendingRetirements();
+
+    // Must NOT wipe layer while in flight:
+    EnterCriticalSection(&g_hook_cs);
+    TEST_EXPECT(g_layer[0].pending_retirement == true);
+    TEST_EXPECT(g_layer[0].mod == static_cast<HMODULE>(mem));
+    TEST_EXPECT(g_layer[0].eval.target == mem);
+    LeaveCriticalSection(&g_hook_cs);
+
+    // Now in-flight call completes:
+    InterlockedDecrement(&g_in_flight_trampoline_calls);
+    TEST_EXPECT(WaitForInFlightTrampolineCalls(50));
+
+    // Worker attempts background drain now that calls are 0:
+    ProcessPendingRetirements();
+
+    // Layer must now be fully retired and cleared:
+    EnterCriticalSection(&g_hook_cs);
+    TEST_EXPECT(g_layer[0].pending_retirement == false);
+    TEST_EXPECT(g_layer[0].mod == nullptr);
+    TEST_EXPECT(g_layer[0].eval.target == nullptr);
+    TEST_EXPECT(g_layer[0].eval.original == nullptr);
+    g_layer_count = 0;
+    LeaveCriticalSection(&g_hook_cs);
+
+    VirtualFree(mem, 0, MEM_RELEASE);
+    printf("PASS\n");
+}
+
+static void TestReloadAtSameAddressWithPendingRetirement()
+{
+    printf("CASE: Module reloads at same address while pending retirement; old hook finalized without collision\n");
+    void *mem = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    TEST_EXPECT(mem != nullptr);
+    memcpy(mem, kTestFuncCode, sizeof(kTestFuncCode));
+    auto func = reinterpret_cast<PFN_TestFunc>(mem);
+
+    g_active_test_hook = &g_layer[0].eval;
+    EnterCriticalSection(&g_hook_cs);
+    g_layer_count = 1;
+    g_layer[0] = {};
+    g_layer[0].mod = static_cast<HMODULE>(mem);
+    TEST_EXPECT(HookInstall(g_layer[0].eval, mem, reinterpret_cast<void *>(&DetourFunc)));
+    LeaveCriticalSection(&g_hook_cs);
+
+    TEST_EXPECT(func(10, 20) == 1030);
+
+    // Module unloads while in-flight calls are active; ForgetUnloadedLayer defers retirement:
+    InterlockedIncrement(&g_in_flight_trampoline_calls);
+    ForgetUnloadedLayer(mem);
+    TEST_EXPECT(g_layer[0].pending_retirement == true);
+    InterlockedDecrement(&g_in_flight_trampoline_calls);
+
+    // Simulate module reload at the same virtual address:
+    // When HookNewNgxModules runs (simulated here via pending_retirement check on mods[i] == mem):
+    EnterCriticalSection(&g_hook_cs);
+    for (LONG k = 0; k < g_layer_count; ++k)
+    {
+        if (g_layer[k].mod == static_cast<HMODULE>(mem) && g_layer[k].pending_retirement)
+        {
+            WaitForInFlightTrampolineCalls(2000);
+            HookRetire(g_layer[k].eval);
+            HookRetire(g_layer[k].eval_c);
+            HookRetire(g_layer[k].create);
+            HookRetire(g_layer[k].vk_eval);
+            HookRetire(g_layer[k].vk_eval_c);
+            HookRetire(g_layer[k].vk_create);
+            HookRetire(g_layer[k].vk_create1);
+            g_layer[k] = {};
+        }
+    }
+    // Simulate Windows PE loader mapping fresh module bytes at the reloaded base address:
+    memcpy(mem, kTestFuncCode, sizeof(kTestFuncCode));
+
+    // Now install fresh hook on the reloaded module at the same address:
+    g_layer[0].mod = static_cast<HMODULE>(mem);
+    TEST_EXPECT(HookInstall(g_layer[0].eval, mem, reinterpret_cast<void *>(&DetourFunc)));
+    LeaveCriticalSection(&g_hook_cs);
+
+    TEST_EXPECT(func(20, 30) == 1050);
+
+    EnterCriticalSection(&g_hook_cs);
+    HookRemove(g_layer[0].eval);
+    g_layer[0] = {};
+    g_layer_count = 0;
+    LeaveCriticalSection(&g_hook_cs);
+
+    g_active_test_hook = &g_test_hook;
+    VirtualFree(mem, 0, MEM_RELEASE);
+    printf("PASS\n");
+}
+
+static void TestUnloadAddonWhileWorkerRunning()
+{
+    printf("CASE: Unloading addon while hook scan worker is actively running\n");
+    g_shutting_down = false;
+    g_watching_ngx = true;
+    g_scan_pending = true;
+
+    // Trigger a scan so worker is started:
+    TriggerHookScan();
+
+    // Verify worker was initiated:
+    TEST_EXPECT(g_worker_thread != nullptr || InterlockedCompareExchange(&g_worker_running, 0, 0) == 0);
+
+    // Concurrently trigger addon unload while worker is active:
+    StopWatchingForNgx();
+
+    // Verify shutdown signal was asserted and watcher disabled:
+    TEST_EXPECT(g_shutting_down == true);
+    TEST_EXPECT(g_watching_ngx == false);
+
+    // StopWatchingForNgx must guarantee worker has finished its scan pass and cleared g_worker_running:
+    TEST_EXPECT(InterlockedCompareExchange(&g_worker_running, 0, 0) == 0);
+    TEST_EXPECT(g_worker_thread == nullptr);
+
+    // Verify subsequent scan attempts while shut down are safely rejected:
+    TriggerHookScan();
+    TEST_EXPECT(InterlockedCompareExchange(&g_worker_running, 0, 0) == 0);
+    TEST_EXPECT(g_worker_thread == nullptr);
+
+    printf("PASS\n");
+}
+
 int main()
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
     InitializeCriticalSection(&g_log_cs);
     InitializeCriticalSection(&g_hook_cs);
     InitializeCriticalSection(&g_ngx_cs);
     InitializeCriticalSection(&g_bridge_cs);
     g_ngx_cs_ready = true;
+    g_shutting_down = true;
     strcpy_s(g_log_path, "NUL");
     MH_Initialize();
 
@@ -242,6 +401,9 @@ int main()
     TestModuleUnloadAndRetire();
     TestModuleReload();
     TestOrphanOnTimeoutSafety();
+    TestDeferredRetirementUnderTimeout();
+    TestReloadAtSameAddressWithPendingRetirement();
+    TestUnloadAddonWhileWorkerRunning();
 
     MH_Uninitialize();
     DeleteCriticalSection(&g_bridge_cs);

@@ -404,7 +404,10 @@ static MH_STATUS EnableHookLL(UINT pos, BOOL enable)
     }
 
     if (!VirtualProtect(pPatchTarget, patchSize, PAGE_EXECUTE_READWRITE, &oldProtect))
-        return MH_ERROR_MEMORY_PROTECT;
+    {
+        if (!VirtualProtect(pPatchTarget, patchSize, PAGE_EXECUTE_WRITECOPY, &oldProtect))
+            return MH_ERROR_MEMORY_PROTECT;
+    }
 
     if (enable)
     {
