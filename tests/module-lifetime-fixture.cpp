@@ -1,6 +1,7 @@
 #include "../src/module-lifetime.h"
 #include <MinHook.h>
 static HANDLE gate, finished, detached;
+static void (*detach_callback)();
 static int (*original)(int, int);
 static int Detour(int a, int b) { return original(a, b) + 100; }
 static DWORD WINAPI Worker(LPVOID owner)
@@ -19,6 +20,10 @@ extern "C" __declspec(dllexport) BOOL Pin(HANDLE unload)
     detached = unload;
     return PinHookModule(reinterpret_cast<const void *>(&Pin));
 }
+extern "C" __declspec(dllexport) void SetDetachCallback(void (*callback)())
+{
+    detach_callback = callback;
+}
 extern "C" __declspec(dllexport) BOOL Install(void *target)
 {
     return MH_Initialize() == MH_OK &&
@@ -31,6 +36,7 @@ extern "C" __declspec(dllexport) BOOL Remove(void *target)
 }
 BOOL WINAPI DllMain(HMODULE, DWORD reason, LPVOID)
 {
+    if (reason == DLL_PROCESS_DETACH && detach_callback) detach_callback();
     if (reason == DLL_PROCESS_DETACH && detached) SetEvent(detached);
     return TRUE;
 }
