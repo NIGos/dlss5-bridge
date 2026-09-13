@@ -1,7 +1,7 @@
 # Vendored MinHook
 
 The hook engine, buffer allocator and trampoline builder match
-[m417z/minhook at 8af6b4acae5a9388fd742b56fa79ece89d96f823](https://github.com/m417z/minhook/tree/8af6b4acae5a9388fd742b56fa79ece89d96f823),
+[m417z/minhook at 4f18d1809a81e6c700bcc4a21aeb43ade72bbf8b](https://github.com/m417z/minhook/tree/4f18d1809a81e6c700bcc4a21aeb43ade72bbf8b),
 with these local differences (ignoring UTF-8 BOMs and line endings):
 
 - `hook.c`: `TEXT("ntdll.dll")` works in both ANSI and Unicode builds; added
@@ -25,3 +25,7 @@ this engine on the same target and removes them in both orders. The hook tests
 also cover concurrent forwarding, retirement and address reuse.
 
 Original licensing is retained in `LICENSE.txt` and `AUTHORS.txt`.
+
+Security review on 2026-09-13 corrected the reference above from the upstream
+master commit to the multihook commit actually matching the vendored engine.
+This corrects the documentation only; the shipped source and binary are unchanged.
