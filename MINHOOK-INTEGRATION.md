@@ -11,7 +11,7 @@ under the loader lock; the worker's code stays mapped during that delay.
 Before publishing an NGX hook, the bridge pins its own module until process exit.
 There is no timed join or MinHook teardown in `DllMain`. **Once hooks are active,
 restart the game to replace or unload the bridge.** Runtime configuration changes
-still work. An initial probe that installs no hooks is not pinned by this policy.
+still work. A probe that never attempts NGX hook installation is not pinned by this policy.
 
 Unload notifications publish atomic markers only for tracked modules. The worker
 retires hooks outside the loader callback, retaining state while calls remain in

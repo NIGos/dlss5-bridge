@@ -147,7 +147,7 @@ static void TestConcurrencyAndDraining()
 
 static void TestModuleUnloadAndRetire()
 {
-    printf("CASE: Module unload decommits memory; HookRetire frees trampoline without writing unmapped memory\n");
+    printf("CASE: Module unload decommits memory; HookRetire retains trampoline without writing unmapped memory\n");
     void *mem = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     TEST_EXPECT(mem != nullptr);
     memcpy(mem, kTestFuncCode, sizeof(kTestFuncCode));
