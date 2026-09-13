@@ -2683,15 +2683,22 @@ static int HookNewNgxModules()
             {
                 if (g_layer[k].pending_retirement)
                 {
-                    WaitForInFlightTrampolineCalls(2000);
-                    HookRetire(g_layer[k].eval);
-                    HookRetire(g_layer[k].eval_c);
-                    HookRetire(g_layer[k].create);
-                    HookRetire(g_layer[k].vk_eval);
-                    HookRetire(g_layer[k].vk_eval_c);
-                    HookRetire(g_layer[k].vk_create);
-                    HookRetire(g_layer[k].vk_create1);
-                    g_layer[k] = {};
+                    if (WaitForInFlightTrampolineCalls(2000))
+                    {
+                        HookRetire(g_layer[k].eval);
+                        HookRetire(g_layer[k].eval_c);
+                        HookRetire(g_layer[k].create);
+                        HookRetire(g_layer[k].vk_eval);
+                        HookRetire(g_layer[k].vk_eval_c);
+                        HookRetire(g_layer[k].vk_create);
+                        HookRetire(g_layer[k].vk_create1);
+                        g_layer[k] = {};
+                    }
+                    else
+                    {
+                        Log("NGX layer %ld at %p reload deferred; in-flight calls still active.", k, mods[i]);
+                        known = true;
+                    }
                 }
                 else
                 {
@@ -3598,8 +3605,9 @@ static volatile bool g_watching_ngx = false;
 
 static void ProcessPendingRetirements()
 {
+    if (!TryEnterCriticalSection(&g_hook_cs)) return;
+
     bool has_pending = false;
-    EnterCriticalSection(&g_hook_cs);
     for (LONG i = 0; i < g_layer_count; ++i)
     {
         if (g_layer[i].pending_retirement)
@@ -3620,7 +3628,8 @@ static void ProcessPendingRetirements()
         return;
     }
 
-    EnterCriticalSection(&g_hook_cs);
+    if (!TryEnterCriticalSection(&g_hook_cs)) return;
+
     if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0)
     {
         for (LONG i = 0; i < g_layer_count; ++i)
@@ -3669,6 +3678,7 @@ static DWORD WINAPI HookWorkerProc(LPVOID)
         }
         break;
     }
+
     return 0;
 }
 
@@ -3738,13 +3748,9 @@ static void StopWatchingForNgx()
         g_ldr_unregister(g_ldr_cookie);
         g_ldr_cookie = nullptr;
     }
-    // Allow any active worker scan pass to complete cleanly outside loader lock:
-    for (int i = 0; i < 50 && InterlockedCompareExchange(&g_worker_running, 0, 0) != 0; ++i)
-    {
-        Sleep(1);
-    }
     if (g_worker_thread != nullptr)
     {
+        WaitForSingleObject(g_worker_thread, 200);
         CloseHandle(g_worker_thread);
         g_worker_thread = nullptr;
     }
@@ -4030,6 +4036,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         InitializeCriticalSection(&g_log_cs);
         InitializeCriticalSection(&g_hook_cs);
         MH_Initialize();
+        MH_SetThreadFreezeMethod(MH_FREEZE_METHOD_FAST_UNDOCUMENTED);
         // BOTH backends serialise on this one now. Eight NGX forwards in this file
         // and five in vkmirror.inc, all in the same order: g_ngx_cs OUTSIDE
         // g_hook_cs, never the reverse.
@@ -4206,6 +4213,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 
         StopWatchingForNgx();
         ReportOutcome();
+
+        if (g_worker_thread != nullptr)
+        {
+            CloseHandle(g_worker_thread);
+            g_worker_thread = nullptr;
+        }
 
         // Not dead code, however rarely detach runs. A module that unloads with
         // its jumps still in place and is then loaded again reads its own patch
