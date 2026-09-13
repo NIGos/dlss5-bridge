@@ -191,7 +191,7 @@ extern "C" {
     MH_STATUS WINAPI MH_RemoveDisabledHooksEx(ULONG_PTR hookIdent);
 
     // Retires an already created hook whose target module has been unloaded or
-    // decommitted. Frees the trampoline buffer and deletes the hook record
+    // decommitted. Retains the executable buffer and deletes the hook record
     // without attempting to restore target memory or freeze threads.
     // Parameters:
     //   hookIdent   [in]  A hook identifier, can be set to different values for

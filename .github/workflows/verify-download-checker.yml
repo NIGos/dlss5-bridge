@@ -39,6 +39,9 @@ jobs:
       - name: Hook concurrency and lifecycle (CPU)
         shell: cmd
         run: call tests\build-hook-concurrency-test.cmd
+      - name: Real DLL lifetime and two-instance hook coexistence (CPU)
+        shell: cmd
+        run: call tests\build-module-lifetime-test.cmd
       - name: Record build and checksums
         shell: pwsh
         run: |
@@ -48,6 +51,7 @@ jobs:
           }
           New-Item -ItemType Directory -Path dist | Out-Null
           Copy-Item -LiteralPath src/dlss5-bridge.addon64 -Destination dist/
+          Copy-Item -LiteralPath THIRD-PARTY-NOTICES.txt -Destination dist/
           $addon = Get-Item -LiteralPath dist/dlss5-bridge.addon64
           @(
             "Repository: $env:GITHUB_REPOSITORY"
@@ -57,7 +61,7 @@ jobs:
             "File version: $($addon.VersionInfo.FileVersion)"
             "Bytes: $($addon.Length)"
           ) | Set-Content -LiteralPath dist/BUILD-INFO.txt -Encoding utf8
-          Get-FileHash -LiteralPath dist/dlss5-bridge.addon64, dist/BUILD-INFO.txt -Algorithm SHA256 |
+          Get-FileHash -LiteralPath dist/dlss5-bridge.addon64, dist/BUILD-INFO.txt, dist/THIRD-PARTY-NOTICES.txt -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } |
             Set-Content -LiteralPath dist/SHA256SUMS.txt -Encoding ascii
           Get-Content -LiteralPath dist/BUILD-INFO.txt, dist/SHA256SUMS.txt

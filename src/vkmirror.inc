@@ -1824,8 +1824,8 @@ static NVSDK_NGX_Result ForwardVkEvaluate(Hook &h, const char *tag, void *cmd,
     const LONG prev_source = InterlockedExchange(&g_source, SRC_MIRROR);
 
     if (g_scan_pending && !g_ngx_init_in_flight)
-    { g_scan_pending = false; TryInstallHooks(); }
-    if ((n % 600) == 0) TryInstallHooks();
+    { TriggerHookScan(); }
+    if ((n % 600) == 0) TriggerHookScan();
     if (n <= 5 || (n % 1800) == 0) Log("  (entry point: %s)", tag);
 
     // Ray Reconstruction hands over the identical Color, Depth, MotionVectors and

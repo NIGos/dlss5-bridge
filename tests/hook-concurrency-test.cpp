@@ -248,7 +248,9 @@ static void TestDeferredRetirementUnderTimeout()
     InterlockedIncrement(&g_in_flight_trampoline_calls);
 
     // Module unloads; ForgetUnloadedLayer runs under loader lock:
+    InterlockedExchangePointer(&g_layer_modules[0], mem);
     ForgetUnloadedLayer(mem);
+    ProcessPendingRetirements();
 
     // Verify hooks are deactivated but record and pointers are PRESERVED:
     EnterCriticalSection(&g_hook_cs);
@@ -309,7 +311,9 @@ static void TestReloadAtSameAddressWithPendingRetirement()
 
     // Module unloads while in-flight calls are active; ForgetUnloadedLayer defers retirement:
     InterlockedIncrement(&g_in_flight_trampoline_calls);
+    InterlockedExchangePointer(&g_layer_modules[0], mem);
     ForgetUnloadedLayer(mem);
+    ProcessPendingRetirements();
     TEST_EXPECT(g_layer[0].pending_retirement == true);
 
     // SUB-CASE 1: Attempt reload while in-flight call is STILL OUTSTANDING (> 0).
@@ -391,50 +395,49 @@ static void TestReloadAtSameAddressWithPendingRetirement()
     printf("PASS\n");
 }
 
-static void TestUnloadAddonWhileWorkerRunning()
+
+static void TestLoaderNotificationDoesNotWaitForMinHook()
 {
-    printf("CASE: Unloading addon while hook scan worker is actively running / blocked\n");
-    g_shutting_down = false;
-    g_watching_ngx = true;
-    g_scan_pending = true;
-
-    // Hold g_hook_cs to verify worker does not deadlock:
-    EnterCriticalSection(&g_hook_cs);
-
-    // Trigger a scan so worker is started:
-    TriggerHookScan();
-
-    // Verify worker was initiated and handle is valid:
-    TEST_EXPECT(g_worker_thread != nullptr);
-    TEST_EXPECT(InterlockedCompareExchange(&g_worker_running, 0, 0) == 1);
-
-    HANDLE dup = nullptr;
-    TEST_EXPECT(DuplicateHandle(GetCurrentProcess(), g_worker_thread,
-                                GetCurrentProcess(), &dup,
-                                0, FALSE, DUPLICATE_SAME_ACCESS));
-
-    // Concurrently trigger addon unload while g_hook_cs is held:
-    StopWatchingForNgx();
-
-    // Release g_hook_cs:
-    LeaveCriticalSection(&g_hook_cs);
-
-    // Verify shutdown signal was asserted and watcher disabled:
-    TEST_EXPECT(g_shutting_down == true);
-    TEST_EXPECT(g_watching_ngx == false);
-
-    // StopWatchingForNgx must cleanly wait and terminate the worker without leaking threads:
-    TEST_EXPECT(WaitForSingleObject(dup, 2000) == WAIT_OBJECT_0);
-    CloseHandle(dup);
-
-    TEST_EXPECT(InterlockedCompareExchange(&g_worker_running, 0, 0) == 0);
-    TEST_EXPECT(g_worker_thread == nullptr);
-
-    // Verify subsequent scan attempts while shut down are safely rejected:
-    TriggerHookScan();
-    TEST_EXPECT(InterlockedCompareExchange(&g_worker_running, 0, 0) == 0);
-    TEST_EXPECT(g_worker_thread == nullptr);
-
+    printf("CASE: loader unload notification does not wait on another MinHook instance\n");
+    wchar_t name[64];
+    swprintf_s(name, L"minhook_multihook_%08X", GetCurrentProcessId());
+    HANDLE mutex = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, name);
+    TEST_EXPECT(mutex != nullptr);
+    HANDLE held = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    TEST_EXPECT(held && release);
+    void *mem = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    TEST_EXPECT(mem);
+    memcpy(mem, kTestFuncCode, sizeof(kTestFuncCode));
+    g_layer_count = 1; g_layer[0] = {};
+    g_layer[0].mod = static_cast<HMODULE>(mem);
+    TEST_EXPECT(HookInstall(g_layer[0].eval, mem, reinterpret_cast<void *>(&DetourFunc)));
+    InterlockedExchangePointer(&g_layer_modules[0], mem);
+    std::thread holder([&] {
+        WaitForSingleObject(mutex, INFINITE); SetEvent(held);
+        WaitForSingleObject(release, 2000); // Watchdog lets a regression fail instead of hanging CI.
+        ReleaseMutex(mutex);
+    });
+    TEST_EXPECT(WaitForSingleObject(held, 5000) == WAIT_OBJECT_0);
+    auto nt = GetModuleHandleW(L"ntdll.dll");
+    auto lock = reinterpret_cast<LONG (NTAPI *)(ULONG, ULONG *, ULONG_PTR *)>(GetProcAddress(nt,"LdrLockLoaderLock"));
+    auto unlock = reinterpret_cast<LONG (NTAPI *)(ULONG, ULONG_PTR)>(GetProcAddress(nt,"LdrUnlockLoaderLock"));
+    TEST_EXPECT(lock && unlock);
+    ULONG disposition = 0; ULONG_PTR cookie = 0;
+    TEST_EXPECT(lock(0,&disposition,&cookie) >= 0);
+    const ULONGLONG start = GetTickCount64();
+    ForgetUnloadedLayer(mem);
+    const ULONGLONG elapsed = GetTickCount64() - start;
+    TEST_EXPECT(unlock(0,cookie) >= 0);
+    SetEvent(release); holder.join();
+    TEST_EXPECT(elapsed < 1000);
+    TEST_EXPECT(g_layer_unloaded[0] == 1);
+    TEST_EXPECT(g_layer[0].eval.original != nullptr);
+    TEST_EXPECT(ProcessPendingRetirements());
+    TEST_EXPECT(g_layer[0].mod == nullptr);
+    g_layer_count = 0;
+    VirtualFree(mem,0,MEM_RELEASE);
+    CloseHandle(mutex); CloseHandle(held); CloseHandle(release);
     printf("PASS\n");
 }
 
@@ -457,7 +460,8 @@ int main()
     TestOrphanOnTimeoutSafety();
     TestDeferredRetirementUnderTimeout();
     TestReloadAtSameAddressWithPendingRetirement();
-    TestUnloadAddonWhileWorkerRunning();
+    TestLoaderNotificationDoesNotWaitForMinHook();
+    // Actual DLL/loader-lock lifetime is covered by module-lifetime-test.
 
     MH_Uninitialize();
     DeleteCriticalSection(&g_bridge_cs);
