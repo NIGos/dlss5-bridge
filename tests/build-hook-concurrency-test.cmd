@@ -18,6 +18,10 @@ if errorlevel 1 exit /b 1
 cd /d "%~dp0"
 if not exist build mkdir build
 if errorlevel 1 exit /b 1
+rem The scan regression needs a real DLL which can unload inside the scan.
+cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /I..\src\minhook\include /I..\src\minhook\src /LD ^
+   module-lifetime-fixture.cpp ..\src\minhook.c /Fo:build\ /Fe:build\lifetime-a.dll
+if errorlevel 1 exit /b 1
 cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /I..\src\reshade /I..\src\minhook\include /I..\src\minhook\src ^
    /Fo:build\ /Fe:build\hook-concurrency-test.exe hook-concurrency-test.cpp ..\src\minhook.c ^
    /link user32.lib advapi32.lib bcrypt.lib

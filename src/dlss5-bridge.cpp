@@ -677,13 +677,24 @@ static bool HookInstall(Hook &h, void *target, void *detour)
     h.target = nullptr;
 }
 
-static void HookRetire(Hook &h)
+static bool HookRetire(Hook &h)
 {
-    if (!h.target) return;
+    if (!h.target) return true;
     h.active = false;
-    MH_RetireHook(h.target);
+    const MH_STATUS status = MH_RetireHook(h.target);
+    if (status != MH_OK && status != MH_ERROR_NOT_CREATED) return false;
     h.original = nullptr;
     h.target = nullptr;
+    return true;
+}
+
+static bool RetireLayerHooks(Layer &layer)
+{
+    Hook *hooks[] = {&layer.eval, &layer.eval_c, &layer.create, &layer.vk_eval,
+                    &layer.vk_eval_c, &layer.vk_create, &layer.vk_create1};
+    bool retired = true;
+    for (Hook *hook : hooks) retired = HookRetire(*hook) && retired;
+    return retired;
 }
 
 // ---------------------------------------------------------------------------
@@ -2623,7 +2634,28 @@ static bool IsFillerStub(const void *fn)
 
 static volatile bool g_shutting_down = false;
 
-static int HookNewNgxModules()
+// Kept by the caller until after g_hook_cs is released: dropping the last
+// reference can run arbitrary DLL_PROCESS_DETACH code and acquire other locks.
+struct ScanModuleRefs
+{
+    HMODULE modules[1024] = {};
+    DWORD count = 0;
+    bool Acquire(HMODULE module)
+    {
+        if (count == _countof(modules)) return false;
+        HMODULE held = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(module), &held)) return false;
+        modules[count++] = held;
+        return true;
+    }
+    ~ScanModuleRefs()
+    {
+        for (DWORD i = 0; i < count; ++i) FreeLibrary(modules[i]);
+    }
+};
+
+static int HookNewNgxModules(ScanModuleRefs &held)
 {
     HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
     if (k32 == nullptr) return 0;
@@ -2641,9 +2673,7 @@ static int HookNewNgxModules()
     for (DWORD i = 0; i < count; ++i)
     {
         if (g_shutting_down) break;
-        struct ModuleRef { HMODULE value = nullptr; ~ModuleRef() { if (value) FreeLibrary(value); } } hold;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                reinterpret_cast<LPCWSTR>(mods[i]), &hold.value)) continue;
+        if (!held.Acquire(mods[i])) continue;
         bool slot_available = g_layer_count < kMaxLayers;
         for (LONG k = 0; k < g_layer_count && !slot_available; ++k)
             slot_available = g_layer[k].mod == nullptr;
@@ -2697,21 +2727,15 @@ static int HookNewNgxModules()
             {
                 if (g_layer[k].pending_retirement)
                 {
-                    if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0)
+                    if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0 &&
+                        RetireLayerHooks(g_layer[k]))
                     {
-                        HookRetire(g_layer[k].eval);
-                        HookRetire(g_layer[k].eval_c);
-                        HookRetire(g_layer[k].create);
-                        HookRetire(g_layer[k].vk_eval);
-                        HookRetire(g_layer[k].vk_eval_c);
-                        HookRetire(g_layer[k].vk_create);
-                        HookRetire(g_layer[k].vk_create1);
                         InterlockedExchangePointer(&g_layer_modules[k], nullptr);
                         g_layer[k] = {};
                     }
                     else
                     {
-                        Log("NGX layer %ld at %p reload deferred; in-flight calls still active.", k, mods[i]);
+                        Log("NGX layer %ld at %p reload deferred; hook retirement has not completed.", k, mods[i]);
                         known = true;
                     }
                 }
@@ -3395,10 +3419,15 @@ static void TryInstallHooks()
     // start, but the feature snippet underneath only shows up when DLSS
     // initialises, so every load is another chance to find a layer.
 
-    // Do not compete with a render call holding hook state. The next loader
-    // notification or evaluate schedules another scan.
-    if (!TryEnterCriticalSection(&g_hook_cs)) return;
-    const int added = HookNewNgxModules();
+    // Do not compete with a render call holding hook state. Preserve the request
+    // so the worker retries even when no NGX hook has been installed yet.
+    ScanModuleRefs held;
+    if (!TryEnterCriticalSection(&g_hook_cs))
+    {
+        InterlockedExchange(&g_scan_pending, 1);
+        return;
+    }
+    const int added = HookNewNgxModules(held);
     LeaveCriticalSection(&g_hook_cs);
     if (added == 0 || g_shutting_down) return;
 
@@ -3607,19 +3636,18 @@ static bool ProcessPendingRetirements()
     if (!TryEnterCriticalSection(&g_hook_cs)) return false;
 
     const bool drained = InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0;
+    bool retired_all = drained;
     if (drained)
     {
         for (LONG i = 0; i < g_layer_count; ++i)
         {
             if (!g_layer[i].pending_retirement) continue;
 
-            HookRetire(g_layer[i].eval);
-            HookRetire(g_layer[i].eval_c);
-            HookRetire(g_layer[i].create);
-            HookRetire(g_layer[i].vk_eval);
-            HookRetire(g_layer[i].vk_eval_c);
-            HookRetire(g_layer[i].vk_create);
-            HookRetire(g_layer[i].vk_create1);
+            if (!RetireLayerHooks(g_layer[i]))
+            {
+                retired_all = false;
+                continue;
+            }
 
             InterlockedExchangePointer(&g_layer_modules[i], nullptr);
             g_layer[i] = {};
@@ -3627,7 +3655,7 @@ static bool ProcessPendingRetirements()
         }
     }
     LeaveCriticalSection(&g_hook_cs);
-    return drained;
+    return retired_all;
 }
 
 static DWORD WINAPI HookWorkerProc(LPVOID module)

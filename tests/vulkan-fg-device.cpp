@@ -140,6 +140,7 @@ int main()
     }
     BYTE peer[sizeof(Layer)]; memcpy(peer, &g_layer[1], sizeof(peer));
     InterlockedExchangePointer(&g_layer_modules[0], g_layer[0].mod);
+    EXPECT(MH_Initialize() == MH_OK);
     ForgetUnloadedLayer(g_layer[0].mod);
     EXPECT(g_layer[0].mod != nullptr); // Notification only records the unload.
     EXPECT(ProcessPendingRetirements());

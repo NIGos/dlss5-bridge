@@ -677,6 +677,15 @@ static HANDLE CreateProcessMutex(VOID)
 }
 
 //-------------------------------------------------------------------------
+// WAIT_ABANDONED also grants ownership. Fail this operation rather than use
+// potentially inconsistent state, but do not leave the mutex owned on failure.
+static BOOL LockProcessMutex(VOID)
+{
+    DWORD wait = WaitForSingleObject(g_hMutex, INFINITE);
+    if (wait == WAIT_ABANDONED) ReleaseMutex(g_hMutex);
+    return wait == WAIT_OBJECT_0;
+}
+
 MH_STATUS WINAPI MH_Initialize(VOID)
 {
     if (g_hMutex != NULL)
@@ -706,7 +715,7 @@ MH_STATUS WINAPI MH_Uninitialize(VOID)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = EnableHooksLL(MH_ALL_IDENTS, MH_ALL_HOOKS, FALSE);
@@ -740,7 +749,7 @@ MH_STATUS WINAPI MH_SetThreadFreezeMethod(MH_THREAD_FREEZE_METHOD method)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     if (method == MH_FREEZE_METHOD_FAST_UNDOCUMENTED && !pNtGetNextThread)
@@ -769,7 +778,7 @@ MH_STATUS WINAPI MH_CreateHookEx(ULONG_PTR hookIdent, LPVOID pTarget, LPVOID pDe
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;
@@ -841,7 +850,7 @@ MH_STATUS WINAPI MH_RemoveHookEx(ULONG_PTR hookIdent, LPVOID pTarget)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;
@@ -914,7 +923,7 @@ MH_STATUS WINAPI MH_RetireHookEx(ULONG_PTR hookIdent, LPVOID pTarget)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;
@@ -969,7 +978,7 @@ MH_STATUS WINAPI MH_RemoveDisabledHooksEx(ULONG_PTR hookIdent)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;
@@ -1031,7 +1040,7 @@ static MH_STATUS EnableHook(ULONG_PTR hookIdent, LPVOID pTarget, BOOL enable)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;
@@ -1102,7 +1111,7 @@ static MH_STATUS QueueHook(ULONG_PTR hookIdent, LPVOID pTarget, BOOL queueEnable
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;
@@ -1168,7 +1177,7 @@ MH_STATUS WINAPI MH_ApplyQueuedEx(ULONG_PTR hookIdent)
     if (g_hMutex == NULL)
         return MH_ERROR_NOT_INITIALIZED;
 
-    if (WaitForSingleObject(g_hMutex, INFINITE) != WAIT_OBJECT_0)
+    if (!LockProcessMutex())
         return MH_ERROR_MUTEX_FAILURE;
 
     MH_STATUS status = MH_OK;

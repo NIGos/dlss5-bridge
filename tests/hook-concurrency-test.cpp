@@ -441,6 +441,120 @@ static void TestLoaderNotificationDoesNotWaitForMinHook()
     printf("PASS\n");
 }
 
+static HMODULE g_scan_fixture;
+static bool g_scan_released, g_scan_detached, g_scan_detached_under_lock;
+static FARPROC (WINAPI *g_real_get_proc)(HMODULE, LPCSTR);
+static void ScanFixtureDetached()
+{
+    g_scan_detached = true;
+    // This deterministic single-thread test only owns this section in the scan.
+    g_scan_detached_under_lock = g_hook_cs.RecursionCount != 0;
+}
+static FARPROC WINAPI ScanGetProc(HMODULE module, LPCSTR name)
+{
+    if (module == g_scan_fixture && !g_scan_released &&
+        reinterpret_cast<uintptr_t>(name) > 65535 &&
+        strcmp(name, "NVSDK_NGX_D3D11_EvaluateFeature") == 0)
+    {
+        // The production scanner has acquired its temporary reference. Release
+        // the host reference now, making the scanner responsible for final unload.
+        g_scan_released = true;
+        FreeLibrary(g_scan_fixture);
+    }
+    return g_real_get_proc(module, name);
+}
+static void TestScanReleasesOutsideHookLock()
+{
+    puts("CASE: production scan releases its final DLL reference outside hook lock");
+    g_scan_fixture = LoadLibraryW(L"lifetime-a.dll");
+    TEST_EXPECT(g_scan_fixture);
+    auto set = reinterpret_cast<void (*)(void (*)())>(GetProcAddress(g_scan_fixture,"SetDetachCallback"));
+    TEST_EXPECT(set); set(ScanFixtureDetached);
+    void *target = reinterpret_cast<void *>(&GetProcAddress);
+    TEST_EXPECT(MH_CreateHook(target,reinterpret_cast<void *>(&ScanGetProc),
+        reinterpret_cast<void **>(&g_real_get_proc)) == MH_OK);
+    TEST_EXPECT(MH_EnableHook(target) == MH_OK);
+    g_shutting_down = false;
+    TryInstallHooks();
+    g_shutting_down = true;
+    TEST_EXPECT(MH_RemoveHook(target) == MH_OK);
+    TEST_EXPECT(g_scan_released && g_scan_detached);
+    TEST_EXPECT(!g_scan_detached_under_lock);
+    puts("PASS");
+}
+
+static void TestBusyScanIsRescheduled()
+{
+    puts("CASE: a scan losing the hook lock keeps a retry pending");
+    HANDLE held = CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    HANDLE release = CreateEventW(nullptr,TRUE,FALSE,nullptr);
+    TEST_EXPECT(held && release);
+    std::thread holder([&] {
+        EnterCriticalSection(&g_hook_cs); SetEvent(held);
+        WaitForSingleObject(release,5000); LeaveCriticalSection(&g_hook_cs);
+    });
+    TEST_EXPECT(WaitForSingleObject(held,5000) == WAIT_OBJECT_0);
+    g_shutting_down = false;
+    InterlockedExchange(&g_scan_pending,0);
+    TryInstallHooks();
+    const LONG retry = InterlockedCompareExchange(&g_scan_pending,0,0);
+    g_shutting_down = true;
+    SetEvent(release); holder.join();
+    CloseHandle(held); CloseHandle(release);
+    TEST_EXPECT(retry == 1);
+    puts("PASS");
+}
+
+static MH_STATUS WINAPI FailRetirement(LPVOID) { return MH_ERROR_MUTEX_FAILURE; }
+static void TestRetirementFailurePreservesRecord()
+{
+    puts("CASE: failed MinHook retirement preserves the pending layer for retry");
+    void *mem = VirtualAlloc(nullptr,4096,MEM_COMMIT|MEM_RESERVE,PAGE_EXECUTE_READWRITE);
+    TEST_EXPECT(mem); memcpy(mem,kTestFuncCode,sizeof(kTestFuncCode));
+    g_layer_count=1; g_layer[0]={}; g_layer[0].mod=static_cast<HMODULE>(mem);
+    TEST_EXPECT(HookInstall(g_layer[0].eval,mem,reinterpret_cast<void *>(&DetourFunc)));
+    InterlockedExchangePointer(&g_layer_modules[0],mem);
+    void *retire = reinterpret_cast<void *>(&MH_RetireHook);
+    void *unused = nullptr;
+    TEST_EXPECT(MH_CreateHook(retire,reinterpret_cast<void *>(&FailRetirement),&unused)==MH_OK);
+    TEST_EXPECT(MH_EnableHook(retire)==MH_OK);
+    ForgetUnloadedLayer(mem);
+    const bool finished = ProcessPendingRetirements();
+    const bool retained = g_layer[0].pending_retirement && g_layer[0].mod==mem &&
+        g_layer[0].eval.original && g_layer[0].eval.target==mem;
+    TEST_EXPECT(MH_RemoveHook(retire)==MH_OK);
+    TEST_EXPECT(!finished && retained);
+    TEST_EXPECT(ProcessPendingRetirements());
+    TEST_EXPECT(g_layer[0].mod==nullptr);
+    g_layer_count=0; VirtualFree(mem,0,MEM_RELEASE);
+    puts("PASS");
+}
+
+static void TestAbandonedMutexFailureReleasesOwnership()
+{
+    puts("CASE: an abandoned MinHook mutex is not retained after API failure");
+    wchar_t name[64]; swprintf_s(name,L"minhook_multihook_%08X",GetCurrentProcessId());
+    HANDLE mutex=OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE,FALSE,name);
+    TEST_EXPECT(mutex);
+    std::thread abandon([&] {
+        TEST_EXPECT(WaitForSingleObject(mutex,5000)==WAIT_OBJECT_0);
+        // Deliberately exit while owning it: Windows marks the mutex abandoned.
+    });
+    abandon.join();
+    const MH_STATUS status=MH_SetThreadFreezeMethod(MH_FREEZE_METHOD_ORIGINAL);
+    DWORD next=WAIT_FAILED;
+    std::thread observer([&] {
+        next=WaitForSingleObject(mutex,0);
+        if (next==WAIT_OBJECT_0 || next==WAIT_ABANDONED) ReleaseMutex(mutex);
+    });
+    observer.join();
+    if (next==WAIT_TIMEOUT) ReleaseMutex(mutex); // Clean up the pre-fix failure.
+    CloseHandle(mutex);
+    TEST_EXPECT(status==MH_ERROR_MUTEX_FAILURE);
+    TEST_EXPECT(next==WAIT_OBJECT_0);
+    puts("PASS");
+}
+
 int main()
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -461,6 +575,10 @@ int main()
     TestDeferredRetirementUnderTimeout();
     TestReloadAtSameAddressWithPendingRetirement();
     TestLoaderNotificationDoesNotWaitForMinHook();
+    TestScanReleasesOutsideHookLock();
+    TestBusyScanIsRescheduled();
+    TestRetirementFailurePreservesRecord();
+    TestAbandonedMutexFailureReleasesOwnership();
     // Actual DLL/loader-lock lifetime is covered by module-lifetime-test.
 
     MH_Uninitialize();

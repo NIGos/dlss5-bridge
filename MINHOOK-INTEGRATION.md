@@ -50,3 +50,6 @@ and is **skipped**, not passed. Background Gym runs passed D3D11 consumer
 (120/120 evaluates), with neural rendering active. No game was launched.
 The D3D11 runs preceded the final unrelated-unload scheduling guard; that guard
 was included in the CPU notification suite and Vulkan run.
+
+See [the follow-up audit](MINHOOK-AUDIT.md) for four additional edge-case fixes
+and their failing-before/passing-after regression tests.
