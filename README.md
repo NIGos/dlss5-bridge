@@ -361,3 +361,11 @@ are included by the `.cpp`. The version is in two places that stay in step:
   command buffer on a `VkEvent` pair.
 
 Everything else is this project's own, under MIT.
+
+### Hook lifecycle (next release)
+
+MinHook is compiled into the bridge; no additional DLL is needed. Once NGX hooks
+are installed, the bridge stays loaded until the game exits. Restart the game
+to replace or unload it; live configuration changes still work. See
+[implementation and tests](MINHOOK-INTEGRATION.md) and
+[third-party notices](THIRD-PARTY-NOTICES.txt).

@@ -139,7 +139,10 @@ int main()
         hook->active = true; // Unload must discard state without patching freed code.
     }
     BYTE peer[sizeof(Layer)]; memcpy(peer, &g_layer[1], sizeof(peer));
+    InterlockedExchangePointer(&g_layer_modules[0], g_layer[0].mod);
     ForgetUnloadedLayer(g_layer[0].mod);
+    EXPECT(g_layer[0].mod != nullptr); // Notification only records the unload.
+    EXPECT(ProcessPendingRetirements());
     EXPECT(g_layer[0].mod == nullptr);
     for (const auto *hook : hooks) EXPECT(hook->target == nullptr && !hook->active);
     EXPECT(memcmp(peer, &g_layer[1], sizeof(peer)) == 0);

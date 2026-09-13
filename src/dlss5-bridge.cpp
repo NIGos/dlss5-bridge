@@ -10,10 +10,8 @@
 // call a DLSS 5 add-on detours and inserts itself into. Nothing about the other
 // add-on is modified; it simply receives genuine D3D12 NGX calls.
 //
-// Nothing on disk is patched. The only writes to foreign code are 14 bytes at
-// each of three function entry points in every module that exports the NGX D3D11
-// API -- six such modules in Baldur's Gate 3, twelve at most -- in memory,
-// restored around every call. vk_mirror=1 adds four more per module.
+// Nothing on disk is patched. MinHook installs in-memory detours at NGX
+// entry points and provides relocated trampolines for forwarding original calls.
 //
 // Behaviour is driven by dlss5-bridge.cfg, re-read while the game runs, so
 // settings can be changed without restarting. dlss5-bridge.log records the
@@ -41,6 +39,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <MinHook.h>
+#include "module-lifetime.h"
 // SHA-256 for identifying a neighbour build whose version resource does not.
 #include <bcrypt.h>
 #include <d3d11.h>
@@ -63,7 +63,7 @@
 #pragma comment(lib, "version.lib")
 
 // Kept in step with version.rc, which is where ReShade's overlay reads it from.
-#define BRIDGE_VERSION "1.4.13-pre7"
+#define BRIDGE_VERSION "1.4.13-pre8"
 
 extern "C" __declspec(dllexport) const char *NAME =
     "DLSS 5 Bridge " BRIDGE_VERSION;
@@ -463,10 +463,9 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 
 struct Hook
 {
-    BYTE *target;
-    BYTE  saved[14];
-    BYTE  patch[14];
-    bool  active;
+    void *target   = nullptr;
+    void *original = nullptr;
+    bool  active   = false;
 };
 
 // Several modules can export the NGX D3D11 API at the same time: a game or mod
@@ -497,7 +496,13 @@ struct Layer
     Hook    vk_eval_c;
     Hook    vk_create;
     Hook    vk_create1;
+    bool pending_retirement = false;
 };
+
+// Loader notifications only publish into these atomics. They never acquire
+// bridge/MinHook locks, log or manipulate hooks; scheduling owns a DLL reference.
+static PVOID volatile g_layer_modules[kMaxLayers] = {};
+static volatile LONG g_layer_unloaded[kMaxLayers] = {};
 
 // Whether the Vulkan mirror is switched on, read once at attach out of
 // dlss5-bridge.cfg. It decides whether four foreign entry points get
@@ -580,15 +585,23 @@ struct NestGuard
     ~NestGuard() { --g_nest; }
 };
 
-static bool WriteCode(void *dst, const void *src, size_t len)
+static volatile LONG g_in_flight_trampoline_calls = 0;
+
+struct TrampolineCallGuard
 {
-    DWORD old = 0;
-    if (!VirtualProtect(dst, len, PAGE_EXECUTE_READWRITE, &old))
-        return false;
-    memcpy(dst, src, len);
-    VirtualProtect(dst, len, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), dst, len);
-    return true;
+    TrampolineCallGuard()  { InterlockedIncrement(&g_in_flight_trampoline_calls); }
+    ~TrampolineCallGuard() { InterlockedDecrement(&g_in_flight_trampoline_calls); }
+};
+
+static bool WaitForInFlightTrampolineCalls(DWORD maxWaitMs = 2000)
+{
+    DWORD waited = 0;
+    while (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) > 0 && waited < maxWaitMs)
+    {
+        Sleep(1);
+        waited += 1;
+    }
+    return InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0;
 }
 
 static const void *DetourTargetOf(const BYTE *p);
@@ -596,13 +609,12 @@ static bool        JumpsInsideOwnModule(const BYTE *p);
 
 static bool HookInstall(Hook &h, void *target, void *detour)
 {
+    if (!target || !detour) return false;
+
     // An export that is a 5-byte jmp into its own module is one entry of a
     // thunk table, and the entries beside it are the module's own internal
-    // calls. The 14-byte patch below overwrote the two after it: Pathologic 3's
-    // NVUnityPlugin.DLL then faulted at +0x43C2, the thunk right after
-    // NVSDK_NGX_VULKAN_EvaluateFeature at +0x43BD, the first time the game's
-    // own code went through it (#15, 2026-09-02). The hook goes where the thunk
-    // goes instead: an ordinary function with an ordinary prologue.
+    // calls. The hook goes where the thunk goes: an ordinary function with an
+    // ordinary prologue.
     BYTE *at = static_cast<BYTE *>(target);
     for (int hop = 0; hop < 4 && at[0] == 0xE9 && JumpsInsideOwnModule(at); ++hop)
     {
@@ -613,31 +625,65 @@ static bool HookInstall(Hook &h, void *target, void *detour)
         at = static_cast<BYTE *>(const_cast<void *>(next));
     }
     h.target = at;
-    memcpy(h.saved, h.target, sizeof(h.saved));
 
-    // jmp qword ptr [rip+0]; <8-byte absolute address>
-    h.patch[0] = 0xFF;
-    h.patch[1] = 0x25;
-    h.patch[2] = h.patch[3] = h.patch[4] = h.patch[5] = 0x00;
-    memcpy(h.patch + 6, &detour, sizeof(detour));
-
-    if (!WriteCode(h.target, h.patch, sizeof(h.patch)))
+    if (!PinHookModule(reinterpret_cast<const void *>(&HookInstall))) return false;
+    const MH_STATUS init = MH_Initialize();
+    if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) return false;
+    MH_STATUS st = MH_CreateHook(at, detour, &h.original);
+    if (st != MH_OK)
+    {
+        Log("    MH_CreateHook to %p failed with status %d", at, st);
+        h.active = false;
+        h.original = nullptr;
         return false;
+    }
+
+    st = MH_EnableHook(at);
+    if (st != MH_OK)
+    {
+        for (int retry = 0; retry < 3 && st != MH_OK; ++retry)
+        {
+            Sleep(10);
+            st = MH_EnableHook(at);
+        }
+    }
+    if (st != MH_OK)
+    {
+        Log("    MH_EnableHook to %p failed with status %d (win32 error %lu)", at, st, GetLastError());
+        MH_RemoveHook(at);
+        h.active = false;
+        h.original = nullptr;
+        return false;
+    }
 
     h.active = true;
     return true;
 }
 
-static void HookRemove(Hook &h)
+[[maybe_unused]] static void HookRemove(Hook &h)
 {
-    if (!h.active) return;
-    WriteCode(h.target, h.saved, sizeof(h.saved));
+    if (!h.active || !h.target) return;
+    MH_DisableHook(h.target);
+    h.active = false;
+    if (!WaitForInFlightTrampolineCalls(2000))
+    {
+        Log("    [hook] trampoline wait timed out for %p (%ld in flight); "
+            "leaving trampoline allocated to prevent use-after-free",
+            h.target, InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0));
+        return;
+    }
+    MH_RemoveHook(h.target);
+    h.original = nullptr;
+    h.target = nullptr;
 }
 
-static void HookRestore(Hook &h)
+static void HookRetire(Hook &h)
 {
-    if (!h.active) return;
-    WriteCode(h.target, h.patch, sizeof(h.patch));
+    if (!h.target) return;
+    h.active = false;
+    MH_RetireHook(h.target);
+    h.original = nullptr;
+    h.target = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,7 +1571,7 @@ static void LogPrologue(const char *label, const BYTE *p);
 // Set around this add-on's own NGX initialisation. Hooking a module while NGX
 // is loading its snippets is what took Prey 2017 down.
 static volatile bool g_ngx_init_in_flight;
-static volatile bool g_scan_pending;
+static volatile LONG g_scan_pending;
 
 // Defined below the include, beside the rest of the snippet-version reading, and
 // used inside it: the session opener asks whether the neural snippet beside this
@@ -1548,6 +1594,7 @@ static bool g_ngx_route_closed;
 // Defined with the idle report it withdraws.
 static void RetractIdleNote();
 static void TryInstallHooks();
+static void TriggerHookScan();
 
 
 // Two builds of one NGX snippet in a single process is a configuration nobody
@@ -2191,16 +2238,15 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                                         const NVSDK_NGX_Handle *handle,
                                         const NVSDK_NGX_Parameter *p, void *cb)
 {
+    TrampolineCallGuard call_guard;
+    auto fwd = reinterpret_cast<PFN_Evaluate>(h.original ? h.original : h.target);
+
     // A nested call means the layer above already handled this frame and is now
     // calling down through NGX's own plumbing. Forward it and touch nothing.
     if (g_nest > 0)
     {
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result inner = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result inner = fwd(ctx, handle, p, cb);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return inner;
     }
@@ -2224,11 +2270,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                 static_cast<void *>(ctx));
 
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result bogus = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result bogus = fwd(ctx, handle, p, cb);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return bogus;
     }
@@ -2236,11 +2278,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     if (IsOtherFeature(handle))
     {
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result other = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result other = fwd(ctx, handle, p, cb);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return other;
     }
@@ -2260,11 +2298,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                 "mirrored. Only a synthetic contract may hold this session.");
         }
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result pinned = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result pinned = fwd(ctx, handle, p, cb);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return pinned;
     }
@@ -2293,8 +2327,8 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     // A scan deferred out of the loader-lock callback is serviced here, where
     // nothing is held.
     if (g_scan_pending && !g_ngx_init_in_flight)
-    { g_scan_pending = false; TryInstallHooks(); }
-    if ((n % 600) == 0) TryInstallHooks();
+    { TriggerHookScan(); }
+    if ((n % 600) == 0) TriggerHookScan();
     if (n <= 5 || (n % 1800) == 0)
     {
         Log("  (entry point: %s)", tag);
@@ -2320,11 +2354,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
                 "in, or its handle would already be recorded.", dkey);
 
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result denoise = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result denoise = fwd(ctx, handle, p, cb);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return denoise;
     }
@@ -2336,11 +2366,7 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
     if (!suppress)
     {
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        r = reinterpret_cast<PFN_Evaluate>(h.target)(ctx, handle, p, cb);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        r = fwd(ctx, handle, p, cb);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
     }
 
@@ -2392,15 +2418,12 @@ static NVSDK_NGX_Result ForwardEvaluate(Hook &h, const char *tag, ID3D11DeviceCo
 static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int feature_id,
                                       NVSDK_NGX_Parameter *p, NVSDK_NGX_Handle **out)
 {
+    TrampolineCallGuard call_guard;
+    auto fwd = reinterpret_cast<PFN_Create>(h.original ? h.original : h.target);
     if (g_nest > 0)
     {
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result inner =
-            reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result inner = fwd(ctx, feature_id, p, out);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return inner;
     }
@@ -2420,12 +2443,7 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
                 static_cast<void *>(p), static_cast<void *>(ctx));
 
         if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-        EnterCriticalSection(&g_hook_cs);
-        HookRemove(h);
-        NVSDK_NGX_Result bogus =
-            reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
-        HookRestore(h);
-        LeaveCriticalSection(&g_hook_cs);
+        NVSDK_NGX_Result bogus = fwd(ctx, feature_id, p, out);
         if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
         return bogus;
     }
@@ -2454,12 +2472,9 @@ static NVSDK_NGX_Result ForwardCreate(Hook &h, ID3D11DeviceContext *ctx, int fea
         DumpInt(p, "DLSS.Enable.Output.Subrects");
     }
 
+
     if (g_ngx_cs_ready) EnterCriticalSection(&g_ngx_cs);
-    EnterCriticalSection(&g_hook_cs);
-    HookRemove(h);
-    NVSDK_NGX_Result r = reinterpret_cast<PFN_Create>(h.target)(ctx, feature_id, p, out);
-    HookRestore(h);
-    LeaveCriticalSection(&g_hook_cs);
+    NVSDK_NGX_Result r = fwd(ctx, feature_id, p, out);
     if (g_ngx_cs_ready) LeaveCriticalSection(&g_ngx_cs);
 
     Log("=== CreateFeature #%ld returned %d, handle=%p ===", n, r,
@@ -2606,6 +2621,7 @@ static bool IsFillerStub(const void *fn)
     return true;
 }
 
+static volatile bool g_shutting_down = false;
 
 static int HookNewNgxModules()
 {
@@ -2621,10 +2637,17 @@ static int HookNewNgxModules()
         return 0;
 
     int added = 0;
-    const DWORD count = needed / sizeof(HMODULE);
+    const DWORD count = (needed < sizeof(mods) ? needed : sizeof(mods)) / sizeof(HMODULE);
     for (DWORD i = 0; i < count; ++i)
     {
-        if (g_layer_count >= kMaxLayers)
+        if (g_shutting_down) break;
+        struct ModuleRef { HMODULE value = nullptr; ~ModuleRef() { if (value) FreeLibrary(value); } } hold;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(mods[i]), &hold.value)) continue;
+        bool slot_available = g_layer_count < kMaxLayers;
+        for (LONG k = 0; k < g_layer_count && !slot_available; ++k)
+            slot_available = g_layer[k].mod == nullptr;
+        if (!slot_available)
         {
             static bool said = false;
             if (!said) { said = true; Log("  layer table full at %d; later modules "
@@ -2669,7 +2692,35 @@ static int HookNewNgxModules()
 
         bool known = AlreadyRejected(mods[i]);
         for (LONG k = 0; k < g_layer_count && !known; ++k)
-            known = (g_layer[k].mod == mods[i]);
+        {
+            if (g_layer[k].mod == mods[i])
+            {
+                if (g_layer[k].pending_retirement)
+                {
+                    if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0)
+                    {
+                        HookRetire(g_layer[k].eval);
+                        HookRetire(g_layer[k].eval_c);
+                        HookRetire(g_layer[k].create);
+                        HookRetire(g_layer[k].vk_eval);
+                        HookRetire(g_layer[k].vk_eval_c);
+                        HookRetire(g_layer[k].vk_create);
+                        HookRetire(g_layer[k].vk_create1);
+                        InterlockedExchangePointer(&g_layer_modules[k], nullptr);
+                        g_layer[k] = {};
+                    }
+                    else
+                    {
+                        Log("NGX layer %ld at %p reload deferred; in-flight calls still active.", k, mods[i]);
+                        known = true;
+                    }
+                }
+                else
+                {
+                    known = true;
+                }
+            }
+        }
         if (known) continue;
 
         wchar_t path[MAX_PATH] = {};
@@ -2757,6 +2808,8 @@ static int HookNewNgxModules()
         Layer &L = g_layer[slot];
         L = {};
         L.mod = mods[i];
+        InterlockedExchange(&g_layer_unloaded[slot], 0);
+        InterlockedExchangePointer(&g_layer_modules[slot], mods[i]);
 
         Log("NGX layer %ld: %ls (base=%p)", slot, path, static_cast<void *>(mods[i]));
         {
@@ -3334,29 +3387,20 @@ static void WarnIfOldCopyLoaded()
             "covers every API this bridge does has not been checked.");
 }
 
-// Safe to call repeatedly and from the loader callback: it does nothing once
-// the hooks are in, and everything it does before that is a name lookup.
+// Only the owned worker installs hooks, outside loader notifications and detours.
 static void TryInstallHooks()
 {
+    if (g_shutting_down) return;
     // Not "once and done" any more. The game's own exports are present from the
     // start, but the feature snippet underneath only shows up when DLSS
     // initialises, so every load is another chance to find a layer.
-    if (g_layer_count >= kMaxLayers) return;
 
-    // This runs from the loader notification, holding the loader lock. The same
-    // critical section is held by a detour across the forwarded NGX call -- and
-    // NGX loads its snippets from inside those calls, which is how layers 3, 4
-    // and 5 appear mid-session in every log. Blocking here would then be: this
-    // thread holds the loader lock and waits for the section, while the thread
-    // holding the section waits for the loader lock inside NGX. Nothing crashes,
-    // nothing is logged, and every frame stops.
-    //
-    // So it never blocks. A module missed now is picked up on the next library
-    // load or the next frame; a deadlock is forever.
+    // Do not compete with a render call holding hook state. The next loader
+    // notification or evaluate schedules another scan.
     if (!TryEnterCriticalSection(&g_hook_cs)) return;
     const int added = HookNewNgxModules();
     LeaveCriticalSection(&g_hook_cs);
-    if (added == 0) return;
+    if (added == 0 || g_shutting_down) return;
 
     if (InterlockedCompareExchange(&g_hooks_installed, 1, 0) != 0) return;
 
@@ -3451,6 +3495,7 @@ static void RetractIdleNote()
 // all keeps loading DLLs.
 static void ReportIdle()
 {
+    if (g_shutting_down) return;
     if (InterlockedCompareExchange(&g_hooks_installed, 0, 0) == 0 &&
         g_deferred_exe == nullptr) return;
     if (g_eval_count != 0) return;
@@ -3510,60 +3555,136 @@ static void NameHookedLayerAt(const void *base, wchar_t *out, size_t cch)
                          L"NGX layer %ld, no longer a registered module", i);
 }
 
+static void TriggerHookScan();
+
 static void ForgetUnloadedLayer(const void *base)
 {
-    if (base == nullptr) return;
-    // Also reached under the loader lock; see TryInstallHooks. Missing an unload
-    // costs a stale record, which the crash reporter can name. Blocking costs
-    // the process.
-    if (!TryEnterCriticalSection(&g_hook_cs)) return;
+    if (!base) return;
+    bool matched = false;
+    for (LONG i = 0; i < kMaxLayers; ++i)
+        if (InterlockedCompareExchangePointer(&g_layer_modules[i], nullptr, nullptr) == base)
+        {
+            InterlockedExchange(&g_layer_unloaded[i], 1);
+            matched = true;
+        }
+    // In particular, never start another worker while our own last reference
+    // is being released after a probe which installed no hooks.
+    if (matched) TriggerHookScan();
+}
+
+static volatile LONG g_worker_running = 0;
+static volatile bool g_watching_ngx = false;
+
+static bool ProcessPendingRetirements()
+{
+    if (!TryEnterCriticalSection(&g_hook_cs)) return false;
+
+    bool has_pending = false;
+    for (LONG i = 0; i < g_layer_count; ++i)
+        if (InterlockedExchange(&g_layer_unloaded[i], 0))
+        {
+            Layer &layer = g_layer[i];
+            layer.pending_retirement = true;
+            layer.eval.active = layer.eval_c.active = layer.create.active = false;
+            layer.vk_eval.active = layer.vk_eval_c.active = layer.vk_create.active = layer.vk_create1.active = false;
+        }
     for (LONG i = 0; i < g_layer_count; ++i)
     {
-        if (g_layer[i].mod == nullptr ||
-            static_cast<const void *>(g_layer[i].mod) != base) continue;
-        g_layer[i] = {};
-        Log("NGX layer %ld has been unloaded; its hooks are dropped rather than "
-            "called into or written back to memory that is gone.", i);
+        if (g_layer[i].pending_retirement)
+        {
+            has_pending = true;
+            break;
+        }
     }
     LeaveCriticalSection(&g_hook_cs);
+
+    if (!has_pending) return true;
+
+    // Never wait for a render call while holding bridge or loader locks.
+    if (InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) != 0)
+        return false;
+
+    if (!TryEnterCriticalSection(&g_hook_cs)) return false;
+
+    const bool drained = InterlockedCompareExchange(&g_in_flight_trampoline_calls, 0, 0) == 0;
+    if (drained)
+    {
+        for (LONG i = 0; i < g_layer_count; ++i)
+        {
+            if (!g_layer[i].pending_retirement) continue;
+
+            HookRetire(g_layer[i].eval);
+            HookRetire(g_layer[i].eval_c);
+            HookRetire(g_layer[i].create);
+            HookRetire(g_layer[i].vk_eval);
+            HookRetire(g_layer[i].vk_eval_c);
+            HookRetire(g_layer[i].vk_create);
+            HookRetire(g_layer[i].vk_create1);
+
+            InterlockedExchangePointer(&g_layer_modules[i], nullptr);
+            g_layer[i] = {};
+            Log("NGX layer %ld retirement finalized.", i);
+        }
+    }
+    LeaveCriticalSection(&g_hook_cs);
+    return drained;
+}
+
+static DWORD WINAPI HookWorkerProc(LPVOID module)
+{
+    for (;;)
+    {
+        InterlockedExchange(&g_scan_pending, 0);
+        if (!g_shutting_down)
+        {
+            if (ProcessPendingRetirements())
+            {
+                TryInstallHooks();
+                ReportIdle();
+            }
+            else
+            {
+                InterlockedExchange(&g_scan_pending, 1);
+                Sleep(10); // Retry outside every lock; no render-thread wait.
+            }
+        }
+        InterlockedExchange(&g_worker_running, 0);
+        if (!g_shutting_down && InterlockedCompareExchange(&g_scan_pending, 0, 0) &&
+            InterlockedCompareExchange(&g_worker_running, 1, 0) == 0) continue;
+        // Atomic release + exit: there must be no return into an unloaded DLL.
+        FreeLibraryAndExitThread(static_cast<HMODULE>(module), 0);
+    }
+}
+
+static void TriggerHookScan()
+{
+    InterlockedExchange(&g_scan_pending, 1);
+    if (!g_watching_ngx || g_shutting_down) return;
+    if (InterlockedCompareExchange(&g_worker_running, 1, 0) != 0) return;
+    HANDLE thread = StartModuleWorker(HookWorkerProc);
+    if (thread) CloseHandle(thread);
+    else InterlockedExchange(&g_worker_running, 0);
 }
 
 static void CALLBACK OnDllLoaded(ULONG reason, const void *data, void *)
 {
     // 1 is LDR_DLL_NOTIFICATION_REASON_LOADED, 2 is UNLOADED. This runs under
-    // the loader lock, on the thread doing the load, and what follows is not the
-    // least it can do: it enumerates modules, reads version resources from disk,
-    // and writes fourteen bytes of jump into code.
-    //
-    // NVSDK_NGX_D3D12_Init_Ext loads nvngx_dlss.dll itself, so in Prey 2017 this
-    // fires inside NGX's own initialisation and patches the snippet NGX is
-    // setting up -- while Luma, which also watches for NGX modules in that game,
-    // is on the same stack. Defer the scan to a caller holding no lock.
-    //
-    // Unload bookkeeping stays here: it only nulls pointers, and missing one
-    // leaves a hook pointing at memory that is gone.
+    // the loader lock, on the thread doing the load.
+    // Hook installation uses MinHook which freezes threads and modifies protection,
+    // so it must execute outside the loader lock to prevent deadlocks.
     if (reason == 1)
     {
-        if (g_ngx_init_in_flight)
-        {
-            // Said once. Its presence in a log is the proof that this guard ran;
-            // a silent fix is one nobody can tell apart from a missing one.
-            static bool said;
-            if (!said) { said = true; Log("a module loaded while NGX was initialising; "
-                                          "the hook scan is deferred until nothing holds "
-                                          "the loader lock."); }
-            g_scan_pending = true;
-            return;
-        }
-        TryInstallHooks();
-        ReportIdle();
+        TriggerHookScan();
     }
     else if (reason == 2 && data != nullptr)
+    {
         ForgetUnloadedLayer(static_cast<const LdrDllNotificationData *>(data)->DllBase);
+    }
 }
 
 static void StartWatchingForNgx()
 {
+    g_watching_ngx = true;
     HMODULE nt = GetModuleHandleW(L"ntdll.dll");
     auto reg = nt != nullptr ? reinterpret_cast<PFN_LdrRegisterDllNotification>(
         GetProcAddress(nt, "LdrRegisterDllNotification")) : nullptr;
@@ -3573,17 +3694,22 @@ static void StartWatchingForNgx()
     if (reg != nullptr) reg(0, &OnDllLoaded, nullptr, &g_ldr_cookie);
     else Log("loader notifications unavailable; NGX will only be found if it is already loaded");
 
-    // It may already be there, in which case no notification is coming.
-    TryInstallHooks();
+    // Signal the worker to scan as soon as DllMain exits and releases the loader lock:
+    TriggerHookScan();
 }
 
 static void StopWatchingForNgx()
 {
+    g_watching_ngx = false;
+    g_shutting_down = true;
     if (g_ldr_cookie != nullptr && g_ldr_unregister != nullptr)
     {
         g_ldr_unregister(g_ldr_cookie);
         g_ldr_cookie = nullptr;
     }
+    // No join in DllMain. A live worker owns a DLL reference, and installed
+    // hooks pin the module, so normal detach cannot race either of them.
+
 }
 
 // Said at unload, when the answer is finally known, rather than guessed at from
@@ -3719,7 +3845,7 @@ static bool RegisterWithReShade(HMODULE self)
 //
 // It runs once, on its own thread, after a delay long enough for the other
 // add-ons to have registered whatever they register.
-static DWORD WINAPI NgxProbeThread(LPVOID)
+static DWORD NgxProbeRun()
 {
     Sleep(20000);
 
@@ -3853,6 +3979,12 @@ static int CfgKeyInt(const char *key, int def)
     return out;
 }
 
+static DWORD WINAPI NgxProbeThread(LPVOID module)
+{
+    const DWORD result = NgxProbeRun();
+    FreeLibraryAndExitThread(static_cast<HMODULE>(module), result);
+}
+
 static bool ProbeRequested() { return CfgKeyOn("probe=1"); }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
@@ -3860,6 +3992,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH)
     {
         g_self = module;
+        g_shutting_down = false;
+        g_worker_running = 0;
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
         InitializeCriticalSection(&g_hook_cs);
@@ -3903,7 +4037,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         // Opt-in and off by default: it creates a D3D12 device in every game
         // that turns it on. The thread does not start until DllMain returns.
         if (ProbeRequested())
-            if (HANDLE t = CreateThread(nullptr, 0, NgxProbeThread, nullptr, 0, nullptr))
+            if (HANDLE t = StartModuleWorker(NgxProbeThread))
                 CloseHandle(t);
 
         // Carry forward the previous run's crash report, if it left one. This
@@ -4040,39 +4174,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         StopWatchingForNgx();
         ReportOutcome();
 
-        // Not dead code, however rarely detach runs. A module that unloads with
-        // its jumps still in place and is then loaded again reads its own patch
-        // as the "original bytes" it saves and calls through: the detour lands
-        // in itself and recurses until the stack is gone. The Vulkan port of
-        // this add-on is the counter-example -- its DllMain has only a
-        // DLL_PROCESS_ATTACH branch, so nothing ever wrote the bytes back, and a
-        // second load produced STATUS_STACK_OVERFLOW. Most games never reach
-        // here, which is exactly why it looks removable.
-        // Before the hooks come out, because a game whose GPU is parked at the
-        // mirror's vkCmdWaitEvents is waiting on an event only this add-on can
-        // set -- and an unloaded add-on that never sets it is a device loss for
-        // the whole game rather than a dropped frame.
+        // NGX hooks pin the bridge, but a probe or synthetic-only session can
+        // still detach normally. Release any parked transport before unregistering.
         VkmShutdown();
         // The substitute contract's Vulkan transport parks the same way and for
         // the same stakes, on ReShade's own command buffer rather than the game's.
         SynthVkParkStop();
 
-        EnterCriticalSection(&g_hook_cs);
-        for (LONG i = 0; i < g_layer_count; ++i)
-        {
-            HookRemove(g_layer[i].eval);
-            HookRemove(g_layer[i].eval_c);
-            HookRemove(g_layer[i].create);
-            HookRemove(g_layer[i].vk_eval);
-            HookRemove(g_layer[i].vk_eval_c);
-            HookRemove(g_layer[i].vk_create);
-            HookRemove(g_layer[i].vk_create1);
-            g_layer[i].eval.active = g_layer[i].eval_c.active =
-                g_layer[i].create.active = false;
-            g_layer[i].vk_eval.active = g_layer[i].vk_eval_c.active =
-                g_layer[i].vk_create.active = g_layer[i].vk_create1.active = false;
-        }
-        LeaveCriticalSection(&g_hook_cs);
+        // Any installed hook pins this module before publication. Normal detach
+        // therefore has no MinHook state to tear down; never acquire its shared
+        // mutex or suspend threads under the loader lock.
         if (g_unregister != nullptr) g_unregister(g_self);
 
         // Kept as a human-readable end-of-session marker only. Nothing reads it:
