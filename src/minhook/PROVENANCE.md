@@ -8,6 +8,8 @@ with these local differences (ignoring UTF-8 BOMs and line endings):
   `MH_RetireHook` / `MH_RetireHookEx` remove records for unmapped targets without
   touching target memory or freeing executable buffers. Those buffers remain
   allocated until process exit in the bridge. Retirement runs outside loader notifications.
+- `hook.c`: on `WAIT_ABANDONED`, release the mutex ownership granted by Windows
+  before returning `MH_ERROR_MUTEX_FAILURE`. All guarded APIs use the same helper.
 - `MinHook.h`: declarations/documentation for retirement; omitted an upstream
   comment about a possible future thread-freeze method.
 - `src/hde/*`: the complete HDE directory instead matches

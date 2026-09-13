@@ -530,6 +530,31 @@ static void TestRetirementFailurePreservesRecord()
     puts("PASS");
 }
 
+static void TestAbandonedMutexFailureReleasesOwnership()
+{
+    puts("CASE: an abandoned MinHook mutex is not retained after API failure");
+    wchar_t name[64]; swprintf_s(name,L"minhook_multihook_%08X",GetCurrentProcessId());
+    HANDLE mutex=OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE,FALSE,name);
+    TEST_EXPECT(mutex);
+    std::thread abandon([&] {
+        TEST_EXPECT(WaitForSingleObject(mutex,5000)==WAIT_OBJECT_0);
+        // Deliberately exit while owning it: Windows marks the mutex abandoned.
+    });
+    abandon.join();
+    const MH_STATUS status=MH_SetThreadFreezeMethod(MH_FREEZE_METHOD_ORIGINAL);
+    DWORD next=WAIT_FAILED;
+    std::thread observer([&] {
+        next=WaitForSingleObject(mutex,0);
+        if (next==WAIT_OBJECT_0 || next==WAIT_ABANDONED) ReleaseMutex(mutex);
+    });
+    observer.join();
+    if (next==WAIT_TIMEOUT) ReleaseMutex(mutex); // Clean up the pre-fix failure.
+    CloseHandle(mutex);
+    TEST_EXPECT(status==MH_ERROR_MUTEX_FAILURE);
+    TEST_EXPECT(next==WAIT_OBJECT_0);
+    puts("PASS");
+}
+
 int main()
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -553,6 +578,7 @@ int main()
     TestScanReleasesOutsideHookLock();
     TestBusyScanIsRescheduled();
     TestRetirementFailurePreservesRecord();
+    TestAbandonedMutexFailureReleasesOwnership();
     // Actual DLL/loader-lock lifetime is covered by module-lifetime-test.
 
     MH_Uninitialize();

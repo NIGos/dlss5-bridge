@@ -1,16 +1,17 @@
 # Follow-up audit, 2026-09-13
 
 Reviewed the integration merged in `9a7df3f80a570b6d8787672e149f5cf559202a8e`.
-Found and corrected three edge cases before publishing pre8.
+Found and corrected four edge cases before publishing pre8.
 
 | Finding | Correction | Regression evidence |
 | --- | --- | --- |
 | The scanner's last DLL reference could be released while holding `g_hook_cs`, running foreign detach code under the bridge lock. | Keep scan references until after releasing the lock. | A real fixture DLL releases its host reference during the production export scan. Its detach callback observes the lock held before the fix and released afterwards. |
 | Losing the hook lock between retirement and installation could discard a scan request. With no hooks installed, there might be no evaluate callback to retry it. | Leave the scan flag pending when installation cannot acquire the lock. | A separate thread holds the section; the production scanner failed to request a retry before the fix and requests one afterwards. |
 | Retirement cleared the layer even when MinHook returned an error. | Preserve failed hook records and keep the layer pending until retirement succeeds; both retirement paths share the same helper. | Injected `MH_ERROR_MUTEX_FAILURE` into the real retirement call. State was lost before the fix; it is retained afterwards and the subsequent successful retry clears it. |
+| MinHook returned an error on an abandoned mutex without releasing the ownership granted by Windows. Other callers could remain blocked. | All guarded APIs release abandoned ownership before returning the error; this does not attempt to recover potentially inconsistent state. | A thread exits owning the real mutex. Before the fix a second observer cannot acquire it after the API fails; afterwards it can. |
 
-All three tests were run before their respective corrections and failed at the
-assertion for the reported condition. All now pass as part of the full **11-case
+All four tests were run before their respective corrections and failed at the
+assertion for the reported condition. All now pass as part of the full **12-case
 hook/lifecycle suite**. These are reproduced state/lifetime defects, not claims
 that a particular game's crash was reproduced.
 
@@ -31,3 +32,6 @@ resource/runtime transitions, not perceptual HDR quality. This is not a measured
 performance comparison, exhaustive mod-compatibility test, or proof that every
 Frame Generation issue is resolved. Replacing an active bridge still requires a
 game restart. No release is published by this audit.
+
+The GPU runs preceded the isolated abandoned-mutex error-path correction; the
+full CPU and real-DLL suites cover both normal and abandoned mutex paths after it.
